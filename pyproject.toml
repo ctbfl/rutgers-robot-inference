@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 name = "rutgers-robot-inference"
 version = "0.1.0"
 description = "A minimal inference stack for robot policies."
-readme = "README.md"
+readme = "readme.md"
 requires-python = ">=3.10"
 
 dependencies = [
@@ -25,8 +25,8 @@ client = [
 
 
 [project.scripts]
-rri-server = "rutgers_robot_inference.server.__main__:main"
-rri-client = "rutgers_robot_inference.client.__main__:main"
+rri-server = "ruri.server.__main__:main"
+rri-client = "ruri.client.__main__:main"
 
 
 [tool.setuptools.packages.find]

@@ -1,3 +1,5 @@
+Rutgers Robot Inference (RU-RI, ruri) 是一个轻量化机器人推理层。
+
 三个模块组成完整推理栈：
 
 - `policy_wrapper` 负责推理，由用户自己编写，一般每个模型都要重新编写一个。可以理解为直接当做API进行调用。

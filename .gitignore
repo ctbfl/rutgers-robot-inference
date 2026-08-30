@@ -1,0 +1,33 @@
+# Machine-specific launch scripts (absolute checkpoint and venv paths).
+examples/shell_scripts/*
+
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editors and OS
+.ipynb_checkpoints/
+.DS_Store
+*.swp
