@@ -1,0 +1,4 @@
+三个模块组成完整推理栈：
+policy_wrapper 负责推理，由用户自己编写，一般每个模型都要重新编写一个。可以理解为直接当做API进行调用。
+inference_scheduler 管理时序，从robot controller获取传感器信息，上报policy wrapper，获取生成的动作后合成并传送给下游robot controller进行执行。
+robot_setup_controller 掌控硬件,为上层提供一个抽象的接口，包含相机传感器和机械臂控制等。

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "rutgers-robot-inference"
+version = "0.1.0"
+description = "A minimal inference stack for robot policies."
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy",
+    "pyzmq",
+    "msgpack",
+]
+
+
+[project.optional-dependencies]
+client = [
+    # Add Python dependencies required by
+    # rutgers_agx_arm and rutgers_ur5e here.
+]
+
+
+[project.scripts]
+rri-server = "rutgers_robot_inference.server.__main__:main"
+rri-client = "rutgers_robot_inference.client.__main__:main"
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
