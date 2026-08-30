@@ -1,9 +1,9 @@
-Rutgers Robot Inference (RU-RI, ruri) 是一个轻量化机器人推理层。
+Rutgers Robot Inference (RU-RI, ruri) is a lightweight robot inference layer.
 
-三个模块组成完整推理栈：
+Three modules make up the full inference stack:
 
-- `policy_wrapper` 负责推理，由用户自己编写，一般每个模型都要重新编写一个。可以理解为直接当做API进行调用。
+- `policy_wrapper` runs inference. You write it yourself, generally a new one per model. Think of it as calling the model directly as an API.
 
-- `inference_scheduler` 管理时序，从robot controller获取传感器信息，上报policy wrapper，获取生成的动作后合成并传送给下游robot controller进行执行。
+- `inference_scheduler` manages timing. It reads sensor data from the robot controller, passes it to the policy wrapper, then composes the returned actions and hands them downstream to the robot controller for execution.
 
-- `robot_setup_controller` 掌控硬件,为上层提供一个抽象的接口，包含相机传感器和机械臂控制等。
+- `robot_setup_controller` owns the hardware and exposes an abstract interface to the layers above it, covering camera sensors, arm control, and so on.
