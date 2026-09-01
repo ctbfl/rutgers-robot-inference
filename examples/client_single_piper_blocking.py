@@ -1,8 +1,11 @@
 #!/usr/bin/env python
-"""Continuously drive the local Single Piper with the remote Pi0.5 policy.
+"""Continuously run blocking Pi0.5 chunks with smooth starts and stops.
 
-The scheduler owns observation capture, asynchronous inference, rolling chunk
-aggregation, and the 30 Hz action stream.  Stop with Ctrl+C.
+By default, each inference predicts and executes all 10 actions.  Set a shorter
+execution prefix explicitly when faster replanning is desired.  A
+fixed-duration minimum-jerk time law starts and ends the executed trajectory
+with zero velocity and acceleration, moving faster through the middle instead
+of adding extra time.  Stop with Ctrl+C.
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import logging
 
 from ruri.client.controllers.single_piper import SinglePiperController
 from ruri.client.policies import RemotePolicy
-from ruri.client.schedulers import RollingScheduler
+from ruri.client.schedulers import BlockingScheduler
 
 
 DEFAULT_PROMPT = (
@@ -24,37 +27,41 @@ DEFAULT_PROMPT = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--policy-endpoint",
-        default="tcp://172.16.68.130:5555",
+        "--policy-endpoint", default="tcp://172.16.68.130:5555"
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--control-hz", type=float, default=30.0)
     parser.add_argument("--actions-per-chunk", type=int, default=10)
-    parser.add_argument("--chunk-size-threshold", type=float, default=0.5)
     parser.add_argument(
-        "--aggregate-fn-name",
-        choices=("weighted_average", "latest_only", "average", "conservative"),
-        default="weighted_average",
+        "--execute-actions-per-chunk",
+        type=int,
+        default=10,
+        help="execute only this prefix before requesting a new chunk",
     )
     parser.add_argument(
         "--max-chunks",
         type=int,
         default=None,
-        help="stop after this many inferences; omitted means run continuously",
+        help="stop after this many chunks; omitted means run continuously",
     )
     parser.add_argument(
         "--scheduler-log-dir",
         default="logs",
-        help="local JSONL trace directory (default: logs)",
+        help="local blocking inference/action JSONL directory (default: logs)",
     )
     parser.add_argument(
-        "--diagnostic-log",
+        "--profile-max-velocity",
+        type=float,
         default=None,
-        help="MIT 100 Hz pre-abort q/qd/q_target JSONL path",
+        help="optional scalar action-space velocity limit per second",
+    )
+    parser.add_argument(
+        "--profile-max-acceleration",
+        type=float,
+        default=None,
+        help="optional scalar action-space acceleration limit per second squared",
     )
 
-    # Current local hardware.  Controller still verifies the stable adapter ID
-    # and Piper feedback signature before enabling motion.
     parser.add_argument("--arm-side", default="left")
     parser.add_argument("--arm-role", default="main")
     parser.add_argument("--can-interface", default="can1")
@@ -71,11 +78,17 @@ def parse_args() -> argparse.Namespace:
         help="skip startup homing when max joint error from home is below this",
     )
     parser.add_argument(
+        "--diagnostic-log",
+        default=None,
+        help="MIT 100 Hz pre-abort q/qd/q_target JSONL path",
+    )
+    parser.add_argument(
         "--configure-can",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
     parser.add_argument("--log-level", default="INFO")
+    parser.set_defaults(action_profile="minimum_jerk")
     return parser.parse_args()
 
 
@@ -85,9 +98,8 @@ def main() -> None:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    scheduler = RollingScheduler()
     try:
-        scheduler.run(
+        BlockingScheduler().run(
             controller=SinglePiperController,
             policy=RemotePolicy,
             args=args,

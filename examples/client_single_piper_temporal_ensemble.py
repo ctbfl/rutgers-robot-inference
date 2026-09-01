@@ -1,9 +1,5 @@
 #!/usr/bin/env python
-"""Continuously drive the local Single Piper with the remote Pi0.5 policy.
-
-The scheduler owns observation capture, asynchronous inference, rolling chunk
-aggregation, and the 30 Hz action stream.  Stop with Ctrl+C.
-"""
+"""Run remote ACT with LeRobot-style per-step temporal ensembling."""
 
 from __future__ import annotations
 
@@ -12,7 +8,7 @@ import logging
 
 from ruri.client.controllers.single_piper import SinglePiperController
 from ruri.client.policies import RemotePolicy
-from ruri.client.schedulers import RollingScheduler
+from ruri.client.schedulers import TemporalEnsembleScheduler
 
 
 DEFAULT_PROMPT = (
@@ -24,37 +20,25 @@ DEFAULT_PROMPT = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--policy-endpoint",
-        default="tcp://172.16.68.130:5555",
+        "--policy-endpoint", default="tcp://172.16.68.130:5555"
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--control-hz", type=float, default=30.0)
-    parser.add_argument("--actions-per-chunk", type=int, default=10)
-    parser.add_argument("--chunk-size-threshold", type=float, default=0.5)
+    parser.add_argument("--actions-per-chunk", type=int, default=100)
     parser.add_argument(
-        "--aggregate-fn-name",
-        choices=("weighted_average", "latest_only", "average", "conservative"),
-        default="weighted_average",
+        "--temporal-ensemble-coeff",
+        type=float,
+        default=0.01,
+        help="LeRobot ACT exponential coefficient; positive favors older predictions",
     )
     parser.add_argument(
         "--max-chunks",
         type=int,
         default=None,
-        help="stop after this many inferences; omitted means run continuously",
+        help="stop after this many ACT inferences; omitted means continuous",
     )
-    parser.add_argument(
-        "--scheduler-log-dir",
-        default="logs",
-        help="local JSONL trace directory (default: logs)",
-    )
-    parser.add_argument(
-        "--diagnostic-log",
-        default=None,
-        help="MIT 100 Hz pre-abort q/qd/q_target JSONL path",
-    )
+    parser.add_argument("--scheduler-log-dir", default="logs")
 
-    # Current local hardware.  Controller still verifies the stable adapter ID
-    # and Piper feedback signature before enabling motion.
     parser.add_argument("--arm-side", default="left")
     parser.add_argument("--arm-role", default="main")
     parser.add_argument("--can-interface", default="can1")
@@ -68,7 +52,11 @@ def parse_args() -> argparse.Namespace:
         "--startup-home-skip-threshold-rad",
         type=float,
         default=0.05,
-        help="skip startup homing when max joint error from home is below this",
+    )
+    parser.add_argument(
+        "--diagnostic-log",
+        default=None,
+        help="MIT 100 Hz pre-abort q/qd/q_target JSONL path",
     )
     parser.add_argument(
         "--configure-can",
@@ -85,9 +73,8 @@ def main() -> None:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    scheduler = RollingScheduler()
     try:
-        scheduler.run(
+        TemporalEnsembleScheduler().run(
             controller=SinglePiperController,
             policy=RemotePolicy,
             args=args,

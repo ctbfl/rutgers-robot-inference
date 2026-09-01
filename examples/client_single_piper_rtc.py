@@ -1,8 +1,10 @@
 #!/usr/bin/env python
-"""Continuously drive the local Single Piper with the remote Pi0.5 policy.
+"""Continuously drive Single Piper with latency-aligned RTC chunk replacement.
 
-The scheduler owns observation capture, asynchronous inference, rolling chunk
-aggregation, and the 30 Hz action stream.  Stop with Ctrl+C.
+The policy returns 10 actions.  After every 5 successfully sent
+actions, the scheduler requests another chunk while continuing to execute the
+old one.  On return, the elapsed prefix is discarded and the unsent queue is
+replaced on the same absolute control timeline.  Stop with Ctrl+C.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import logging
 
 from ruri.client.controllers.single_piper import SinglePiperController
 from ruri.client.policies import RemotePolicy
-from ruri.client.schedulers import RollingScheduler
+from ruri.client.schedulers import RTCScheduler
 
 
 DEFAULT_PROMPT = (
@@ -24,37 +26,32 @@ DEFAULT_PROMPT = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--policy-endpoint",
-        default="tcp://172.16.68.130:5555",
+        "--policy-endpoint", default="tcp://172.16.68.130:5555"
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--control-hz", type=float, default=30.0)
     parser.add_argument("--actions-per-chunk", type=int, default=10)
-    parser.add_argument("--chunk-size-threshold", type=float, default=0.5)
     parser.add_argument(
-        "--aggregate-fn-name",
-        choices=("weighted_average", "latest_only", "average", "conservative"),
-        default="weighted_average",
+        "--execution-horizon",
+        type=int,
+        default=5,
+        help="request a fresh chunk after this many sent actions",
     )
     parser.add_argument(
         "--max-chunks",
         type=int,
         default=None,
-        help="stop after this many inferences; omitted means run continuously",
+        help="stop after this many inferences; omitted means continuous",
     )
+    parser.add_argument("--rtc-latency-window", type=int, default=10)
     parser.add_argument(
-        "--scheduler-log-dir",
-        default="logs",
-        help="local JSONL trace directory (default: logs)",
+        "--rtc-initial-delay-steps",
+        type=int,
+        default=4,
+        help="conservative delay estimate before live RTC measurements exist",
     )
-    parser.add_argument(
-        "--diagnostic-log",
-        default=None,
-        help="MIT 100 Hz pre-abort q/qd/q_target JSONL path",
-    )
+    parser.add_argument("--scheduler-log-dir", default="logs")
 
-    # Current local hardware.  Controller still verifies the stable adapter ID
-    # and Piper feedback signature before enabling motion.
     parser.add_argument("--arm-side", default="left")
     parser.add_argument("--arm-role", default="main")
     parser.add_argument("--can-interface", default="can1")
@@ -71,6 +68,11 @@ def parse_args() -> argparse.Namespace:
         help="skip startup homing when max joint error from home is below this",
     )
     parser.add_argument(
+        "--diagnostic-log",
+        default=None,
+        help="MIT 100 Hz pre-abort q/qd/q_target JSONL path",
+    )
+    parser.add_argument(
         "--configure-can",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -85,9 +87,8 @@ def main() -> None:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    scheduler = RollingScheduler()
     try:
-        scheduler.run(
+        RTCScheduler().run(
             controller=SinglePiperController,
             policy=RemotePolicy,
             args=args,
