@@ -20,6 +20,14 @@ Request types:
         policy.describe(). A client calls this to discover the input
         contract instead of hard-coding it.
 
+Announcing itself
+-----------------
+When started with a name, the server writes an entry into the RURI runtime
+directory once it is able to serve, and starts the menu process if nothing
+holds its port yet. Both are best-effort: a server that cannot announce itself
+still serves. See :mod:`ruri.server.registry` for why it never removes that
+entry itself.
+
 Press Ctrl+C to stop the server.
 """
 
@@ -29,6 +37,7 @@ import logging
 import zmq
 
 from ruri.common.zmq import recv, send
+from ruri.server import registry
 from ruri.server.wrappers.policy_wrapper import PolicyWrapper
 
 
@@ -92,6 +101,7 @@ def build_wrapper(args: argparse.Namespace) -> PolicyWrapper:
 def handle_request(
     policy: PolicyWrapper,
     request: dict,
+    server_info: dict | None = None,
 ) -> dict:
     """
     Dispatch one request on its "type" field.
@@ -101,12 +111,21 @@ def handle_request(
 
     "type" is an envelope field, not policy input, so it is stripped before
     the rest of the request reaches the wrapper. It defaults to "infer".
+
+    `server_info` carries facts about this process rather than about the
+    policy -- the name it is registered under, the address it is bound to. It
+    joins the metadata response as its own section rather than going under
+    "policy", which is the wrapper's slot: a wrapper has no idea it is being
+    served over a socket, and should not have to.
     """
 
     request_type = request.get(REQUEST_TYPE_KEY, TYPE_INFER)
 
     if request_type == TYPE_METADATA:
-        return policy.describe()
+        description = policy.describe()
+        if server_info:
+            description["server"] = dict(server_info)
+        return description
 
     if request_type == TYPE_INFER:
         inputs = {k: v for k, v in request.items() if k != REQUEST_TYPE_KEY}
@@ -123,6 +142,8 @@ def handle_request(
 def serve(
     policy: PolicyWrapper,
     bind_address: str,
+    name: str | None = None,
+    advertise_host: str | None = None,
 ) -> None:
     """
     Serve a PolicyWrapper over ZeroMQ.
@@ -134,15 +155,39 @@ def serve(
         dispatch on request["type"]
             ↓
         send response
+
+    Args:
+        name:
+            Register under this name so the menu can list this server. It
+            identifies the *instance*, not the wrapper class -- two
+            Pi05Wrapper servers on two checkpoints both call themselves
+            "pi05", which is useless for picking one. Omit to run
+            unannounced.
+        advertise_host:
+            Hostname to publish in place of the bind wildcard. Defaults to
+            this machine's own; pass it when that is not what the robot can
+            resolve.
     """
 
     context = zmq.Context()
     socket = context.socket(zmq.REP)
 
+    server_info: dict | None = None
+
     try:
         socket.bind(bind_address)
 
+        # Only now can this process answer anything: loading the checkpoint
+        # took ~22 s for Pi0.5, and a client that had found it in the menu
+        # during that window would just have timed out.
+        if name:
+            endpoint = registry.advertised_endpoint(bind_address, advertise_host)
+            server_info = {"name": name, "endpoint": endpoint}
+            registry.register(name, endpoint, policy.describe())
+
         print(f"[RURI] Inference server ready: {bind_address}")
+        if name:
+            print(f"[RURI] Registered as {name!r} ({server_info['endpoint']})")
 
         while True:
             # A REP socket must answer every request it receives, or it locks
@@ -150,7 +195,7 @@ def serve(
             # every failure turns into a reply rather than escaping the loop.
             try:
                 request = recv(socket)
-                response = handle_request(policy, request)
+                response = handle_request(policy, request, server_info)
             except Exception as exc:
                 logging.exception("Request failed")
                 response = {"error": f"{type(exc).__name__}: {exc}"}

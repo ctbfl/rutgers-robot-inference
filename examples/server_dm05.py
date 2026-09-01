@@ -138,6 +138,25 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--name",
+        default='dm05',
+        help=(
+            "Name this server registers under, so the RURI menu can list it and "
+            "a client can pick it. It identifies this instance, not the wrapper "
+            "class: two Pi0.5 servers on two checkpoints would both call "
+            "themselves 'pi05'. Pass --name '' to run unannounced."
+        ),
+    )
+    parser.add_argument(
+        "--advertise-host",
+        default=None,
+        help=(
+            "Hostname to publish to the menu in place of the bind wildcard. "
+            "Defaults to this machine's own hostname; set it when that is not "
+            "what the robot can resolve."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Python logging level (default: INFO).",
@@ -168,7 +187,12 @@ def main() -> None:
     for key, value in policy.optional_more_metadata().items():
         logging.info("  %s: %s", key, value)
 
-    serve(policy=policy, bind_address=args.bind)
+    serve(
+        policy=policy,
+        bind_address=args.bind,
+        name=args.name or None,
+        advertise_host=args.advertise_host,
+    )
 
 
 if __name__ == "__main__":
