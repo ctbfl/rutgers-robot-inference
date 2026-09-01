@@ -29,7 +29,7 @@ namespaces, for example:
     observation.images.top
     observation.images.wrist
     prompt
-    context.current_chunk
+    context.rtc.prev_chunk_left_over
 
 Two independent declarations
 ----------------------------
@@ -43,8 +43,22 @@ wrapper whose policy already speaks RURI naming needs only the second.
 
     POLICY_METADATA   Describes the policy input key layer, i.e. it is
                       keyed by layer-2 names. Named for the policy, not
-                      for inputs, so that an output section can join it
-                      later without a rename.
+                      for inputs, because the output section sits beside
+                      the input one.
+
+Inputs and outputs are not symmetric
+------------------------------------
+There is no OUTPUT_MAPPING and there is no need for one: a response is
+produced by the wrapper and is already in RURI naming, so nothing has to be
+translated back. ruri_metadata() inverts INPUT_MAPPING over the ``inputs``
+section and passes ``outputs`` through as it stands.
+
+The other asymmetry is that outputs are not knowable when the class is
+written. Which keys a policy accepts is fixed by the wrapper; how many
+actions it returns is a property of the checkpoint that was loaded -- the
+same Pi05Wrapper answers 10 or 30 depending on which one it points at. So
+the ``outputs`` section is filled from the live instance, via the
+output_chunk_size property, and ruri_metadata() is an instance method.
 
 Values are forwarded transparently. They may be arrays, strings, nested
 dictionaries, or any other data supported by the transport layer.
@@ -68,7 +82,8 @@ class PolicyWrapper(ABC):
         1. Declare POLICY_METADATA describing the policy's own input keys.
         2. Override INPUT_MAPPING when the policy's key names differ from
            the RURI convention.
-        3. Implement _infer() with policy-specific inference logic.
+        3. Implement output_chunk_size, read off the loaded checkpoint.
+        4. Implement _infer() with policy-specific inference logic.
 
     Model loading, preprocessing, inference, and postprocessing are left to
     the concrete wrapper.
@@ -161,6 +176,23 @@ class PolicyWrapper(ABC):
 
         return self._infer(mapped_inputs)
 
+    @property
+    @abstractmethod
+    def output_chunk_size(self) -> int:
+        """
+        How many actions one inference returns.
+
+        Published as ``outputs.output_chunk_size``. This is the number of
+        rows in ``action_chunk``, unconditionally -- a response is never
+        truncated, so there is no qualifier on it.
+
+        It is a property rather than a class attribute because it is a fact
+        about the loaded checkpoint, not about the wrapper: the same class
+        answers differently for two checkpoints. Abstract so that a wrapper
+        cannot be instantiated without answering, since the scheduler cannot
+        compose actions without knowing how many arrive.
+        """
+
     @abstractmethod
     def _infer(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """
@@ -180,6 +212,8 @@ class PolicyWrapper(ABC):
         top-level keys, and they mean the same thing for every policy:
 
             inputs      Standard, always present, safe to rely on.
+
+            outputs     Standard, always present, safe to rely on.
 
             policy      Whatever this wrapper registered through
                         optional_more_metadata(). Free-form, and omitted
@@ -204,23 +238,29 @@ class PolicyWrapper(ABC):
         """
         return {}
 
-    @classmethod
-    def ruri_metadata(cls) -> dict[str, Any]:
+    def ruri_metadata(self) -> dict[str, Any]:
         """
-        POLICY_METADATA restated in RURI input keys, i.e. what a client
-        needs to know in order to name what it sends.
+        POLICY_METADATA restated for a client: what to send, and what comes
+        back.
 
         The input section goes through the inverse of INPUT_MAPPING; a key
-        the mapping does not cover keeps its name. Other sections pass
-        through untouched.
-        """
-        inverse = {policy: ruri for ruri, policy in cls.INPUT_MAPPING.items()}
+        the mapping does not cover keeps its name. The output section is
+        assembled from the live instance and needs no translation, since a
+        response is already in RURI naming. Any other section a wrapper
+        declares passes through untouched.
 
-        metadata = dict(cls.POLICY_METADATA)
+        An instance method rather than a classmethod: output_chunk_size is
+        only known once a checkpoint is loaded.
+        """
+        inverse = {policy: ruri for ruri, policy in self.INPUT_MAPPING.items()}
+
+        metadata = dict(self.POLICY_METADATA)
         policy_inputs = metadata.get("inputs")
         if isinstance(policy_inputs, dict):
             metadata["inputs"] = {
                 inverse.get(key, key): value for key, value in policy_inputs.items()
             }
+
+        metadata["outputs"] = {"output_chunk_size": self.output_chunk_size}
 
         return metadata

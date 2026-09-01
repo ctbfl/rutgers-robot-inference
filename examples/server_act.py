@@ -1,32 +1,26 @@
 #!/usr/bin/env python
 """
-Example: serve the fine-tuned Pi0.5 tight-insertion policy over ZeroMQ.
+Example: serve the fine-tuned ACT tight-insertion policy over ZeroMQ.
 
-This wires the three pieces together:
+    ACTWrapper (LeRobot + PyTorch)  ->  ruri.server.serve.serve()  ->  ZMQ REP
 
-    Pi05Wrapper (OpenPI + JAX)  ->  ruri.server.serve.serve()  ->  ZMQ REP
-
-Defaults point at the 10k-step tight_insertion_E1 checkpoint on this
+Defaults point at the 100k-step tight_insertion_E1_act checkpoint on this
 machine, so the example runs with no arguments.
 
 Launch
 ------
-Pi0.5 needs the OpenPI environment (JAX + the TrainConfig registry that
-defines ``pi05_tight_insertion_E1``). RURI is already installed into it
-as an editable package, so no PYTHONPATH is needed::
+ACT needs the **LeRobot** environment, not the OpenPI one. The two cannot be
+shared: these checkpoints use the processor-pipeline format introduced after
+LeRobot 0.1.0, and the OpenPI venv pins 0.1.0. RURI is installed editable into
+the LeRobot venv, so no PYTHONPATH is needed::
 
-    cd /common/home/jh2400/projects/openpi
-    XLA_PYTHON_CLIENT_MEM_FRACTION=0.2 \\
-      ./.venv/bin/python \\
-      /common/users/jh2400/rutgers-robot-inference/examples/server_pi05.py
+    CUDA_VISIBLE_DEVICES=0 \\
+      /common/home/jh2400/projects/lerobot/.venv/bin/python \\
+      /common/users/jh2400/rutgers-robot-inference/examples/server_act.py
 
-JAX preallocates ``XLA_PYTHON_CLIENT_MEM_FRACTION`` of the card at startup,
-so nvidia-smi reports the pool rather than real usage. 0.2 is plenty for one
-Pi0.5 policy and leaves the card usable by others.
-
-Startup takes ~25 s: restoring the params, then a warmup inference that
-triggers JAX compilation. The bind address is printed only once the server
-can actually answer.
+Startup is a few seconds: PyTorch loads the weights and runs one warmup
+inference. There is no JAX-style compile to absorb, so this is far quicker than
+the Pi0.5 servers.
 
 Request / response
 ------------------
@@ -38,51 +32,51 @@ arrays natively. A client sends::
         "observation.state":        np.ndarray (7,) float,
         "observation.images.top":   np.ndarray (H, W, 3) uint8, RGB,
         "observation.images.wrist": np.ndarray (H, W, 3) uint8, RGB,
-        "prompt":                   str,   # optional, defaults to --prompt
     }
 
 and gets back::
 
     {
-        "action_chunk": np.ndarray (10, 7) float32,
-        "prompt": str,
+        "action_chunk": np.ndarray (100, 7) float32,
         "timing.infer_ms": float,
         "timing.wrapper_ms": float,
     }
 
-``{"type": "metadata"}`` returns the input contract instead. A failed
-request comes back as ``{"error": "..."}``.
+Note ``observation.images.wrist``: the checkpoint calls that camera ``hand``,
+and the wrapper's INPUT_MAPPING absorbs the difference so clients use the same
+key here as for Pi0.5.
+
+Two things differ from the Pi0.5 servers and matter to the scheduler:
+
+  * The chunk is **100 steps**, i.e. 3.3 s at 30 fps, against Pi0.5's 10 steps
+    / 333 ms. The whole chunk always comes back; re-plan well before it runs
+    out and drop the tail.
+  * Actions are **absolute joint targets**, not deltas against the current
+    state, so they can go to the arm as-is.
+
+``{"type": "metadata"}`` returns the input contract instead. A failed request
+comes back as ``{"error": "..."}``.
 """
 
 import argparse
 import logging
 
 from ruri.server.serve import serve
-from ruri.server.wrappers.pi05.pi05 import Pi05Wrapper
+from ruri.server.wrappers.act.act import ACTWrapper
 
 
-# Steps 2000/4000/6000/8000 sit next to this one. There is no validation split
-# on this dataset, so choosing between them means comparing on hardware.
+# Steps 020000/040000/060000/080000 sit next to this one, plus `last`. There is
+# no validation split on this dataset, so choosing between them means comparing
+# on hardware -- same situation as the Pi0.5 checkpoints.
 DEFAULT_CHECKPOINT = (
-    "/common/users/jh2400/openpi_checkpoints/"
-    "pi05_tight_insertion_E1/tight_insertion_E1_10k/9999"
-)
-
-# Must be the TrainConfig this checkpoint was trained with: it selects the
-# data transforms, not just the architecture.
-DEFAULT_CONFIG_NAME = "pi05_tight_insertion_E1"
-
-# Verbatim from the training set's meta/tasks.jsonl -- a paraphrase is
-# off-distribution.
-DEFAULT_PROMPT = (
-    "pick and place the object E into the first hole "
-    "on the manipulation-net board."
+    "/common/users/jh2400/lerobot_outputs/tight_insertion_E1_act"
+    "/checkpoints/100000/pretrained_model"
 )
 
 # One port per policy so several can run at once; the menu binds 5550.
 # The port is how a client actually addresses a policy; --name is only a
 # convenient label for the menu listing.
-DEFAULT_BIND = "tcp://*:5555"
+DEFAULT_BIND = "tcp://*:5558"
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,38 +92,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         default=DEFAULT_CHECKPOINT,
-        help="Checkpoint step directory, containing params/ and assets/.",
-    )
-    parser.add_argument(
-        "--config-name",
-        default=DEFAULT_CONFIG_NAME,
-        help="OpenPI TrainConfig name this checkpoint was trained with.",
-    )
-    parser.add_argument(
-        "--prompt",
-        default=DEFAULT_PROMPT,
-        help="Prompt used when a request does not carry its own.",
-    )
-    parser.add_argument(
-        "--num-denoising-steps",
-        type=int,
-        default=None,
         help=(
-            "Flow-matching sample steps. Omit to keep the OpenPI default (10); "
-            "lower it to trade action quality for latency."
+            "Checkpoint directory. Either a pretrained_model/ directory or the "
+            "step directory containing it; both are accepted."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Torch device for the policy (default: cuda).",
+    )
+    parser.add_argument(
+        "--task",
+        default="",
+        help=(
+            "Language instruction used when a request carries no 'prompt'. ACT "
+            "is not language-conditioned, so this is inert here; it exists "
+            "because the LeRobot processor pipeline requires the key."
         ),
     )
     parser.add_argument(
         "--no-warmup",
         action="store_true",
         help=(
-            "Skip the startup warmup inference. Not recommended: the JAX "
-            "compile then lands on the first real request instead."
+            "Skip the startup warmup inference. The first real request then "
+            "pays CUDA workspace allocation and kernel loading instead."
         ),
     )
     parser.add_argument(
         "--name",
-        default='pi05',
+        default='act',
         help=(
             "Label this server registers under, shown in the RURI menu listing. "
             "It is a convenience only: a policy is identified by its port, which "
@@ -164,11 +156,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    policy = Pi05Wrapper(
+    policy = ACTWrapper(
         checkpoint_path=args.checkpoint,
-        config_name=args.config_name,
-        default_prompt=args.prompt,
-        num_denoising_steps=args.num_denoising_steps,
+        device=args.device,
+        task=args.task,
         warmup=not args.no_warmup,
     )
 

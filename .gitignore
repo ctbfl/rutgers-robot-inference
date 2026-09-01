@@ -1,6 +1,9 @@
 # Machine-specific launch scripts (absolute checkpoint and venv paths).
 examples/shell_scripts/*
 
+# Server run logs.
+logs/
+
 # Byte-compiled
 __pycache__/
 *.py[cod]

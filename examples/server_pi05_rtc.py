@@ -1,64 +1,71 @@
 #!/usr/bin/env python
 """
-Example: serve the fine-tuned Pi0.5 tight-insertion policy over ZeroMQ.
+Example: serve the fine-tuned Pi0.5 tight-insertion policy with Real-Time Chunking.
 
-This wires the three pieces together:
+Same wiring as ``server_pi05.py``, with the RTC wrapper in place of the plain
+one::
 
-    Pi05Wrapper (OpenPI + JAX)  ->  ruri.server.serve.serve()  ->  ZMQ REP
+    Pi05RTCWrapper (OpenPI + JAX)  ->  ruri.server.serve.serve()  ->  ZMQ REP
 
-Defaults point at the 10k-step tight_insertion_E1 checkpoint on this
-machine, so the example runs with no arguments.
+RTC conditions each new chunk on the tail of the one the robot is still
+executing, so successive chunks join without a seam. It is inference-time only:
+the same 10k-step tight_insertion_E1 checkpoint, no retraining.
 
 Launch
 ------
-Pi0.5 needs the OpenPI environment (JAX + the TrainConfig registry that
-defines ``pi05_tight_insertion_E1``). RURI is already installed into it
-as an editable package, so no PYTHONPATH is needed::
+Identical to ``server_pi05.py`` -- the OpenPI environment, since RTC is a
+different sampler over the same model::
 
     cd /common/home/jh2400/projects/openpi
     XLA_PYTHON_CLIENT_MEM_FRACTION=0.2 \\
       ./.venv/bin/python \\
-      /common/users/jh2400/rutgers-robot-inference/examples/server_pi05.py
+      /common/users/jh2400/rutgers-robot-inference/examples/server_pi05_rtc.py
 
-JAX preallocates ``XLA_PYTHON_CLIENT_MEM_FRACTION`` of the card at startup,
-so nvidia-smi reports the pool rather than real usage. 0.2 is plenty for one
-Pi0.5 policy and leaves the card usable by others.
-
-Startup takes ~25 s: restoring the params, then a warmup inference that
-triggers JAX compilation. The bind address is printed only once the server
-can actually answer.
+Startup is longer than the plain server, ~40 s rather than ~25 s: the guided
+sampler is a separate JAX program and gets its own warmup compile. That is
+deliberate. Skipping it would move the compile onto the first guided request,
+mid-episode.
 
 Request / response
 ------------------
-Messages are MessagePack-encoded by ``ruri.common.zmq``, which carries numpy
-arrays natively. A client sends::
+Everything ``server_pi05.py`` accepts, plus three optional fields::
 
     {
         "type": "infer",
-        "observation.state":        np.ndarray (7,) float,
-        "observation.images.top":   np.ndarray (H, W, 3) uint8, RGB,
-        "observation.images.wrist": np.ndarray (H, W, 3) uint8, RGB,
-        "prompt":                   str,   # optional, defaults to --prompt
+        ...,
+        "context.rtc.prev_chunk_left_over": np.ndarray (H - s, 7) float32,
+        "context.rtc.consumed_steps": int,                   # s
+        "context.rtc.estimated_inference_delay_steps": int,  # d
     }
 
-and gets back::
+``prev_chunk_left_over`` is the previous ``action_chunk`` with its consumed rows
+dropped, so its row 0 is the timestep this request's row 0 will cover. Omit all
+three on the first step of an episode and the server samples normally.
+
+The response adds an ``rtc.*`` section reporting what was actually applied::
 
     {
         "action_chunk": np.ndarray (10, 7) float32,
-        "prompt": str,
-        "timing.infer_ms": float,
-        "timing.wrapper_ms": float,
+        ...,
+        "rtc.applied": bool,
+        "rtc.reason": str | None,               # why it fell back, if it did
+        "rtc.inference_delay": int,             # after clamping
+        "rtc.prefix_attention_horizon": int,    # after clamping
+        "rtc.schedule": str,
     }
 
-``{"type": "metadata"}`` returns the input contract instead. A failed
-request comes back as ``{"error": "..."}``.
+Watch the clamped values. This checkpoint's chunk is 10 steps, which at 30 fps
+is 333 ms end to end, so the window RTC has to work in is narrow: the horizon
+can never exceed ``H - s``. If it is being clamped down near the delay on every
+request, the client is running late enough that RTC is mostly pinning the
+trajectory rather than steering it.
 """
 
 import argparse
 import logging
 
 from ruri.server.serve import serve
-from ruri.server.wrappers.pi05.pi05 import Pi05Wrapper
+from ruri.server.wrappers.pi05.pi05_rtc import Pi05RTCWrapper
 
 
 # Steps 2000/4000/6000/8000 sit next to this one. There is no validation split
@@ -82,7 +89,7 @@ DEFAULT_PROMPT = (
 # One port per policy so several can run at once; the menu binds 5550.
 # The port is how a client actually addresses a policy; --name is only a
 # convenient label for the menu listing.
-DEFAULT_BIND = "tcp://*:5555"
+DEFAULT_BIND = "tcp://*:5556"
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,20 +123,52 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Flow-matching sample steps. Omit to keep the OpenPI default (10); "
-            "lower it to trade action quality for latency."
+            "lower it to trade action quality for latency. RTC's guidance "
+            "weights are tuned for 10, so change this and re-tune "
+            "--max-guidance-weight."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-attention-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Timestep at which agreement with the previous chunk reaches zero. "
+            "Omit for the full chunk. Always clamped down to the overlap the "
+            "client actually sent, so this is an upper bound. Lower it to buy "
+            "reactivity at the cost of smoothness."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-attention-schedule",
+        default="exp",
+        choices=("exp", "linear", "ones", "zeros"),
+        help=(
+            "How agreement decays across the overlap (default: exp, the "
+            "reference implementation's default). 'zeros' is a hard prefix "
+            "with no soft overlap, i.e. the ablation."
+        ),
+    )
+    parser.add_argument(
+        "--max-guidance-weight",
+        type=float,
+        default=10.0,
+        help=(
+            "Ceiling on PiGDM guidance strength (default: 10.0, tuned for "
+            "10-step flow matching). Higher enforces continuity harder."
         ),
     )
     parser.add_argument(
         "--no-warmup",
         action="store_true",
         help=(
-            "Skip the startup warmup inference. Not recommended: the JAX "
-            "compile then lands on the first real request instead."
+            "Skip both startup warmup inferences. Not recommended: the JAX "
+            "compiles then land on the first real requests instead."
         ),
     )
     parser.add_argument(
         "--name",
-        default='pi05',
+        default='pi05_rtc',
         help=(
             "Label this server registers under, shown in the RURI menu listing. "
             "It is a convenience only: a policy is identified by its port, which "
@@ -164,12 +203,16 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    policy = Pi05Wrapper(
+    policy = Pi05RTCWrapper(
         checkpoint_path=args.checkpoint,
         config_name=args.config_name,
         default_prompt=args.prompt,
         num_denoising_steps=args.num_denoising_steps,
+        prefix_attention_horizon=args.prefix_attention_horizon,
+        prefix_attention_schedule=args.prefix_attention_schedule,
+        max_guidance_weight=args.max_guidance_weight,
         warmup=not args.no_warmup,
+        rtc_warmup=not args.no_warmup,
     )
 
     for key, value in policy.optional_more_metadata().items():
