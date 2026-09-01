@@ -201,11 +201,6 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
     # ------------------------------------------------------------------
 
     @property
-    def action_horizon(self) -> int:
-        """Chunk length H the checkpoint was trained with."""
-        return self.policy._model.action_horizon
-
-    @property
     def max_inference_delay(self) -> int:
         """Largest delay the model was actually trained to condition on."""
         return len(self.policy._model.delay_probs) - 1
@@ -329,7 +324,7 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
             logger.warning("Skipping RTC warmup: no default_prompt is set.")
             return
 
-        horizon = self.action_horizon
+        horizon = self.output_chunk_size
         dummy = {
             "observation.state": np.zeros(self.state_dim, dtype=np.float32),
             "observation.images.top": np.zeros(self.warmup_image_shape, dtype=np.uint8),
@@ -433,7 +428,7 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
                 f"{type(leftover).__name__}."
             )
 
-        horizon_length = self.action_horizon
+        horizon_length = self.output_chunk_size
         if leftover.ndim != 2 or leftover.shape[-1] != self.state_dim:
             raise ValueError(
                 f"{CONTEXT_PREV_CHUNK!r} must have shape (H - s, {self.state_dim}) "
@@ -558,7 +553,6 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
                 "name": "pi05_train_rtc",
                 "rtc_method": "training-time",
                 "paper": "arXiv 2512.05964",
-                "action_horizon": self.action_horizon,
                 "trained_delay_support": f"0-{self.max_inference_delay}",
                 "default_inference_delay": self.default_inference_delay,
             }

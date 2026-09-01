@@ -228,7 +228,7 @@ class LeRobotWrapper(PolicyWrapper):
             )
 
     @property
-    def action_horizon(self) -> int:
+    def output_chunk_size(self) -> int:
         """Number of actions a single inference returns."""
         # chunk_size is None for policies that only expose n_action_steps.
         return self.config.chunk_size or self.config.n_action_steps
@@ -365,7 +365,6 @@ class LeRobotWrapper(PolicyWrapper):
             "name": self.config.type,
             "backend": "lerobot",
             "checkpoint_path": str(self.checkpoint_path),
-            "action_horizon": self.action_horizon,
             "n_action_steps": self.config.n_action_steps,
             "state_dim": self.state_dim,
             "image_keys": self.image_keys,

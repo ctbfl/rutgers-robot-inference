@@ -190,6 +190,11 @@ class Pi05Wrapper(PolicyWrapper):
     # Setup
     # ------------------------------------------------------------------
 
+    @property
+    def output_chunk_size(self) -> int:
+        """Chunk length the checkpoint was trained with."""
+        return self.policy._model.action_horizon
+
     def _load_policy(self) -> "Policy":
         """Build the OpenPI policy, failing fast on a bad checkpoint path."""
         # Deferred so that importing ruri without OpenPI installed works.

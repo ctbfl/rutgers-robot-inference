@@ -177,11 +177,6 @@ class Pi05RTCWrapper(Pi05Wrapper):
     # Setup
     # ------------------------------------------------------------------
 
-    @property
-    def action_horizon(self) -> int:
-        """Chunk length H the checkpoint was trained with."""
-        return self.policy._model.action_horizon
-
     def _load_policy(self):
         """
         Load as usual, after refusing a checkpoint meant for the other method.
@@ -245,7 +240,7 @@ class Pi05RTCWrapper(Pi05Wrapper):
             logger.warning("Skipping RTC warmup: no default_prompt is set.")
             return
 
-        horizon = self.action_horizon
+        horizon = self.output_chunk_size
         dummy = {
             "observation.state": np.zeros(self.state_dim, dtype=np.float32),
             "observation.images.top": np.zeros(self.warmup_image_shape, dtype=np.uint8),
@@ -355,7 +350,7 @@ class Pi05RTCWrapper(Pi05Wrapper):
                 f"{type(leftover).__name__}."
             )
 
-        horizon_length = self.action_horizon
+        horizon_length = self.output_chunk_size
         if leftover.ndim != 2 or leftover.shape[-1] != self.state_dim:
             raise ValueError(
                 f"{CONTEXT_PREV_CHUNK!r} must have shape (H - s, {self.state_dim}) "
@@ -489,7 +484,6 @@ class Pi05RTCWrapper(Pi05Wrapper):
         metadata.update(
             {
                 "name": "pi05_rtc",
-                "action_horizon": self.action_horizon,
                 "prefix_attention_horizon": self.prefix_attention_horizon,
                 "prefix_attention_schedule": self.prefix_attention_schedule,
                 "max_guidance_weight": self.max_guidance_weight,

@@ -245,6 +245,11 @@ class DM05Wrapper(PolicyWrapper):
     # Setup
     # ------------------------------------------------------------------
 
+    @property
+    def output_chunk_size(self) -> int:
+        """Chunk length the checkpoint was trained with."""
+        return self._exp.model_config.chunk_size
+
     def _load_policy(self):
         """Build the OpenDM inference runtime, failing fast on a bad path."""
         self._check_checkpoint()
@@ -467,7 +472,6 @@ class DM05Wrapper(PolicyWrapper):
             "dataset_name": exp.data_config.dataset_name,
             "robot_type": self.policy.default_robot_type,
             "image_prompts": list(self.policy.image_prompts),
-            "chunk_size": exp.model_config.chunk_size,
             "action_dim": self.policy.output_action_dim,
             "action_mode": exp.data_config.action_mode.value,
             "returns_absolute_actions": bool(self.policy.use_absolute_action),
