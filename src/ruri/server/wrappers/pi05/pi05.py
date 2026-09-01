@@ -86,6 +86,15 @@ OPENPI_PROMPT = "prompt"
 # Optional truncation hint from the scheduler, forwarded unmapped.
 CONTEXT_ACTIONS_PER_CHUNK = "context.actions_per_chunk"
 
+# Real-time-chunking hints, forwarded unmapped. Defined here rather than in
+# either RTC wrapper so that the test-time and training-time wrappers are
+# guaranteed to speak the same wire keys without one depending on the other --
+# a scheduler written against one works against the other unchanged, and
+# retiring either wrapper leaves the other intact.
+CONTEXT_PREV_CHUNK = "context.rtc.prev_chunk_left_over"
+CONTEXT_CONSUMED_STEPS = "context.rtc.consumed_steps"
+CONTEXT_INFERENCE_DELAY = "context.rtc.estimated_inference_delay_steps"
+
 
 class Pi05Wrapper(PolicyWrapper):
     """
