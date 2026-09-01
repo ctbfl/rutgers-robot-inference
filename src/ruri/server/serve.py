@@ -158,10 +158,10 @@ def serve(
 
     Args:
         name:
-            Register under this name so the menu can list this server. It
-            identifies the *instance*, not the wrapper class -- two
-            Pi05Wrapper servers on two checkpoints both call themselves
-            "pi05", which is useless for picking one. Omit to run
+            Label to register under, so the menu listing reads as something
+            other than a port number. It is not an identifier: a policy is
+            identified by the port it serves on, which the kernel already
+            keeps unique, and by the contract it publishes. Omit to run
             unannounced.
         advertise_host:
             Hostname to publish in place of the bind wildcard. Defaults to

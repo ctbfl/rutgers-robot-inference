@@ -2,7 +2,10 @@
 How a policy server announces itself, and how the menu reaps the dead.
 
 A policy server writes one JSON file into :data:`ruri.config.POLICIES_DIR` when
-it becomes able to serve, and then forgets about it. It never deletes it, not
+it becomes able to serve, and then forgets about it. The file is named after
+the port it serves on, because that is what actually identifies a policy: it is
+unique, the kernel enforces it, and it is the thing a client dials. ``--name``
+is a convenience label for the listing, so two servers may share one. It never deletes it, not
 even on a clean exit. The menu sweeps the directory once a second, drops any
 entry whose pid is gone, and unlinks the file.
 
@@ -32,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -43,8 +47,23 @@ from ruri.config import MENU_LOG, MENU_PORT, POLICIES_DIR, RUNTIME_DIR
 logger = logging.getLogger(__name__)
 
 
-def entry_path(name: str):
-    return POLICIES_DIR / f"{name}.json"
+def entry_key(endpoint: str) -> str:
+    """
+    Filename for an entry, derived from the endpoint.
+
+    Keyed by port rather than by name because the port is already unique and
+    the kernel enforces it -- two servers cannot bind the same one. A name is
+    only a label for the listing, so two servers are free to share one, and
+    there is no collision to detect.
+    """
+    port = re.search(r":(\d+)$", endpoint)
+    if port:
+        return port.group(1)
+    return re.sub(r"[^A-Za-z0-9._-]", "_", endpoint)
+
+
+def entry_path(endpoint: str):
+    return POLICIES_DIR / f"{entry_key(endpoint)}.json"
 
 
 def advertised_endpoint(bind_address: str, host: str | None = None) -> str:
@@ -72,6 +91,7 @@ def register(name: str, endpoint: str, describe: dict[str, Any]) -> None:
     """
     try:
         POLICIES_DIR.mkdir(parents=True, exist_ok=True)
+
         payload = {
             "name": name,
             "endpoint": endpoint,
@@ -79,9 +99,9 @@ def register(name: str, endpoint: str, describe: dict[str, Any]) -> None:
             "describe": describe,
         }
         # Written whole, then renamed, so the menu never reads half a file.
-        tmp = entry_path(name).with_suffix(".json.tmp")
+        tmp = entry_path(endpoint).with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, default=str))
-        tmp.rename(entry_path(name))
+        tmp.rename(entry_path(endpoint))
         logger.info("Registered %r at %s", name, endpoint)
     except Exception:
         logger.exception("Could not register %r; serving anyway", name)

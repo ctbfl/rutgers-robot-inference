@@ -73,7 +73,10 @@ DEFAULT_CHECKPOINT = (
     "/checkpoints/100000/pretrained_model"
 )
 
-DEFAULT_BIND = "tcp://*:5555"
+# One port per policy so several can run at once; the menu binds 5550.
+# The port is how a client actually addresses a policy; --name is only a
+# convenient label for the menu listing.
+DEFAULT_BIND = "tcp://*:5558"
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,10 +123,11 @@ def parse_args() -> argparse.Namespace:
         "--name",
         default='act',
         help=(
-            "Name this server registers under, so the RURI menu can list it and "
-            "a client can pick it. It identifies this instance, not the wrapper "
-            "class: two Pi0.5 servers on two checkpoints would both call "
-            "themselves 'pi05'. Pass --name '' to run unannounced."
+            "Label this server registers under, shown in the RURI menu listing. "
+            "It is a convenience only: a policy is identified by its port, which "
+            "is unique and which the client actually dials, and by the "
+            "inputs/outputs contract it publishes. Two servers may share a "
+            "label. Pass --name '' to run unannounced."
         ),
     )
     parser.add_argument(
