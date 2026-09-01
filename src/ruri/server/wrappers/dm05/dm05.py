@@ -62,7 +62,6 @@ namespaces::
         "observation.images.top":   (H, W, 3) uint8,   # third-person camera
         "observation.images.wrist": (H, W, 3) uint8,   # wrist camera
         "prompt":                   str,               # optional per-request
-        "context.actions_per_chunk": int,              # optional truncation
     }
 
 These are the same keys the Pi0.5 wrapper takes, so one client can be pointed
@@ -133,8 +132,6 @@ DM05_IMAGE_HEAD = "observation.images.1"
 DM05_IMAGE_LEFT_WRIST = "observation.images.2"
 DM05_PROMPT = "prompt"
 
-# Optional truncation hint from the scheduler, forwarded unmapped.
-CONTEXT_ACTIONS_PER_CHUNK = "context.actions_per_chunk"
 
 
 class DM05Wrapper(PolicyWrapper):
@@ -386,12 +383,6 @@ class DM05Wrapper(PolicyWrapper):
                 f"Expected DM0.5 actions of shape (horizon, action_dim), got "
                 f"{actions.shape}"
             )
-
-        # The scheduler may want fewer actions than the model's horizon, e.g.
-        # when it re-plans faster than the chunk is consumed.
-        actions_per_chunk = inputs.get(CONTEXT_ACTIONS_PER_CHUNK)
-        if actions_per_chunk is not None:
-            actions = actions[:actions_per_chunk]
 
         model_latency = self.policy.last_model_latency_sec
         infer_ms = float("nan") if model_latency is None else model_latency * 1000.0

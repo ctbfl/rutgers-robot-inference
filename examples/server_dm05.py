@@ -55,7 +55,7 @@ comes back as ``{"error": "..."}``.
 These are the same keys ``server_pi05.py`` serves, and both return absolute
 joint targets in the dataset's units, so the same client can be pointed at
 either for an A/B on the same robot. The horizons differ: Pi0.5 returns 10
-actions, DM0.5 returns 50. Send ``context.actions_per_chunk`` to truncate.
+actions, DM0.5 returns 50. Both return their whole chunk; the scheduler slices.
 """
 
 import argparse

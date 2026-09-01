@@ -79,11 +79,6 @@ gt = np.stack([json.loads(lines[FRAME + i])["action"] for i in range(50)]).astyp
 print("gt[-1]         :", np.round(gt[-1], 2).tolist())
 print("mean |pred-gt| per joint:", np.round(np.abs(a - gt).mean(axis=0), 3).tolist())
 
-print("\n=== truncation via context.actions_per_chunk ===")
-r2 = handle_request(w, {**req, "context.actions_per_chunk": 10})
-print("action_chunk:", r2["action_chunk"].shape)
-assert r2["action_chunk"].shape == (10, 7)
-
 print("\n=== metadata request ===")
 print("inputs:", sorted(handle_request(w, {"type": "metadata"})["inputs"]))
 

@@ -19,8 +19,8 @@ will refuse to start rather than silently drop a camera.
 **Chunks are long.** chunk_size is 100, which at this dataset's 30 fps is 3.3
 seconds of motion -- ten times the Pi0.5 config's horizon. Combined with ~9 ms
 inference, the scheduler has an enormous amount of slack here compared to Pi0.5,
-where a whole chunk was 333 ms. Expect to use ``context.actions_per_chunk``, or
-to re-plan long before the chunk runs out.
+where a whole chunk was 333 ms. The whole chunk comes back regardless; expect
+the scheduler to re-plan long before it runs out and to discard the tail.
 
 **Actions are absolute joint targets**, not deltas relative to the current
 state. There is no delta transform anywhere in the LeRobot ACT pipeline, so the

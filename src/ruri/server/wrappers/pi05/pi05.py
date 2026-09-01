@@ -26,7 +26,6 @@ namespaces::
         "observation.images.top":   (H, W, 3) uint8,      # third-person camera
         "observation.images.wrist": (H, W, 3) uint8,      # wrist camera
         "prompt":                   str,                  # optional per-request
-        "context.actions_per_chunk": int,                 # optional truncation
     }
 
 :attr:`Pi05Wrapper.INPUT_MAPPING` renames those to the keys OpenPI's
@@ -83,8 +82,6 @@ OPENPI_BASE_IMAGE = "observation/image"
 OPENPI_WRIST_IMAGE = "observation/wrist_image"
 OPENPI_PROMPT = "prompt"
 
-# Optional truncation hint from the scheduler, forwarded unmapped.
-CONTEXT_ACTIONS_PER_CHUNK = "context.actions_per_chunk"
 
 # Real-time-chunking hints, forwarded unmapped. Defined here rather than in
 # either RTC wrapper so that the test-time and training-time wrappers are
@@ -282,12 +279,6 @@ class Pi05Wrapper(PolicyWrapper):
             raise ValueError(
                 f"Expected Pi0.5 actions of shape (horizon, action_dim), got {actions.shape}"
             )
-
-        # The scheduler may want fewer actions than the model's horizon, e.g.
-        # when it re-plans faster than the chunk is consumed.
-        actions_per_chunk = inputs.get(CONTEXT_ACTIONS_PER_CHUNK)
-        if actions_per_chunk is not None:
-            actions = actions[:actions_per_chunk]
 
         infer_ms = float(result.get("policy_timing", {}).get("infer_ms", float("nan")))
         wrapper_ms = (time.perf_counter() - wrapper_start) * 1000.0

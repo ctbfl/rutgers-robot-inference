@@ -28,7 +28,6 @@ Standard RURI naming, flat with dot-separated namespaces::
         "observation.state":         (state_dim,) float,
         "observation.images.<name>": (H, W, 3) uint8,   # one per camera
         "prompt":                    str,               # optional
-        "context.actions_per_chunk": int,               # optional truncation
     }
 
 ``INPUT_MAPPING`` renames those to the checkpoint's own feature keys, so a
@@ -73,8 +72,6 @@ from ruri.server.wrappers.policy_wrapper import PolicyWrapper
 logger = logging.getLogger(__name__)
 
 
-# Optional truncation hint from the scheduler, forwarded unmapped.
-CONTEXT_ACTIONS_PER_CHUNK = "context.actions_per_chunk"
 
 # LeRobot's own key for the language instruction.
 LEROBOT_TASK = "task"
@@ -311,11 +308,6 @@ class LeRobotWrapper(PolicyWrapper):
             raise ValueError(
                 f"Expected actions of shape (horizon, action_dim), got {actions.shape}"
             )
-
-        # The scheduler may want fewer actions than the model's horizon.
-        actions_per_chunk = inputs.get(CONTEXT_ACTIONS_PER_CHUNK)
-        if actions_per_chunk is not None:
-            actions = actions[:actions_per_chunk]
 
         wrapper_ms = (time.perf_counter() - wrapper_start) * 1000.0
 

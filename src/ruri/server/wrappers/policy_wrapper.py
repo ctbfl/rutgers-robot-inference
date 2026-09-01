@@ -29,7 +29,7 @@ namespaces, for example:
     observation.images.top
     observation.images.wrist
     prompt
-    context.current_chunk
+    context.rtc.prev_chunk_left_over
 
 Two independent declarations
 ----------------------------

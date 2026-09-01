@@ -32,7 +32,6 @@ arrays natively. A client sends::
         "observation.state":        np.ndarray (7,) float,
         "observation.images.top":   np.ndarray (H, W, 3) uint8, RGB,
         "observation.images.wrist": np.ndarray (H, W, 3) uint8, RGB,
-        "context.actions_per_chunk": int,   # optional truncation
     }
 
 and gets back::
@@ -50,8 +49,8 @@ key here as for Pi0.5.
 Two things differ from the Pi0.5 servers and matter to the scheduler:
 
   * The chunk is **100 steps**, i.e. 3.3 s at 30 fps, against Pi0.5's 10 steps
-    / 333 ms. Use ``context.actions_per_chunk`` or re-plan well before it runs
-    out.
+    / 333 ms. The whole chunk always comes back; re-plan well before it runs
+    out and drop the tail.
   * Actions are **absolute joint targets**, not deltas against the current
     state, so they can go to the arm as-is.
 

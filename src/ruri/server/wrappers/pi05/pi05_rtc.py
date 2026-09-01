@@ -83,7 +83,6 @@ from typing import Any
 import numpy as np
 
 from ruri.server.wrappers.pi05.pi05 import (
-    CONTEXT_ACTIONS_PER_CHUNK,
     CONTEXT_CONSUMED_STEPS,
     CONTEXT_INFERENCE_DELAY,
     CONTEXT_PREV_CHUNK,
@@ -311,10 +310,6 @@ class Pi05RTCWrapper(Pi05Wrapper):
             raise ValueError(
                 f"Expected Pi0.5 actions of shape (horizon, action_dim), got {actions.shape}"
             )
-
-        actions_per_chunk = inputs.get(CONTEXT_ACTIONS_PER_CHUNK)
-        if actions_per_chunk is not None:
-            actions = actions[:actions_per_chunk]
 
         wrapper_ms = (time.perf_counter() - wrapper_start) * 1000.0
 
