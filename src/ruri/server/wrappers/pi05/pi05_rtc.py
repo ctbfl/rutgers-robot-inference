@@ -14,6 +14,21 @@ seam disappears. It is inference-time only -- the same checkpoint, no retraining
 :mod:`ruri.server.wrappers.pi05.rtc` holds the algorithm; this file holds the
 plumbing.
 
+Not to be confused with training-time RTC
+-----------------------------------------
+:mod:`ruri.server.wrappers.pi05.pi05_train_rtc` implements a *different* method
+(arXiv 2512.05964) that requires its own checkpoint. This module is the
+inference-time method (arXiv 2506.07339): PiGDM guidance, tunable soft overlap,
+one extra VJP per flow step, and an approximation of the conditional that pushes
+the sampler off the training distribution. The other module has none of those,
+and its comparison table is worth reading before choosing.
+
+Feeding a training-time RTC checkpoint to this wrapper would be silent rather
+than loud -- ``BaseModelConfig.load`` drops the extra ``tok_time_proj``
+parameter without a warning, discarding the entire training run and leaving
+guidance running on weights fine-tuned away from its assumptions. Hence the
+check in :meth:`Pi05RTCWrapper._load_policy`.
+
 Request contract
 ----------------
 Everything ``Pi05Wrapper`` accepts, plus::
@@ -167,6 +182,36 @@ class Pi05RTCWrapper(Pi05Wrapper):
     def action_horizon(self) -> int:
         """Chunk length H the checkpoint was trained with."""
         return self.policy._model.action_horizon
+
+    def _load_policy(self):
+        """
+        Load as usual, after refusing a checkpoint meant for the other method.
+
+        ``BaseModelConfig.load`` intersects the checkpoint against the model's
+        own parameter tree and drops the remainder, so a training-time RTC
+        checkpoint loads here without complaint and silently loses the
+        conditioning it was trained for. Reading the Orbax metadata costs ~20 ms
+        and turns that into an error.
+        """
+        params_dir = self.checkpoint_path / "params"
+        if params_dir.exists():
+            try:
+                import orbax.checkpoint as ocp
+
+                metadata = ocp.PyTreeCheckpointer().metadata(params_dir)
+                top_level = set(metadata.get("params", metadata))
+            except Exception as exc:  # noqa: BLE001 - never block loading on a probe
+                logger.debug("Could not read checkpoint metadata (%s); skipping check", exc)
+            else:
+                if "tok_time_proj" in top_level:
+                    raise ValueError(
+                        f"{self.checkpoint_path} is a training-time RTC checkpoint "
+                        "(it has a tok_time_proj parameter), which this wrapper would "
+                        "silently discard. Serve it with Pi05TrainRTCWrapper "
+                        "(ruri.server.wrappers.pi05.pi05_train_rtc) instead; that is a "
+                        "different method, not a different setting of this one."
+                    )
+        return super()._load_policy()
 
     def _build_rtc_sampler(self):
         """JIT the guided sampler. Deferred so importing ruri stays JAX-free."""
