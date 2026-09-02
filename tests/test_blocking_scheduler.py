@@ -23,6 +23,11 @@ class BlockingSchedulerTests(unittest.TestCase):
             )
 
             class FakeController:
+                action_bounds = (
+                    np.asarray([-100.0], dtype=np.float32),
+                    np.asarray([100.0], dtype=np.float32),
+                )
+
                 def __init__(self, received_args):
                     pass
 
@@ -33,7 +38,7 @@ class BlockingSchedulerTests(unittest.TestCase):
                     return {"observation.state": np.zeros(1, dtype=np.float32)}
 
                 def send_action(self, action):
-                    return np.clip(action, -100.0, 100.0)
+                    pass
 
                 def stop(self):
                     pass
@@ -44,20 +49,15 @@ class BlockingSchedulerTests(unittest.TestCase):
                 def __init__(self, received_args):
                     pass
 
-                def start(self):
-                    pass
-
                 def infer(self, inputs):
                     return {
                         "action_chunk": np.asarray([[101.0], [2.0]], dtype=np.float32)
                     }
 
-                def stop(self):
-                    pass
-
             scheduler = BlockingScheduler()
+            policy = FakePolicy(args)
             with patch("ruri.client.schedulers.blocking.time.sleep"):
-                scheduler.run(FakeController, FakePolicy, args=args)
+                scheduler.run(FakeController, policy, args=args)
 
             self.assertIsNotNone(scheduler.last_log_path)
             records = [
@@ -67,8 +67,8 @@ class BlockingSchedulerTests(unittest.TestCase):
             self.assertTrue(any(r["event"] == "inference_returned" for r in records))
             actions = [r for r in records if r["event"] == "action"]
             self.assertEqual(len(actions), 1)
-            self.assertEqual(actions[0]["action"], [101.0])
-            self.assertEqual(actions[0]["accepted_action"], [100.0])
+            self.assertEqual(actions[0]["action"], [100.0])
+            self.assertEqual(actions[0]["pre_clip_action"], [101.0])
             self.assertTrue(actions[0]["clipped"])
             stop = next(r for r in records if r["event"] == "run_stop")
             self.assertEqual(stop["stats"]["actions_sent"], 1)
@@ -116,9 +116,6 @@ class BlockingSchedulerTests(unittest.TestCase):
                 instances["policy"] = self
                 events.append("policy.init")
 
-            def start(self):
-                events.append("policy.start")
-
             def infer(self, observation):
                 self.calls += 1
                 self.assert_shared_args()
@@ -138,11 +135,9 @@ class BlockingSchedulerTests(unittest.TestCase):
                 if self.args is not args:
                     raise AssertionError("Policy did not receive the global args object")
 
-            def stop(self):
-                events.append("policy.stop")
-
+        policy = FakePolicy(args)
         with patch("ruri.client.schedulers.blocking.time.sleep"):
-            BlockingScheduler().run(FakeController, FakePolicy, args=args)
+            BlockingScheduler().run(FakeController, policy, args=args)
 
         self.assertIs(instances["controller"].args, args)
         self.assertIs(instances["policy"].args, args)
@@ -150,9 +145,8 @@ class BlockingSchedulerTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                "controller.init",
                 "policy.init",
-                "policy.start",
+                "controller.init",
                 "controller.start",
                 "controller.observe.1",
                 "policy.infer.1",
@@ -163,11 +157,10 @@ class BlockingSchedulerTests(unittest.TestCase):
                 "controller.action.21",
                 "controller.action.22",
                 "controller.stop",
-                "policy.stop",
             ],
         )
 
-    def test_stops_both_components_when_controller_start_fails(self):
+    def test_stops_controller_when_controller_start_fails(self):
         events = []
         args = SimpleNamespace(
             control_hz=30.0,
@@ -192,18 +185,13 @@ class BlockingSchedulerTests(unittest.TestCase):
             def __init__(self, received_args):
                 self.args = received_args
 
-            def start(self):
-                events.append("policy.start")
-
-            def stop(self):
-                events.append("policy.stop")
-
+        policy = FakePolicy(args)
         with self.assertRaisesRegex(RuntimeError, "hardware failed"):
-            BlockingScheduler().run(FailingController, FakePolicy, args=args)
+            BlockingScheduler().run(FailingController, policy, args=args)
 
         self.assertEqual(
             events,
-            ["policy.start", "controller.start", "controller.stop", "policy.stop"],
+            ["controller.start", "controller.stop"],
         )
 
     def test_rejects_execution_prefix_before_starting_hardware(self):
@@ -231,18 +219,11 @@ class BlockingSchedulerTests(unittest.TestCase):
             def __init__(self, received_args):
                 pass
 
-            def start(self):
-                events.append("policy.start")
-
-            def stop(self):
-                events.append("policy.stop")
-
+        policy = FakePolicy(args)
         with self.assertRaisesRegex(ValueError, "output_chunk_size"):
-            BlockingScheduler().run(FakeController, FakePolicy, args=args)
+            BlockingScheduler().run(FakeController, policy, args=args)
 
-        self.assertEqual(
-            events, ["policy.start", "controller.stop", "policy.stop"]
-        )
+        self.assertEqual(events, ["controller.stop"])
 
     def test_predicts_ten_but_executes_only_first_five(self):
         instances = {}
@@ -291,11 +272,9 @@ class BlockingSchedulerTests(unittest.TestCase):
                     )[:, None]
                 }
 
-            def stop(self):
-                pass
-
+        policy = FakePolicy(args)
         with patch("ruri.client.schedulers.blocking.time.sleep"):
-            BlockingScheduler().run(FakeController, FakePolicy, args=args)
+            BlockingScheduler().run(FakeController, policy, args=args)
 
         self.assertEqual(instances["policy"].calls, 2)
         self.assertEqual(

@@ -78,9 +78,6 @@ class RollingSchedulerTests(unittest.TestCase):
                 self.inputs = []
                 instances["policy"] = self
 
-            def start(self):
-                events.append("policy.start")
-
             def infer(self, inputs):
                 self.calls += 1
                 self.inputs.append(inputs)
@@ -91,11 +88,9 @@ class RollingSchedulerTests(unittest.TestCase):
                     ]
                 }
 
-            def stop(self):
-                events.append("policy.stop")
-
         scheduler = RollingScheduler()
-        scheduler.run(FakeController, FakePolicy, args=args)
+        policy = FakePolicy(args)
+        scheduler.run(FakeController, policy, args=args)
 
         robot = instances["controller"]
         policy = instances["policy"]
@@ -108,8 +103,7 @@ class RollingSchedulerTests(unittest.TestCase):
             robot.observation_threads,
             ["ruri-rolling-inference", "ruri-rolling-inference"],
         )
-        self.assertEqual(events[0:2], ["policy.start", "controller.start"])
-        self.assertEqual(events[-2:], ["controller.stop", "policy.stop"])
+        self.assertEqual(events, ["controller.start", "controller.stop"])
         self.assertEqual(scheduler.last_run_stats["chunks_received"], 2)
         self.assertGreater(scheduler.last_run_stats["overlap_actions"], 0)
 
@@ -154,11 +148,8 @@ class RollingSchedulerTests(unittest.TestCase):
                     time.sleep(0.055)
                 return {"action_chunk": np.asarray([[1.0], [2.0]])}
 
-            def stop(self):
-                pass
-
         scheduler = RollingScheduler()
-        scheduler.run(TimedController, SlowPolicy, args=args)
+        scheduler.run(TimedController, SlowPolicy(args), args=args)
 
         send_times = instances["controller"].send_times
         intervals = np.diff(send_times)
@@ -203,12 +194,9 @@ class RollingSchedulerTests(unittest.TestCase):
                 def infer(self, inputs):
                     return {"action_chunk": np.asarray([[1.0], [2.0]])}
 
-                def stop(self):
-                    pass
-
             scheduler = RollingScheduler()
             with self.assertRaisesRegex(ValueError, "test action rejected"):
-                scheduler.run(RejectingController, FakePolicy, args=args)
+                scheduler.run(RejectingController, FakePolicy(args), args=args)
 
             self.assertIsNotNone(scheduler.last_log_path)
             log_path = Path(scheduler.last_log_path)
@@ -233,7 +221,7 @@ class RollingSchedulerTests(unittest.TestCase):
         args = SimpleNamespace(aggregate_fn_name="mystery")
 
         with self.assertRaisesRegex(ValueError, "Unknown aggregate_fn_name"):
-            RollingScheduler().run(lambda _: object(), lambda _: object(), args=args)
+            RollingScheduler().run(lambda _: object(), object(), args=args)
 
 
 if __name__ == "__main__":

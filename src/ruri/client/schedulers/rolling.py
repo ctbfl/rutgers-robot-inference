@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 
 from ruri.client._args import get_arg
+from ruri.client.schedulers._actions import clip_target
 
 
 logger = logging.getLogger(__name__)
@@ -84,19 +85,18 @@ class RollingScheduler:
     def run(
         self,
         controller: Callable[[Any], Any],
-        policy: Callable[[Any], Any],
+        policy: Any,
         *,
         args: Any,
     ) -> None:
         """Run a fixed-rate executor and an asynchronous inference worker.
 
-        The exact same global ``args`` object is passed to both factories.  An
-        initial chunk is fetched before execution starts.  Afterwards a new
-        observation is requested when the fraction of actions remaining in the
-        current chunk reaches ``chunk_size_threshold``.
+        ``policy`` is an already-connected handle.  An initial chunk is
+        fetched before execution starts. Afterwards a new observation is
+        requested when the fraction of actions remaining in the current chunk
+        reaches ``chunk_size_threshold``.
         """
         robot = controller(args)
-        remote_policy = policy(args)
 
         control_hz = float(get_arg(args, "control_hz", 30.0))
         max_chunks = get_arg(args, "max_chunks", None)
@@ -128,7 +128,6 @@ class RollingScheduler:
 
         worker: threading.Thread | None = None
         stop_worker = threading.Event()
-        ready_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
         request_queue: queue.Queue[object] = queue.Queue(maxsize=1)
         result_queue: queue.Queue[tuple[str, int | None, Any]] = queue.Queue(maxsize=1)
         stop_token = object()
@@ -136,101 +135,74 @@ class RollingScheduler:
         latest_step_lock = threading.Lock()
 
         def inference_worker() -> None:
-            try:
-                # The policy's complete lifecycle stays on one thread.  This
-                # matters for transports such as ZeroMQ sockets, which must not
-                # be reused from a different thread after initial inference.
+            while not stop_worker.is_set():
+                request = request_queue.get()
+                if request is stop_token:
+                    return
+                request_id = int(request)
+                inference_started_ns = time.monotonic_ns()
+                if trace is not None:
+                    trace.record("inference_started", request_id=request_id)
                 try:
-                    remote_policy.start()
+                    observation = robot.get_observation()
+                    with latest_step_lock:
+                        observation_step = latest_step[0]
+                    # ACT action_chunk[0] is the first command to execute
+                    # *after* this observation. latest_step is the command
+                    # already sent, so anchoring offset zero there would
+                    # discard action_chunk[0] and shift every subsequent
+                    # action one control tick early.
+                    first_action_step = observation_step + 1
+                    inputs = self._policy_inputs(observation, args)
+                    chunk = self._action_chunk(policy.infer(inputs))
+                    if chunk.shape[0] != output_chunk_size:
+                        raise ValueError(
+                            "Policy returned an action chunk whose horizon does "
+                            "not match metadata outputs.output_chunk_size: "
+                            f"{chunk.shape[0]} != {output_chunk_size}"
+                        )
+                    if trace is not None:
+                        trace.record(
+                            "inference_result",
+                            request_id=request_id,
+                            observation_timestep=observation_step,
+                            first_action_timestep=first_action_step,
+                            duration_ms=(
+                                time.monotonic_ns() - inference_started_ns
+                            )
+                            / 1_000_000.0,
+                            chunk_shape=list(chunk.shape),
+                            action_min=float(np.min(chunk)),
+                            action_max=float(np.max(chunk)),
+                        )
+                    result_queue.put(("ok", first_action_step, chunk))
                 except Exception as error:
                     if trace is not None:
                         trace.record(
-                            "policy_start_error",
+                            "inference_error",
+                            request_id=request_id,
+                            duration_ms=(
+                                time.monotonic_ns() - inference_started_ns
+                            )
+                            / 1_000_000.0,
                             error_type=type(error).__name__,
                             error=str(error),
                             traceback=traceback.format_exc(),
                         )
-                    ready_queue.put(("error", error))
-                    return
-                output_chunk_size = int(remote_policy.output_chunk_size)
-                if trace is not None:
-                    trace.record(
-                        "policy_ready", output_chunk_size=output_chunk_size
-                    )
-                ready_queue.put(("ok", output_chunk_size))
-                while not stop_worker.is_set():
-                    request = request_queue.get()
-                    if request is stop_token:
-                        return
-                    request_id = int(request)
-                    inference_started_ns = time.monotonic_ns()
-                    if trace is not None:
-                        trace.record("inference_started", request_id=request_id)
-                    try:
-                        observation = robot.get_observation()
-                        with latest_step_lock:
-                            observation_step = latest_step[0]
-                        # ACT action_chunk[0] is the first command to execute
-                        # *after* this observation.  latest_step is the command
-                        # already sent, so anchoring offset zero there would
-                        # discard action_chunk[0] and shift every subsequent
-                        # action one control tick early.
-                        first_action_step = observation_step + 1
-                        inputs = self._policy_inputs(observation, args)
-                        chunk = self._action_chunk(remote_policy.infer(inputs))
-                        if chunk.shape[0] != output_chunk_size:
-                            raise ValueError(
-                                "Policy returned an action chunk whose horizon does "
-                                "not match metadata outputs.output_chunk_size: "
-                                f"{chunk.shape[0]} != {output_chunk_size}"
-                            )
-                        if trace is not None:
-                            trace.record(
-                                "inference_result",
-                                request_id=request_id,
-                                observation_timestep=observation_step,
-                                first_action_timestep=first_action_step,
-                                duration_ms=(
-                                    time.monotonic_ns() - inference_started_ns
-                                )
-                                / 1_000_000.0,
-                                chunk_shape=list(chunk.shape),
-                                action_min=float(np.min(chunk)),
-                                action_max=float(np.max(chunk)),
-                            )
-                        result_queue.put(("ok", first_action_step, chunk))
-                    except Exception as error:
-                        if trace is not None:
-                            trace.record(
-                                "inference_error",
-                                request_id=request_id,
-                                duration_ms=(
-                                    time.monotonic_ns() - inference_started_ns
-                                )
-                                / 1_000_000.0,
-                                error_type=type(error).__name__,
-                                error=str(error),
-                                traceback=traceback.format_exc(),
-                            )
-                        result_queue.put(("error", None, error))
-            finally:
-                remote_policy.stop()
-                if trace is not None:
-                    trace.record("policy_stopped")
+                    result_queue.put(("error", None, error))
 
         try:
+            output_chunk_size = int(policy.output_chunk_size)
+            if trace is not None:
+                trace.record(
+                    "policy_ready", output_chunk_size=output_chunk_size
+                )
             worker = threading.Thread(
                 target=inference_worker,
                 name="ruri-rolling-inference",
                 daemon=True,
             )
             worker.start()
-
-            # Check the remote dependency before enabling real hardware.
-            ready_status, ready_payload = ready_queue.get()
-            if ready_status == "error":
-                raise ready_payload
-            horizon = int(ready_payload)
             robot.start()
             if trace is not None:
                 trace.record("controller_ready")
@@ -251,7 +223,7 @@ class RollingScheduler:
             self.last_run_stats = self._execute(
                 robot=robot,
                 initial_chunk=initial_chunk,
-                horizon=horizon,
+                horizon=output_chunk_size,
                 control_hz=control_hz,
                 max_chunks=max_chunks,
                 threshold=threshold,
@@ -387,9 +359,10 @@ class RollingScheduler:
                 raise RuntimeError("RollingScheduler has no action available to execute")
 
             action_values = np.asarray(action, dtype=np.float32).copy()
+            target, clipped = clip_target(robot, action_values)
             send_started_ns = time.monotonic_ns()
             try:
-                accepted = robot.send_action(action_values)
+                robot.send_action(target)
             except Exception as error:
                 if trace is not None:
                     trace.record(
@@ -397,7 +370,10 @@ class RollingScheduler:
                         timestep=expected_step,
                         source=action_source,
                         outcome="rejected",
-                        action=action_values.tolist(),
+                        action=target.tolist(),
+                        pre_clip_action=(
+                            action_values.tolist() if clipped else None
+                        ),
                         queue_size=len(future_actions),
                         inference_in_flight=inference_in_flight,
                         chunks_requested=chunks_requested,
@@ -409,20 +385,15 @@ class RollingScheduler:
                         traceback=traceback.format_exc(),
                     )
                 raise
-            accepted_values = (
-                action_values
-                if accepted is None
-                else np.asarray(accepted, dtype=np.float32).copy()
-            )
             if trace is not None:
                 trace.record(
                     "action",
                     timestep=expected_step,
                     source=action_source,
                     outcome="sent",
-                    action=action_values.tolist(),
-                    accepted_action=accepted_values.tolist(),
-                    clipped=not np.array_equal(action_values, accepted_values),
+                    action=target.tolist(),
+                    pre_clip_action=(action_values.tolist() if clipped else None),
+                    clipped=clipped,
                     queue_size=len(future_actions),
                     inference_in_flight=inference_in_flight,
                     chunks_requested=chunks_requested,
@@ -430,7 +401,7 @@ class RollingScheduler:
                     send_duration_ms=(time.monotonic_ns() - send_started_ns)
                     / 1_000_000.0,
                 )
-            last_action = action_values
+            last_action = target
             with latest_step_lock:
                 latest_step[0] = expected_step
             actions_sent += 1

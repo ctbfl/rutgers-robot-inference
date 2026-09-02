@@ -17,22 +17,6 @@ from ruri.client.controllers.single_piper.config import SinglePiperConfig
 logger = logging.getLogger(__name__)
 
 
-def resolve_teleop_root(configured: Path | None) -> Path:
-    candidates = []
-    if configured is not None:
-        candidates.append(configured)
-    if root := os.environ.get("RURI_PIPER_TELEOP_ROOT"):
-        candidates.append(Path(root))
-    candidates.append(Path(__file__).resolve().parents[6] / "piper_teleop_agx")
-    for candidate in candidates:
-        if (candidate / "mit_policy_controller.py").is_file():
-            return candidate.resolve()
-    raise FileNotFoundError(
-        "Could not find piper_teleop_agx/mit_policy_controller.py; set "
-        "SinglePiperConfig.teleop_root or RURI_PIPER_TELEOP_ROOT"
-    )
-
-
 class ManagedMITProcess:
     """Start and supervise the MIT loop as an implementation detail of Controller."""
 
@@ -50,12 +34,12 @@ class ManagedMITProcess:
     def start(self) -> None:
         if self.running:
             raise RuntimeError("MIT worker is already running")
-        root = resolve_teleop_root(self.config.teleop_root)
         python = self.config.python_executable or Path(sys.executable)
         command = [
             str(python),
             "-u",
-            str(root / "mit_policy_controller.py"),
+            "-m",
+            "ruri.client.controllers.single_piper.mit.policy_controller",
             "--follower-can",
             self.can_interface,
             "--command-address",
@@ -74,7 +58,6 @@ class ManagedMITProcess:
             command.extend(("--diagnostic-log", str(diagnostic_log)))
         self.process = subprocess.Popen(
             command,
-            cwd=root,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -115,3 +98,78 @@ class ManagedMITProcess:
                 os.killpg(self.process.pid, signal.SIGTERM)
                 self.wait(5.0)
         self.process = None
+
+
+class ManagedMITTeleopProcess(ManagedMITProcess):
+    """Launch the packaged leader/follower MIT worker as the sole CAN owner."""
+
+    def __init__(self, config, leader_can_interface: str, follower_can_interface: str):
+        super().__init__(config, follower_can_interface)
+        self.leader_can_interface = leader_can_interface
+        self.follower_can_interface = follower_can_interface
+
+    def start(self) -> None:
+        if self.running:
+            raise RuntimeError("MIT teleop worker is already running")
+        python = self.config.python_executable or Path(sys.executable)
+        command = [
+            str(python),
+            "-u",
+            "-m",
+            "ruri.client.controllers.single_piper.mit.leader_follower",
+            "--leader-can",
+            self.leader_can_interface,
+            "--follower-can",
+            self.follower_can_interface,
+            "--telemetry-address",
+            self.config.telemetry_address,
+            "--rate",
+            str(self.config.mit_rate_hz),
+            "--leader-kd",
+            str(self.config.leader_kd),
+            "--follower-kp",
+            str(self.config.follower_kp),
+            "--follower-kd",
+            str(self.config.follower_kd),
+            "--engage-seconds",
+            str(self.config.engage_seconds),
+            "--start-home-speed",
+            str(self.config.start_home_speed),
+            "--max-start-gap",
+            str(self.config.max_start_gap),
+            "--max-track-error",
+            str(self.config.max_track_error),
+            "--max-joint-speed",
+            str(self.config.max_joint_speed),
+            "--max-reference-speed",
+            str(self.config.max_reference_speed),
+            "--feedback-timeout",
+            str(self.config.feedback_timeout_s),
+            "--seconds",
+            str(self.config.seconds),
+            "--abort-hold-seconds",
+            str(self.config.abort_hold_seconds),
+            "--abort-home-speed",
+            str(self.config.abort_home_speed),
+            "--grip-force",
+            str(self.config.grip_force),
+            "--grip-base",
+            str(self.config.grip_base),
+            "--grip-gain",
+            str(self.config.grip_gain),
+            "--grip-max-force",
+            str(self.config.grip_max_force),
+            "--execute",
+        ]
+        if not self.config.use_gripper:
+            command.append("--no-gripper")
+        self.process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        self._log_thread = threading.Thread(target=self._copy_logs, daemon=True)
+        self._log_thread.start()

@@ -11,8 +11,8 @@ import argparse
 import logging
 
 from ruri.client.controllers.single_piper import SinglePiperController
-from ruri.client.policies import RemotePolicy
 from ruri.client.schedulers import RollingScheduler
+from ruri.client.utils import inference_client
 
 
 DEFAULT_PROMPT = (
@@ -90,11 +90,12 @@ def main() -> None:
     )
     scheduler = RollingScheduler()
     try:
-        scheduler.run(
-            controller=SinglePiperController,
-            policy=RemotePolicy,
-            args=args,
-        )
+        with inference_client.connect(args) as policy:
+            scheduler.run(
+                controller=SinglePiperController,
+                policy=policy,
+                args=args,
+            )
     except KeyboardInterrupt:
         logging.info("Stopped by user")
 

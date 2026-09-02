@@ -13,6 +13,8 @@ JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 GRIPPER_NAME = "gripper"
 ACTION_NAMES = (*JOINT_NAMES, GRIPPER_NAME)
 ACTION_KEYS = tuple(f"{name}.pos" for name in ACTION_NAMES)
+ACTION_LOWER = np.asarray([-100.0] * 6 + [0.0], dtype=np.float32)
+ACTION_UPPER = np.asarray([100.0] * 7, dtype=np.float32)
 
 # Piper raw joint values are 0.001 degree and gripper values are micrometres.
 # This is the stable convention used by this machine's LeRobot collection path.
@@ -38,8 +40,6 @@ def _denormalize_raw(name: str, normalized_value: float) -> float:
     value = float(normalized_value)
     if not math.isfinite(value):
         raise ValueError(f"Piper action {name}.pos must be finite")
-    lower, upper = (0.0, 100.0) if name == GRIPPER_NAME else (-100.0, 100.0)
-    value = min(upper, max(lower, value))
     minimum, maximum = CALIBRATION_RANGES[name]
     fraction = value / 100.0 if name == GRIPPER_NAME else (value + 100.0) / 200.0
     return minimum + fraction * (maximum - minimum)
@@ -68,15 +68,11 @@ def validate_action(action: Any) -> np.ndarray:
     if not np.all(np.isfinite(values)):
         raise ValueError("Single Piper action contains NaN or infinity")
 
-    # OpenPI's statistically unnormalized output is not bounded: a finite
-    # delta/absolute prediction can overshoot the recorded calibration domain.
-    # The Controller owns this hardware convention, so saturate at its physical
-    # boundaries instead of turning a recoverable model overshoot into a control
-    # stream failure.  Copy first so caller-owned policy chunks are not mutated.
-    accepted = values.copy()
-    np.clip(accepted[:6], -100.0, 100.0, out=accepted[:6])
-    accepted[6] = np.clip(accepted[6], 0.0, 100.0)
-    return accepted
+    if np.any(values < ACTION_LOWER) or np.any(values > ACTION_UPPER):
+        raise ValueError(
+            "Single Piper action is outside its normalized target range"
+        )
+    return values.copy()
 
 
 def denormalize_action(action: Any) -> tuple[np.ndarray, float]:
@@ -97,3 +93,11 @@ def normalize_telemetry(packet: Mapping[str, Any]) -> np.ndarray:
     if not isinstance(follower, Mapping):
         raise ValueError("MIT telemetry is missing follower state")
     return normalize_pose(follower.get("q", ()), follower.get("gripper_width"))
+
+
+def normalize_teleop_target(packet: Mapping[str, Any]) -> np.ndarray:
+    """Read the follower target from the same MIT packet as its state."""
+    action = packet.get("action")
+    if not isinstance(action, Mapping):
+        raise ValueError("MIT telemetry is missing follower target")
+    return normalize_pose(action.get("q", ()), action.get("gripper_width"))

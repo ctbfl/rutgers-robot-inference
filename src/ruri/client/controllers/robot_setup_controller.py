@@ -21,6 +21,11 @@ class RobotSetupController(ABC):
     def is_connected(self) -> bool:
         """Whether the controller's observation devices are connected."""
 
+    @property
+    def action_bounds(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Describe this Controller's target space for Scheduler-side clipping."""
+        return None
+
     @abstractmethod
     def start(self) -> None:
         """Block until all hardware is ready for observation and action."""
@@ -34,8 +39,8 @@ class RobotSetupController(ABC):
         """Return one observation using standard RURI field names."""
 
     @abstractmethod
-    def send_action(self, action: np.ndarray) -> np.ndarray:
-        """Inject one robot-convention action and return what was accepted."""
+    def send_action(self, action: np.ndarray) -> None:
+        """Send one already-scheduled target without changing its semantics."""
 
     @abstractmethod
     def disconnect(self) -> None:

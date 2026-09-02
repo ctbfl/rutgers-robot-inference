@@ -9,6 +9,7 @@ version = "0.1.0"
 description = "A minimal inference stack for robot policies."
 readme = "readme.md"
 requires-python = ">=3.10"
+license-files = ["THIRD_PARTY_NOTICES.md", "licenses/*"]
 
 dependencies = [
     "numpy",
@@ -22,6 +23,10 @@ client = [
     # Add Python dependencies required by
     # rutgers_agx_arm and rutgers_ur5e here.
 ]
+piper = [
+    "python-can>=3.3.4",
+    "typing-extensions>=3.7.4.3",
+]
 
 
 [project.scripts]
@@ -30,8 +35,14 @@ ruri-client = "ruri.client.__main__:main"
 
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "vendor/pyAgxArm"]
+include = ["ruri*", "pyAgxArm*"]
 
 
 [tool.setuptools.package-data]
-"ruri.client.controllers.single_piper" = ["cam_params.json"]
+"ruri.client.controllers.single_piper" = [
+    "cam_params.json",
+    "mit/assets/*.json",
+    "mit/assets/*.urdf",
+    "mit/assets/LICENSE*",
+]

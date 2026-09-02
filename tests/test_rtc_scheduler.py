@@ -75,11 +75,8 @@ class RTCSchedulerTests(unittest.TestCase):
                     "rtc.applied": True,
                 }
 
-            def stop(self):
-                pass
-
         scheduler = RTCScheduler()
-        scheduler.run(FakeController, DelayedPolicy, args=args)
+        scheduler.run(FakeController, DelayedPolicy(args), args=args)
 
         controller = instances["controller"]
         policy = instances["policy"]
@@ -155,11 +152,8 @@ class RTCSchedulerTests(unittest.TestCase):
                     }
                 return {"action_chunk": np.asarray([[0.0], [1.0], [2.0]])}
 
-            def stop(self):
-                pass
-
         scheduler = RTCScheduler()
-        scheduler.run(FakeController, SlowPolicy, args=args)
+        scheduler.run(FakeController, SlowPolicy(args), args=args)
 
         self.assertEqual(instances["controller"].actions, [0, 1, 2, 2, 2])
         self.assertEqual(scheduler.last_run_stats["hold_ticks"], 2)
@@ -204,11 +198,8 @@ class RTCSchedulerTests(unittest.TestCase):
                 def infer(self, inputs):
                     return {"action_chunk": np.asarray([[1.0], [2.0]])}
 
-                def stop(self):
-                    pass
-
             scheduler = RTCScheduler()
-            scheduler.run(FakeController, FakePolicy, args=args)
+            scheduler.run(FakeController, FakePolicy(args), args=args)
 
             log_path = Path(scheduler.last_log_path)
             records = [json.loads(line) for line in log_path.read_text().splitlines()]
@@ -254,11 +245,8 @@ class RTCSchedulerTests(unittest.TestCase):
             def infer(self, inputs):
                 return {"action_chunk": np.zeros((2, 1), dtype=np.float32)}
 
-            def stop(self):
-                pass
-
         with self.assertRaisesRegex(ValueError, "does not match"):
-            RTCScheduler().run(FakeController, ShortPolicy, args=args)
+            RTCScheduler().run(FakeController, ShortPolicy(args), args=args)
 
     def test_rejects_execution_horizon_before_starting_hardware(self):
         events = []
@@ -285,19 +273,12 @@ class RTCSchedulerTests(unittest.TestCase):
             def __init__(self, received_args):
                 pass
 
-            def start(self):
-                events.append("policy.start")
-
-            def stop(self):
-                events.append("policy.stop")
-
+        policy = FakePolicy(args)
         with self.assertRaisesRegex(ValueError, "output_chunk_size"):
-            RTCScheduler().run(FakeController, FakePolicy, args=args)
+            RTCScheduler().run(FakeController, policy, args=args)
 
         self.assertNotIn("controller.start", events)
-        self.assertEqual(events[0], "policy.start")
-        self.assertIn("controller.stop", events)
-        self.assertIn("policy.stop", events)
+        self.assertEqual(events, ["controller.stop"])
 
     def test_rejects_silent_rtc_server_fallback(self):
         args = SimpleNamespace(
@@ -340,11 +321,8 @@ class RTCSchedulerTests(unittest.TestCase):
                     "rtc.reason": "test fallback",
                 }
 
-            def stop(self):
-                pass
-
         with self.assertRaisesRegex(RuntimeError, "test fallback"):
-            RTCScheduler().run(FakeController, FallbackPolicy, args=args)
+            RTCScheduler().run(FakeController, FallbackPolicy(args), args=args)
 
 
 if __name__ == "__main__":

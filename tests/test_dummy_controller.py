@@ -11,7 +11,7 @@ from ruri.client.schedulers import BlockingScheduler
 
 
 class DummyControllerTests(unittest.TestCase):
-    def test_lifecycle_observation_and_action_feedback(self):
+    def test_lifecycle_observation_and_action_target(self):
         args = SimpleNamespace(
             dummy_state_dim=3,
             dummy_image_height=4,
@@ -22,15 +22,15 @@ class DummyControllerTests(unittest.TestCase):
 
         controller.start()
         observation = controller.get_observation()
-        accepted = controller.send_action([1.0, 2.0, 3.0])
+        result = controller.send_action([1.0, 2.0, 3.0])
         next_observation = controller.get_observation()
 
         self.assertEqual(observation["observation.state"].shape, (3,))
         self.assertEqual(observation["observation.images.top"].shape, (4, 6, 3))
         self.assertEqual(int(observation["observation.images.wrist"][0, 0, 0]), 12)
-        np.testing.assert_array_equal(accepted, [1.0, 2.0, 3.0])
+        self.assertIsNone(result)
         np.testing.assert_array_equal(
-            next_observation["observation.state"], accepted
+            next_observation["observation.state"], [1.0, 2.0, 3.0]
         )
         self.assertEqual(controller.action_history.shape, (1, 3))
 
@@ -92,9 +92,10 @@ class DummyControllerTests(unittest.TestCase):
                 pass
 
         with patch("ruri.client.schedulers.blocking.time.sleep"):
+            policy = FakePolicy(args)
             BlockingScheduler().run(
                 controller_factory,
-                FakePolicy,
+                policy,
                 args=args,
             )
 

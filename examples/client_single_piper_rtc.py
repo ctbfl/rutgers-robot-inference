@@ -14,8 +14,8 @@ import argparse
 import logging
 
 from ruri.client.controllers.single_piper import SinglePiperController
-from ruri.client.policies import RemotePolicy
 from ruri.client.schedulers import RTCScheduler
+from ruri.client.utils import inference_client
 
 
 DEFAULT_PROMPT = (
@@ -93,11 +93,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        RTCScheduler().run(
-            controller=SinglePiperController,
-            policy=RemotePolicy,
-            args=args,
-        )
+        with inference_client.connect(args) as policy:
+            RTCScheduler().run(
+                controller=SinglePiperController,
+                policy=policy,
+                args=args,
+            )
     except KeyboardInterrupt:
         logging.info("Stopped by user")
 

@@ -37,7 +37,6 @@ class SinglePiperConfig:
     startup_home_skip_threshold_rad: float = 0.05
     diagnostic_log: Path | None = None
 
-    teleop_root: Path | None = None
     python_executable: Path | None = None
 
     @classmethod
@@ -52,7 +51,7 @@ class SinglePiperConfig:
             item.name: get_arg(args, item.name, item.default)
             for item in fields(cls)
         }
-        for name in ("diagnostic_log", "teleop_root", "python_executable"):
+        for name in ("diagnostic_log", "python_executable"):
             if values[name] is not None:
                 values[name] = Path(values[name])
         return cls(**values)

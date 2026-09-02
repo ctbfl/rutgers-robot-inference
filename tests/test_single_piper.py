@@ -165,20 +165,17 @@ class NormalizationTests(unittest.TestCase):
         np.testing.assert_allclose(restored_q, q, atol=1e-6)
         self.assertAlmostEqual(restored_gripper, 0.034, places=6)
 
-    def test_finite_policy_overshoot_is_clipped_without_mutating_input(self):
+    def test_finite_policy_overshoot_is_rejected_without_mutating_input(self):
         action = np.asarray(
             [-101.5, 102.0, -100.0, 100.0, 0.0, 500.0, -3.0],
             dtype=np.float32,
         )
         original = action.copy()
 
-        accepted = validate_action(action)
+        with self.assertRaisesRegex(ValueError, "outside its normalized target range"):
+            validate_action(action)
 
         np.testing.assert_array_equal(action, original)
-        np.testing.assert_array_equal(
-            accepted,
-            [-100.0, 100.0, -100.0, 100.0, 0.0, 100.0, 0.0],
-        )
 
     def test_non_finite_policy_action_is_still_rejected(self):
         with self.assertRaisesRegex(ValueError, "NaN or infinity"):
@@ -186,6 +183,52 @@ class NormalizationTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_teleop_observer_reads_state_and_target_without_touching_can(self):
+        class TeleopTelemetry(FakeTelemetry):
+            def __init__(self, address):
+                super().__init__(address)
+                self.packet["action"] = {
+                    "q": [0.1] * 6,
+                    "gripper_width": 0.02,
+                }
+                self.closed = False
+
+            def latch_engaged(self, *_):
+                return self.packet
+
+            def close(self):
+                self.closed = True
+
+        telemetry = TeleopTelemetry("unused")
+
+        def forbid_can(**_):
+            raise AssertionError("observer must not discover or open CAN")
+
+        controller = SinglePiperController(
+            SinglePiperConfig(configure_can=False),
+            camera_discovery=lambda: SimpleNamespace(
+                head_serial="head", wrist_serial="wrist"
+            ),
+            can_discovery=forbid_can,
+            camera_factory=lambda serial, _: FakeCamera(
+                10 if serial == "head" else 20
+            ),
+            telemetry_factory=lambda _: telemetry,
+        )
+
+        controller.connect_teleop_observer()
+        observation, target = controller.get_teleop_sample()
+
+        self.assertTrue(controller.teleop_observer_attached)
+        self.assertIsNone(controller.status()["can_interface"])
+        self.assertEqual(int(observation["observation.images.top"][0, 0, 0]), 10)
+        np.testing.assert_array_equal(
+            observation["observation.state"], normalize_pose([0.0] * 6, 0.034)
+        )
+        np.testing.assert_array_equal(target, normalize_pose([0.1] * 6, 0.02))
+        controller.disconnect()
+        self.assertTrue(telemetry.closed)
+
     def test_reviewed_camera_controls_are_loaded_from_json(self):
         params = load_camera_params()
         self.assertEqual(params.warmup_frames, 30)
@@ -389,7 +432,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(int(observation["observation.images.wrist"][0, 0, 0]), 20)
 
         action = normalize_pose([0.0] * 6, 0.034)
-        np.testing.assert_array_equal(controller.send_action(action), action)
+        self.assertIsNone(controller.send_action(action))
         self.assertEqual(len(commands.sent), 1)
         np.testing.assert_allclose(commands.sent[0][0], np.zeros(6), atol=1e-6)
         self.assertAlmostEqual(commands.sent[0][1], 0.034, places=6)
@@ -398,14 +441,9 @@ class ControllerTests(unittest.TestCase):
             [101.0, -102.0, 103.0, -104.0, 105.0, -106.0, 110.0],
             dtype=np.float32,
         )
-        expected = np.asarray(
-            [100.0, -100.0, 100.0, -100.0, 100.0, -100.0, 100.0],
-            dtype=np.float32,
-        )
-        np.testing.assert_array_equal(controller.send_action(overshoot), expected)
-        expected_q, expected_gripper = denormalize_action(expected)
-        np.testing.assert_allclose(commands.sent[1][0], expected_q)
-        self.assertAlmostEqual(commands.sent[1][1], expected_gripper)
+        with self.assertRaisesRegex(ValueError, "outside its normalized target range"):
+            controller.send_action(overshoot)
+        self.assertEqual(len(commands.sent), 1)
 
         controller.disconnect()
         self.assertFalse(controller.is_connected)

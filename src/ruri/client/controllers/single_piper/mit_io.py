@@ -34,6 +34,7 @@ class MITTelemetryReceiver:
         self.endpoint = parse_local_udp(address)
         self._socket: socket.socket | None = None
         self._latest: dict[str, Any] | None = None
+        self._latched: dict[str, Any] | None = None
         self._received_at: float | None = None
 
     @property
@@ -79,6 +80,19 @@ class MITTelemetryReceiver:
             raise RuntimeError(f"MIT worker phase={phase!r} reason={reason!r}")
         return self._latest
 
+    def latch_engaged(self, timeout_s: float) -> Mapping[str, Any]:
+        """Latch one control packet for a complete 30 Hz collection frame."""
+        packet = self.latest_engaged(timeout_s)
+        self._latched = dict(packet)
+        return self._latched
+
+    def latched(self) -> Mapping[str, Any]:
+        if self._latched is None:
+            raise RuntimeError(
+                "No MIT packet is latched; collect the observation before its action"
+            )
+        return self._latched
+
     def wait_for_engaged(self, timeout_s: float, freshness_s: float) -> Mapping[str, Any]:
         deadline = time.monotonic() + timeout_s
         last_phase = None
@@ -100,7 +114,19 @@ class MITTelemetryReceiver:
             self._socket.close()
         self._socket = None
         self._latest = None
+        self._latched = None
         self._received_at = None
+
+
+_SHARED_TELEMETRY: dict[str, MITTelemetryReceiver] = {}
+
+
+def get_shared_mit_telemetry(address: str) -> MITTelemetryReceiver:
+    """Return the one local receiver shared by thin LeRobot adapters."""
+    parse_local_udp(address)
+    if address not in _SHARED_TELEMETRY:
+        _SHARED_TELEMETRY[address] = MITTelemetryReceiver(address)
+    return _SHARED_TELEMETRY[address]
 
 
 class MITCommandSender:

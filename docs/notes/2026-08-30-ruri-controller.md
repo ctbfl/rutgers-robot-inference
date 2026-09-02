@@ -135,7 +135,7 @@ Policy inference ──补充 action chunk──▶ Scheduler action queue
 - 使用稳定 USB-CAN ID 和 Piper feedback 双重确认 arm。
 - `get_camera_observation()` 获取已经 streaming 的最新相机帧。
 - `get_observation()` 返回标准 RURI state/top/wrist 字段。
-- 显式启动并持有参考项目 `piper_teleop_agx/mit_policy_controller.py`。
+- 显式启动并持有 RURI 内置的 `single_piper.mit.policy_controller`。
 - `send_action()` 接受一行机器 convention action，立即转换为 rad/m 并发送给 MIT 进程。
 - 本地 command/telemetry 使用 loopback UDP；MIT 子进程是唯一实际 CAN socket owner。
 - command watchdog 超时后执行参考控制器的 hold/home 安全恢复。

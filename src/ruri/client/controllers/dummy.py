@@ -11,7 +11,7 @@ from ruri.client.controllers.robot_setup_controller import RobotSetupController
 
 
 class DummyController(RobotSetupController):
-    """Produce synthetic observations and record every accepted action."""
+    """Produce synthetic observations and record every scheduled target."""
 
     def __init__(self, args: Any):
         self.args = args
@@ -84,12 +84,11 @@ class DummyController(RobotSetupController):
             "observation.images.wrist": self._wrist_image.copy(),
         }
 
-    def send_action(self, action: np.ndarray) -> np.ndarray:
+    def send_action(self, action: np.ndarray) -> None:
         self._require_started()
-        accepted = self._validate_action(action)
-        self._state = accepted
-        self._actions.append(accepted.copy())
-        return accepted.copy()
+        target = self._validate_action(action)
+        self._state = target
+        self._actions.append(target.copy())
 
     def status(self) -> dict[str, Any]:
         return {

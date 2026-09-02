@@ -6,7 +6,6 @@ from typing import Any
 
 __all__ = [
     "BlockingScheduler",
-    "RemotePolicy",
     "RollingScheduler",
     "RTCScheduler",
     "TemporalEnsembleScheduler",
@@ -31,8 +30,4 @@ def __getattr__(name: str) -> Any:
         from ruri.client.schedulers import TemporalEnsembleScheduler
 
         return TemporalEnsembleScheduler
-    if name == "RemotePolicy":
-        from ruri.client.policies import RemotePolicy
-
-        return RemotePolicy
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

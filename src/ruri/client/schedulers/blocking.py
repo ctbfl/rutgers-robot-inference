@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 
 from ruri.client._args import get_arg
+from ruri.client.schedulers._actions import clip_target
 
 
 logger = logging.getLogger(__name__)
@@ -77,19 +78,17 @@ class BlockingScheduler:
     def run(
         self,
         controller: Callable[[Any], Any],
-        policy: Callable[[Any], Any],
+        policy: Any,
         *,
         args: Any,
     ) -> None:
         """Run until ``max_chunks`` is reached or the caller interrupts it.
 
-        The exact same global ``args`` object is passed to both component
-        factories. Their blocking ``start()`` methods must return only when
-        they are ready for inference/control, and ``stop()`` must be
-        idempotent so cleanup is safe after a partial start.
+        ``policy`` is an already-connected handle returned by
+        ``ruri.client.utils.inference_client.connect``.  The scheduler owns
+        Controller lifecycle but not the caller-owned policy connection.
         """
         robot = controller(args)
-        remote_policy = policy(args)
 
         control_hz = float(get_arg(args, "control_hz", 30.0))
         max_chunks = get_arg(args, "max_chunks", None)
@@ -122,9 +121,7 @@ class BlockingScheduler:
             )
 
         try:
-            # Check the remote dependency before enabling real hardware.
-            remote_policy.start()
-            output_chunk_size = int(remote_policy.output_chunk_size)
+            output_chunk_size = int(policy.output_chunk_size)
             if (
                 execute_actions_per_chunk is not None
                 and execute_actions_per_chunk > output_chunk_size
@@ -143,7 +140,7 @@ class BlockingScheduler:
                 trace.record("controller_ready")
             self.last_run_stats = self._run_loop(
                 robot,
-                remote_policy,
+                policy,
                 args,
                 control_hz,
                 max_chunks,
@@ -169,12 +166,9 @@ class BlockingScheduler:
             try:
                 robot.stop()
             finally:
-                try:
-                    remote_policy.stop()
-                finally:
-                    if trace is not None:
-                        trace.record("run_stop", stats=self.last_run_stats)
-                        trace.close()
+                if trace is not None:
+                    trace.record("run_stop", stats=self.last_run_stats)
+                    trace.close()
 
     @staticmethod
     def _run_loop(
@@ -272,9 +266,10 @@ class BlockingScheduler:
             next_tick = time.monotonic()
             for chunk_offset, action in enumerate(action_chunk):
                 action_values = np.asarray(action, dtype=np.float32).copy()
+                target, clipped = clip_target(controller, action_values)
                 send_started_ns = time.monotonic_ns()
                 try:
-                    accepted = controller.send_action(action_values)
+                    controller.send_action(target)
                 except Exception as error:
                     if trace is not None:
                         trace.record(
@@ -283,18 +278,15 @@ class BlockingScheduler:
                             chunk_index=chunk_index,
                             chunk_offset=chunk_offset,
                             outcome="rejected",
-                            action=action_values.tolist(),
+                            action=target.tolist(),
+                            pre_clip_action=(
+                                action_values.tolist() if clipped else None
+                            ),
                             error_type=type(error).__name__,
                             error=str(error),
                             traceback=traceback.format_exc(),
                         )
                     raise
-                accepted_values = (
-                    action_values
-                    if accepted is None
-                    else np.asarray(accepted, dtype=np.float32).copy()
-                )
-                clipped = not np.array_equal(action_values, accepted_values)
                 stats["actions_sent"] = int(stats["actions_sent"]) + 1
                 if clipped:
                     stats["clipped_actions"] = int(stats["clipped_actions"]) + 1
@@ -305,8 +297,10 @@ class BlockingScheduler:
                         chunk_index=chunk_index,
                         chunk_offset=chunk_offset,
                         outcome="sent",
-                        action=action_values.tolist(),
-                        accepted_action=accepted_values.tolist(),
+                        action=target.tolist(),
+                        pre_clip_action=(
+                            action_values.tolist() if clipped else None
+                        ),
                         clipped=clipped,
                         send_duration_ms=(time.monotonic_ns() - send_started_ns)
                         / 1_000_000.0,

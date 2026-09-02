@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from ruri.client._args import get_arg
+from ruri.client.schedulers._actions import clip_target
 
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,7 @@ class _ActionEnsemble:
         self._lock = threading.Lock()
         self._latest_sent_step = -1
         self._future: dict[int, _EnsembleCell] = {}
-        self._last_accepted: np.ndarray | None = None
+        self._last_target: np.ndarray | None = None
 
     def latest_sent_step(self) -> int:
         with self._lock:
@@ -190,16 +191,16 @@ class _ActionEnsemble:
                     source="ensemble",
                     contributors=cell.count,
                 )
-            if self._last_accepted is None:
+            if self._last_target is None:
                 return None
             return _SelectedAction(
                 timestep=timestep,
-                value=self._last_accepted.copy(),
+                value=self._last_target.copy(),
                 source="hold",
                 contributors=0,
             )
 
-    def commit(self, selected: _SelectedAction, accepted: np.ndarray) -> None:
+    def commit(self, selected: _SelectedAction, target: np.ndarray) -> None:
         with self._lock:
             expected = self._latest_sent_step + 1
             if selected.timestep != expected:
@@ -213,7 +214,7 @@ class _ActionEnsemble:
                         f"Temporal ensemble action {selected.timestep} disappeared"
                     )
             self._latest_sent_step = selected.timestep
-            self._last_accepted = accepted.copy()
+            self._last_target = target.copy()
 
 
 class TemporalEnsembleScheduler:
@@ -226,7 +227,7 @@ class TemporalEnsembleScheduler:
     def run(
         self,
         controller: Callable[[Any], Any],
-        policy: Callable[[Any], Any],
+        policy: Any,
         *,
         args: Any,
     ) -> None:
@@ -241,7 +242,6 @@ class TemporalEnsembleScheduler:
             raise ValueError("max_chunks cannot be negative")
 
         robot = controller(args)
-        remote_policy = policy(args)
         ensemble = _ActionEnsemble(coefficient)
         trace = self._start_trace(args)
         if trace is not None:
@@ -262,12 +262,7 @@ class TemporalEnsembleScheduler:
 
         def inference_worker() -> None:
             try:
-                try:
-                    remote_policy.start()
-                except Exception as error:
-                    ready_queue.put(("error", error))
-                    return
-                output_chunk_size = int(remote_policy.output_chunk_size)
+                output_chunk_size = int(policy.output_chunk_size)
                 if trace is not None:
                     trace.record(
                         "policy_ready", output_chunk_size=output_chunk_size
@@ -290,7 +285,7 @@ class TemporalEnsembleScheduler:
                                 observation_timestep=observation_step,
                                 first_action_timestep=anchor_step,
                             )
-                        response = remote_policy.infer(
+                        response = policy.infer(
                             self._policy_inputs(observation, args)
                         )
                         chunk = self._action_chunk(response)
@@ -343,9 +338,8 @@ class TemporalEnsembleScheduler:
                             )
                         )
             finally:
-                remote_policy.stop()
                 if trace is not None:
-                    trace.record("policy_stopped")
+                    trace.record("inference_worker_stopped")
 
         worker: threading.Thread | None = None
         try:
@@ -514,9 +508,10 @@ class TemporalEnsembleScheduler:
                     "TemporalEnsembleScheduler has no action available to execute"
                 )
             action_values = selected.value.copy()
+            target, clipped = clip_target(robot, action_values)
             send_started_ns = time.monotonic_ns()
             try:
-                accepted = robot.send_action(action_values)
+                robot.send_action(target)
             except Exception as error:
                 if trace is not None:
                     trace.record(
@@ -525,18 +520,16 @@ class TemporalEnsembleScheduler:
                         source=selected.source,
                         contributors=selected.contributors,
                         outcome="rejected",
-                        action=action_values.tolist(),
+                        action=target.tolist(),
+                        pre_clip_action=(
+                            action_values.tolist() if clipped else None
+                        ),
                         error_type=type(error).__name__,
                         error=str(error),
                         traceback=traceback.format_exc(),
                     )
                 raise
-            accepted_values = (
-                action_values
-                if accepted is None
-                else np.asarray(accepted, dtype=np.float32).copy()
-            )
-            ensemble.commit(selected, accepted_values)
+            ensemble.commit(selected, target)
             stats["actions_sent"] = int(stats["actions_sent"]) + 1
             if selected.source == "ensemble":
                 stats["ensemble_actions_sent"] = (
@@ -551,9 +544,9 @@ class TemporalEnsembleScheduler:
                     source=selected.source,
                     contributors=selected.contributors,
                     outcome="sent",
-                    action=action_values.tolist(),
-                    accepted_action=accepted_values.tolist(),
-                    clipped=not np.array_equal(action_values, accepted_values),
+                    action=target.tolist(),
+                    pre_clip_action=(action_values.tolist() if clipped else None),
+                    clipped=clipped,
                     pending_actions=ensemble.pending_count(),
                     inference_in_flight=inference_in_flight,
                     send_duration_ms=(time.monotonic_ns() - send_started_ns)

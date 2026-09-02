@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 
 from ruri.client._args import get_arg
+from ruri.client.schedulers._actions import clip_target
 
 
 logger = logging.getLogger(__name__)
@@ -123,7 +124,7 @@ class _ActionTimeline:
         self._lock = threading.Lock()
         self._latest_sent_step = -1
         self._future: dict[int, _QueuedAction] = {}
-        self._last_accepted: _QueuedAction | None = None
+        self._last_target: _QueuedAction | None = None
 
     def latest_sent_step(self) -> int:
         with self._lock:
@@ -138,8 +139,8 @@ class _ActionTimeline:
             if first is None:
                 consumed = (
                     0
-                    if self._last_accepted is None
-                    else self._last_accepted.chunk_offset + 1
+                    if self._last_target is None
+                    else self._last_target.chunk_offset + 1
                 )
                 return latest, None, consumed
 
@@ -157,8 +158,8 @@ class _ActionTimeline:
             queued = self._future.get(self._latest_sent_step + 1)
             if queued is not None:
                 return queued.chunk_offset
-            if self._last_accepted is not None:
-                return self._last_accepted.chunk_offset + 1
+            if self._last_target is not None:
+                return self._last_target.chunk_offset + 1
             return 0
 
     def install(
@@ -226,18 +227,18 @@ class _ActionTimeline:
                     chunk_id=queued.chunk_id,
                     chunk_offset=queued.chunk_offset,
                 )
-            if self._last_accepted is None:
+            if self._last_target is None:
                 return None
             return _SelectedAction(
                 timestep=timestep,
-                value=self._last_accepted.value.copy(),
+                value=self._last_target.value.copy(),
                 source="hold",
-                chunk_id=self._last_accepted.chunk_id,
-                chunk_offset=self._last_accepted.chunk_offset,
+                chunk_id=self._last_target.chunk_id,
+                chunk_offset=self._last_target.chunk_offset,
             )
 
-    def commit(self, selected: _SelectedAction, accepted: np.ndarray) -> None:
-        """Advance the timeline only after the controller accepted the command."""
+    def commit(self, selected: _SelectedAction, target: np.ndarray) -> None:
+        """Advance the timeline after the Controller receives the target."""
         with self._lock:
             expected = self._latest_sent_step + 1
             if selected.timestep != expected:
@@ -252,8 +253,8 @@ class _ActionTimeline:
                         f"RTC action {selected.timestep} disappeared before commit"
                     )
             self._latest_sent_step = selected.timestep
-            self._last_accepted = _QueuedAction(
-                value=accepted.copy(),
+            self._last_target = _QueuedAction(
+                value=target.copy(),
                 chunk_id=selected.chunk_id,
                 chunk_offset=selected.chunk_offset,
             )
@@ -269,7 +270,7 @@ class RTCScheduler:
     def run(
         self,
         controller: Callable[[Any], Any],
-        policy: Callable[[Any], Any],
+        policy: Any,
         *,
         args: Any,
     ) -> None:
@@ -299,7 +300,6 @@ class RTCScheduler:
             raise ValueError("rtc_initial_delay_steps cannot be negative")
 
         robot = controller(args)
-        remote_policy = policy(args)
         timeline = _ActionTimeline()
         trace = self._start_trace(args)
         if trace is not None:
@@ -321,19 +321,7 @@ class RTCScheduler:
 
         def inference_worker() -> None:
             try:
-                try:
-                    remote_policy.start()
-                except Exception as error:
-                    if trace is not None:
-                        trace.record(
-                            "policy_start_error",
-                            error_type=type(error).__name__,
-                            error=str(error),
-                            traceback=traceback.format_exc(),
-                        )
-                    ready_queue.put(("error", error))
-                    return
-                output_chunk_size = int(remote_policy.output_chunk_size)
+                output_chunk_size = int(policy.output_chunk_size)
                 initial_delay_steps = (
                     min(4, output_chunk_size)
                     if configured_initial_delay_steps is None
@@ -391,7 +379,7 @@ class RTCScheduler:
                                     else list(previous_tail.shape)
                                 ),
                             )
-                        response = remote_policy.infer(inputs)
+                        response = policy.infer(inputs)
                         chunk = self._action_chunk(response)
                         if len(chunk) != output_chunk_size:
                             raise ValueError(
@@ -479,9 +467,8 @@ class RTCScheduler:
                             )
                         )
             finally:
-                remote_policy.stop()
                 if trace is not None:
-                    trace.record("policy_stopped")
+                    trace.record("inference_worker_stopped")
 
         worker: threading.Thread | None = None
         try:
@@ -696,9 +683,10 @@ class RTCScheduler:
                 raise RuntimeError("RTCScheduler has no action available to execute")
 
             action_values = selected.value.copy()
+            target, clipped = clip_target(robot, action_values)
             send_started_ns = time.monotonic_ns()
             try:
-                accepted = robot.send_action(action_values)
+                robot.send_action(target)
             except Exception as error:
                 if trace is not None:
                     trace.record(
@@ -708,18 +696,16 @@ class RTCScheduler:
                         chunk_id=selected.chunk_id,
                         chunk_offset=selected.chunk_offset,
                         outcome="rejected",
-                        action=action_values.tolist(),
+                        action=target.tolist(),
+                        pre_clip_action=(
+                            action_values.tolist() if clipped else None
+                        ),
                         error_type=type(error).__name__,
                         error=str(error),
                         traceback=traceback.format_exc(),
                     )
                 raise
-            accepted_values = (
-                action_values
-                if accepted is None
-                else np.asarray(accepted, dtype=np.float32).copy()
-            )
-            timeline.commit(selected, accepted_values)
+            timeline.commit(selected, target)
             stats["actions_sent"] = int(stats["actions_sent"]) + 1
             if selected.source == "policy":
                 stats["policy_actions_sent"] = (
@@ -735,9 +721,9 @@ class RTCScheduler:
                     chunk_id=selected.chunk_id,
                     chunk_offset=selected.chunk_offset,
                     outcome="sent",
-                    action=action_values.tolist(),
-                    accepted_action=accepted_values.tolist(),
-                    clipped=not np.array_equal(action_values, accepted_values),
+                    action=target.tolist(),
+                    pre_clip_action=(action_values.tolist() if clipped else None),
+                    clipped=clipped,
                     queue_size=timeline.pending_count(),
                     inference_in_flight=inference_in_flight,
                     send_duration_ms=(time.monotonic_ns() - send_started_ns)

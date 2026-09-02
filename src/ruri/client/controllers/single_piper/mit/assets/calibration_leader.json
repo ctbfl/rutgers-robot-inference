@@ -1,0 +1,41 @@
+{
+  "torque_sign_vs_urdf": -1.0,
+  "payload_mass_kg": 0.5664964881150384,
+  "payload_com_m": [
+    -0.0007334268579207839,
+    -0.01218829954531128,
+    0.06564120343065956
+  ],
+  "per_joint_scale": [
+    1.0,
+    0.9817833284462995,
+    1.0259458788359803,
+    0.9836359876348129,
+    1.0641693216899313,
+    1.0
+  ],
+  "static_friction_nm": [
+    0.047915836759555325,
+    0.09370248353509991,
+    0.11444027666742856,
+    0.018802260579243026,
+    0.012423667484983898,
+    0.02020723838011606
+  ],
+  "breakaway_nm": [
+    0.661,
+    1.032,
+    0.559,
+    0.059,
+    0.035,
+    0.020
+  ],
+  "breakaway_all_pose_measurements": {
+    "sweep_all_joints_at_once": [0.379, 0.743, 0.559, 0.089, 0.065, 0.020],
+    "sweep_one_joint_at_a_time": [0.661, 1.032, 0.784, 0.059, 0.035, 0.039]
+  },
+  "breakaway_method": "hold_gravity.py --dither-sweep, dither-hz 5: the dither amplitude at which a joint first shows >2 counts peak-to-peak IS its breakaway torque. Two runs at different poses; the all-joints run gave only LOWER BOUNDS for J1/J2 (they never moved) and is contaminated for the later joints because earlier ones broke loose and moved the arm, so the one-joint-at-a-time run is the better measurement. Stored values are the MINIMUM across runs (J1/J2 from the per-joint run, the only real numbers there), because the same joint varied by up to 1.9x between poses and OVER-compensation is the dangerous direction: feedforward above the local friction makes the joint self-driving. Keep kfric <= 0.7 so the 1.9x pose spread stays covered. static_friction_nm from identify_gravity.py under-reports all of this by roughly 5-14x and should not be used for gains.",
+  "n_poses": 18,
+  "recording": "factr/data/leader_ws.csv",
+  "urdf": "piper_no_gripper_description.urdf"
+}

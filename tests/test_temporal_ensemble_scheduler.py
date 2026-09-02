@@ -87,11 +87,8 @@ class TemporalEnsembleSchedulerTests(unittest.TestCase):
                     )[:, None]
                 }
 
-            def stop(self):
-                pass
-
         scheduler = TemporalEnsembleScheduler()
-        scheduler.run(FakeController, FakePolicy, args=args)
+        scheduler.run(FakeController, FakePolicy(args), args=args)
 
         self.assertEqual(instances["policy"].calls, 3)
         np.testing.assert_allclose(
@@ -153,11 +150,8 @@ class TemporalEnsembleSchedulerTests(unittest.TestCase):
                     "action_chunk": np.arange(100, 104, dtype=np.float32)[:, None]
                 }
 
-            def stop(self):
-                pass
-
         scheduler = TemporalEnsembleScheduler()
-        scheduler.run(FakeController, DelayedPolicy, args=args)
+        scheduler.run(FakeController, DelayedPolicy(args), args=args)
 
         np.testing.assert_allclose(
             instances["controller"].actions,
@@ -209,11 +203,8 @@ class TemporalEnsembleSchedulerTests(unittest.TestCase):
                         )
                     }
 
-                def stop(self):
-                    pass
-
             scheduler = TemporalEnsembleScheduler()
-            scheduler.run(FakeController, FakePolicy, args=args)
+            scheduler.run(FakeController, FakePolicy(args), args=args)
 
             records = [
                 json.loads(line)

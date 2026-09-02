@@ -31,8 +31,11 @@ from ruri.client.controllers.single_piper.mit_io import (
 )
 from ruri.client.controllers.single_piper.mit_process import ManagedMITProcess
 from ruri.client.controllers.single_piper.normalization import (
+    ACTION_LOWER,
+    ACTION_UPPER,
     denormalize_action,
     normalize_telemetry,
+    normalize_teleop_target,
     validate_action,
 )
 
@@ -168,6 +171,7 @@ class SinglePiperController(RobotSetupController):
         self._arm: ArmHardwareRegistration | None = None
         self._arm_started = False
         self._sent_action = False
+        self._teleop_observer_attached = False
         self._camera_controls: dict[str, dict[str, float]] = {}
 
     @staticmethod
@@ -201,6 +205,14 @@ class SinglePiperController(RobotSetupController):
     def arm_started(self) -> bool:
         return self._arm_started and self._worker is not None and self._worker.running
 
+    @property
+    def teleop_observer_attached(self) -> bool:
+        return self._teleop_observer_attached and self._telemetry is not None
+
+    @property
+    def action_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        return ACTION_LOWER.copy(), ACTION_UPPER.copy()
+
     def start(self) -> None:
         """Connect all devices, enable the arm, and block until MIT is engaged."""
         if not self.is_connected:
@@ -211,11 +223,6 @@ class SinglePiperController(RobotSetupController):
         if self.is_connected:
             raise RuntimeError("SinglePiperController is already connected")
 
-        discovered = self._camera_discovery()
-        self._devices = RealSenseDevices(
-            head_serial=self.config.head_camera_serial or discovered.head_serial,
-            wrist_serial=self.config.wrist_camera_serial or discovered.wrist_serial,
-        )
         can_candidates = None if self.config.can_interface is None else [self.config.can_interface]
         can_hardware_id = self.config.can_hardware_id
         if can_hardware_id is None and self.config.arm_side is not None:
@@ -233,6 +240,19 @@ class SinglePiperController(RobotSetupController):
         if self._can.hardware_id is None:
             raise RuntimeError("CAN discovery did not return a stable hardware ID")
         self._arm = find_arm_by_hardware_id(self._can.hardware_id)
+
+        self.connect_cameras()
+
+    def connect_cameras(self) -> None:
+        """Connect the standard cameras without discovering or opening CAN."""
+        if self.is_connected:
+            raise RuntimeError("SinglePiperController cameras are already connected")
+
+        discovered = self._camera_discovery()
+        self._devices = RealSenseDevices(
+            head_serial=self.config.head_camera_serial or discovered.head_serial,
+            wrist_serial=self.config.wrist_camera_serial or discovered.wrist_serial,
+        )
 
         self._head = self._camera_factory(self._devices.head_serial, self.config)
         self._wrist = self._camera_factory(self._devices.wrist_serial, self.config)
@@ -255,14 +275,39 @@ class SinglePiperController(RobotSetupController):
             self._camera_controls.clear()
             raise
         logger.info(
-            "Single Piper observations ready: CAN=%s head-D435=%s controls=%s "
+            "Single Piper cameras ready: CAN=%s head-D435=%s controls=%s "
             "wrist-D415=%s controls=%s",
-            self._can.interface,
+            None if self._can is None else self._can.interface,
             self._devices.head_serial,
             self._camera_controls.get("head", {}),
             self._devices.wrist_serial,
             self._camera_controls.get("wrist", {}),
         )
+
+    def connect_teleop_observer(self) -> None:
+        """Attach cameras and read-only telemetry; never discover or open CAN."""
+        cameras_connected_here = False
+        if not self.is_connected:
+            self.connect_cameras()
+            cameras_connected_here = True
+        if self._telemetry is not None:
+            raise RuntimeError("Single Piper telemetry is already attached")
+        telemetry = None
+        try:
+            telemetry = self._telemetry_factory(self.config.telemetry_address)
+            telemetry.open()
+            telemetry.wait_for_engaged(
+                self.config.arm_connect_timeout_s,
+                self.config.telemetry_timeout_s,
+            )
+        except Exception:
+            if telemetry is not None:
+                telemetry.close()
+            if cameras_connected_here:
+                self.disconnect()
+            raise
+        self._telemetry = telemetry
+        self._teleop_observer_attached = True
 
     def start_arm(self) -> None:
         """Explicitly start the managed MIT worker; this enables and homes the arm."""
@@ -273,8 +318,8 @@ class SinglePiperController(RobotSetupController):
 
         self._telemetry = self._telemetry_factory(self.config.telemetry_address)
         self._telemetry.open()
-        self._worker = self._worker_factory(self.config, self._can.interface)
         try:
+            self._worker = self._worker_factory(self.config, self._can.interface)
             self._worker.start()
             self._telemetry.wait_for_engaged(
                 self.config.arm_connect_timeout_s,
@@ -283,7 +328,8 @@ class SinglePiperController(RobotSetupController):
             self._commands = self._command_factory(self.config.command_address)
         except Exception as exc:
             logs = list(getattr(self._worker, "logs", ()))
-            self._worker.stop(allow_watchdog_recovery=False)
+            if self._worker is not None:
+                self._worker.stop(allow_watchdog_recovery=False)
             self._telemetry.close()
             self._worker = self._telemetry = None
             raise RuntimeError(f"MIT worker failed to become engaged; logs={logs[-20:]}") from exc
@@ -324,15 +370,25 @@ class SinglePiperController(RobotSetupController):
             **cameras,
         }
 
-    def send_action(self, action: np.ndarray) -> np.ndarray:
+    def get_teleop_sample(self) -> tuple[dict[str, Any], np.ndarray]:
+        """Return state/images and follower target from one 30 Hz frame latch."""
+        if not self._teleop_observer_attached or self._telemetry is None:
+            raise RuntimeError("connect_teleop_observer() must complete first")
+        packet = self._telemetry.latch_engaged(self.config.telemetry_timeout_s)
+        observation = {
+            "observation.state": normalize_telemetry(packet),
+            **self.get_camera_observation(),
+        }
+        return observation, normalize_teleop_target(packet)
+
+    def send_action(self, action: np.ndarray) -> None:
         """Inject one normalized target; timing/chunk policy remains scheduler-owned."""
         if not self.arm_started or self._commands is None:
             raise RuntimeError("start_arm() must complete before sending an action")
-        accepted = validate_action(action)
-        q_rad, gripper_width_m = denormalize_action(accepted)
+        target = validate_action(action)
+        q_rad, gripper_width_m = denormalize_action(target)
         self._commands.send(q_rad, gripper_width_m)
         self._sent_action = True
-        return accepted.copy()
 
     def status(self) -> dict[str, Any]:
         return {
@@ -352,8 +408,6 @@ class SinglePiperController(RobotSetupController):
             "wrist_camera_serial": None if self._devices is None else self._devices.wrist_serial,
             "head_camera_controls": dict(self._camera_controls.get("head", {})),
             "wrist_camera_controls": dict(self._camera_controls.get("wrist", {})),
-            "last_head_frame_time": getattr(self._head, "latest_timestamp", None),
-            "last_wrist_frame_time": getattr(self._wrist, "latest_timestamp", None),
         }
 
     def disconnect(self) -> None:
@@ -373,6 +427,7 @@ class SinglePiperController(RobotSetupController):
         self._camera_controls.clear()
         self._arm_started = False
         self._sent_action = False
+        self._teleop_observer_attached = False
 
     def stop(self) -> None:
         """Stop control and release resources; safe to call after partial start."""
