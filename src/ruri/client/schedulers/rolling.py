@@ -102,7 +102,6 @@ class RollingScheduler:
         max_chunks = get_arg(args, "max_chunks", None)
         threshold = float(get_arg(args, "chunk_size_threshold", 0.5))
         aggregate_name = str(get_arg(args, "aggregate_fn_name", "weighted_average"))
-        configured_horizon = get_arg(args, "actions_per_chunk", None)
 
         if not np.isfinite(control_hz) or control_hz <= 0:
             raise ValueError("control_hz must be finite and positive")
@@ -115,9 +114,6 @@ class RollingScheduler:
             raise ValueError(
                 f"Unknown aggregate_fn_name {aggregate_name!r}; available: {available}"
             )
-        if configured_horizon is not None and configured_horizon <= 0:
-            raise ValueError("actions_per_chunk must be positive")
-
         trace = self._start_trace(args)
         if trace is not None:
             self.last_log_path = trace.path
@@ -126,7 +122,6 @@ class RollingScheduler:
                 "run_start",
                 control_hz=control_hz,
                 max_chunks=max_chunks,
-                actions_per_chunk=configured_horizon,
                 chunk_size_threshold=threshold,
                 aggregate_fn_name=aggregate_name,
             )
@@ -157,9 +152,12 @@ class RollingScheduler:
                         )
                     ready_queue.put(("error", error))
                     return
+                output_chunk_size = int(remote_policy.output_chunk_size)
                 if trace is not None:
-                    trace.record("policy_ready")
-                ready_queue.put(("ok", None))
+                    trace.record(
+                        "policy_ready", output_chunk_size=output_chunk_size
+                    )
+                ready_queue.put(("ok", output_chunk_size))
                 while not stop_worker.is_set():
                     request = request_queue.get()
                     if request is stop_token:
@@ -180,14 +178,11 @@ class RollingScheduler:
                         first_action_step = observation_step + 1
                         inputs = self._policy_inputs(observation, args)
                         chunk = self._action_chunk(remote_policy.infer(inputs))
-                        if (
-                            configured_horizon is not None
-                            and chunk.shape[0] != int(configured_horizon)
-                        ):
+                        if chunk.shape[0] != output_chunk_size:
                             raise ValueError(
                                 "Policy returned an action chunk whose horizon does "
-                                "not match actions_per_chunk: "
-                                f"{chunk.shape[0]} != {configured_horizon}"
+                                "not match metadata outputs.output_chunk_size: "
+                                f"{chunk.shape[0]} != {output_chunk_size}"
                             )
                         if trace is not None:
                             trace.record(
@@ -235,6 +230,7 @@ class RollingScheduler:
             ready_status, ready_payload = ready_queue.get()
             if ready_status == "error":
                 raise ready_payload
+            horizon = int(ready_payload)
             robot.start()
             if trace is not None:
                 trace.record("controller_ready")
@@ -250,7 +246,6 @@ class RollingScheduler:
             if initial_status == "error":
                 raise initial_payload
             initial_chunk = initial_payload
-            horizon = int(configured_horizon or initial_chunk.shape[0])
 
             old_weight, new_weight = _AGGREGATE_WEIGHTS[aggregate_name]
             self.last_run_stats = self._execute(
@@ -513,9 +508,6 @@ class RollingScheduler:
         prompt = get_arg(args, "prompt", None)
         if prompt is not None:
             inputs["prompt"] = prompt
-        actions_per_chunk = get_arg(args, "actions_per_chunk", None)
-        if actions_per_chunk is not None:
-            inputs["context.actions_per_chunk"] = actions_per_chunk
         return inputs
 
     @staticmethod

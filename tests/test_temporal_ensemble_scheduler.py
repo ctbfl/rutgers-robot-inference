@@ -45,7 +45,6 @@ class TemporalEnsembleSchedulerTests(unittest.TestCase):
         instances = {}
         args = SimpleNamespace(
             control_hz=100.0,
-            actions_per_chunk=4,
             temporal_ensemble_coeff=0.0,
             max_chunks=3,
             scheduler_log_enabled=False,
@@ -70,6 +69,8 @@ class TemporalEnsembleSchedulerTests(unittest.TestCase):
                 pass
 
         class FakePolicy:
+            output_chunk_size = 4
+
             def __init__(self, received_args):
                 self.calls = 0
                 instances["policy"] = self
@@ -105,7 +106,6 @@ class TemporalEnsembleSchedulerTests(unittest.TestCase):
         three_actions_sent = threading.Event()
         args = SimpleNamespace(
             control_hz=100.0,
-            actions_per_chunk=4,
             temporal_ensemble_coeff=0.0,
             max_chunks=2,
             scheduler_log_enabled=False,
@@ -132,6 +132,8 @@ class TemporalEnsembleSchedulerTests(unittest.TestCase):
                 pass
 
         class DelayedPolicy:
+            output_chunk_size = 4
+
             def __init__(self, received_args):
                 self.calls = 0
 
@@ -168,7 +170,6 @@ class TemporalEnsembleSchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as log_dir:
             args = SimpleNamespace(
                 control_hz=100.0,
-                actions_per_chunk=2,
                 temporal_ensemble_coeff=0.01,
                 max_chunks=2,
                 scheduler_log_dir=log_dir,
@@ -191,6 +192,8 @@ class TemporalEnsembleSchedulerTests(unittest.TestCase):
                     pass
 
             class FakePolicy:
+                output_chunk_size = 2
+
                 def __init__(self, received_args):
                     self.calls = 0
 

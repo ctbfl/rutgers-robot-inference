@@ -20,11 +20,15 @@ DEFAULT_PROMPT = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--policy-endpoint", default="tcp://172.16.68.130:5555"
+        "--policy-endpoint",
+        required=True,
+        help=(
+            "explicit ACT policy ZeroMQ endpoint; inspect available policies "
+            "with examples/list_policy_servers.py"
+        ),
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--control-hz", type=float, default=30.0)
-    parser.add_argument("--actions-per-chunk", type=int, default=100)
     parser.add_argument(
         "--temporal-ensemble-coeff",
         type=float,

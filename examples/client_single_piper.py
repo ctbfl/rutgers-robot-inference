@@ -25,11 +25,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--policy-endpoint",
-        default="tcp://172.16.68.130:5555",
+        required=True,
+        help=(
+            "explicit policy ZeroMQ endpoint; inspect available policies with "
+            "examples/list_policy_servers.py"
+        ),
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--control-hz", type=float, default=30.0)
-    parser.add_argument("--actions-per-chunk", type=int, default=10)
     parser.add_argument("--chunk-size-threshold", type=float, default=0.5)
     parser.add_argument(
         "--aggregate-fn-name",

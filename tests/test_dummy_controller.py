@@ -42,7 +42,6 @@ class DummyControllerTests(unittest.TestCase):
             control_hz=30.0,
             max_chunks=2,
             prompt="dummy task",
-            actions_per_chunk=2,
             dummy_state_dim=7,
             dummy_image_height=4,
             dummy_image_width=6,
@@ -55,6 +54,8 @@ class DummyControllerTests(unittest.TestCase):
             return controller
 
         class FakePolicy:
+            output_chunk_size = 2
+
             def __init__(self, received_args):
                 self.args = received_args
                 self.calls = 0
@@ -84,8 +85,8 @@ class DummyControllerTests(unittest.TestCase):
                     raise AssertionError("Policy did not receive shared args")
                 if inputs["prompt"] != args.prompt:
                     raise AssertionError("Prompt did not flow through Scheduler")
-                if inputs["context.actions_per_chunk"] != 2:
-                    raise AssertionError("Chunk context did not flow through Scheduler")
+                if "context.actions_per_chunk" in inputs:
+                    raise AssertionError("Scheduler injected obsolete chunk context")
 
             def stop(self):
                 pass

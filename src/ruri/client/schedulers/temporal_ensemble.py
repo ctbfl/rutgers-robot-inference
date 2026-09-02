@@ -231,13 +231,10 @@ class TemporalEnsembleScheduler:
         args: Any,
     ) -> None:
         control_hz = float(get_arg(args, "control_hz", 30.0))
-        horizon = int(get_arg(args, "actions_per_chunk", 100))
         coefficient = float(get_arg(args, "temporal_ensemble_coeff", 0.01))
         max_chunks = get_arg(args, "max_chunks", None)
         if not math.isfinite(control_hz) or control_hz <= 0:
             raise ValueError("control_hz must be finite and positive")
-        if horizon <= 0:
-            raise ValueError("actions_per_chunk must be positive")
         if not math.isfinite(coefficient):
             raise ValueError("temporal_ensemble_coeff must be finite")
         if max_chunks is not None and max_chunks < 0:
@@ -253,7 +250,6 @@ class TemporalEnsembleScheduler:
             trace.record(
                 "run_start",
                 control_hz=control_hz,
-                actions_per_chunk=horizon,
                 temporal_ensemble_coeff=coefficient,
                 max_chunks=max_chunks,
             )
@@ -271,9 +267,12 @@ class TemporalEnsembleScheduler:
                 except Exception as error:
                     ready_queue.put(("error", error))
                     return
+                output_chunk_size = int(remote_policy.output_chunk_size)
                 if trace is not None:
-                    trace.record("policy_ready")
-                ready_queue.put(("ok", None))
+                    trace.record(
+                        "policy_ready", output_chunk_size=output_chunk_size
+                    )
+                ready_queue.put(("ok", output_chunk_size))
                 while not stop_worker.is_set():
                     token = request_queue.get()
                     if token is stop_token:
@@ -295,10 +294,11 @@ class TemporalEnsembleScheduler:
                             self._policy_inputs(observation, args)
                         )
                         chunk = self._action_chunk(response)
-                        if len(chunk) != horizon:
+                        if len(chunk) != output_chunk_size:
                             raise ValueError(
                                 "Policy returned an action chunk whose horizon does "
-                                f"not match actions_per_chunk: {len(chunk)} != {horizon}"
+                                "not match metadata outputs.output_chunk_size: "
+                                f"{len(chunk)} != {output_chunk_size}"
                             )
                         duration_ms = (
                             time.monotonic_ns() - started_ns
@@ -358,9 +358,12 @@ class TemporalEnsembleScheduler:
             ready_status, ready_payload = ready_queue.get()
             if ready_status == "error":
                 raise ready_payload
+            output_chunk_size = int(ready_payload)
             robot.start()
             if trace is not None:
-                trace.record("controller_ready")
+                trace.record(
+                    "controller_ready", output_chunk_size=output_chunk_size
+                )
             if max_chunks == 0:
                 self.last_run_stats = self._empty_stats(coefficient)
                 return
@@ -575,9 +578,6 @@ class TemporalEnsembleScheduler:
         prompt = get_arg(args, "prompt", None)
         if prompt is not None:
             inputs["prompt"] = prompt
-        inputs["context.actions_per_chunk"] = int(
-            get_arg(args, "actions_per_chunk", 100)
-        )
         return inputs
 
     @staticmethod

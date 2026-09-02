@@ -22,12 +22,17 @@ class RemotePolicyTests(unittest.TestCase):
             policy._socket = fake_socket
 
         policy._open_socket = Mock(side_effect=open_socket)
-        policy._request = Mock(return_value={"inputs": {"observation.state": {}}})
+        metadata = {
+            "inputs": {"observation.state": {}},
+            "outputs": {"output_chunk_size": 30},
+        }
+        policy._request = Mock(return_value=metadata)
 
         policy.start()
 
         self.assertTrue(policy.is_started)
-        self.assertEqual(policy.metadata, {"inputs": {"observation.state": {}}})
+        self.assertEqual(policy.metadata, metadata)
+        self.assertEqual(policy.output_chunk_size, 30)
         self.assertEqual(policy._open_socket.call_count, 2)
         policy.stop()
 
@@ -51,7 +56,6 @@ class RemotePolicyTests(unittest.TestCase):
                 {
                     "observation.state": np.zeros(7, dtype=np.float32),
                     "prompt": "perform task",
-                    "context.actions_per_chunk": 4,
                 }
             )
 
@@ -60,7 +64,7 @@ class RemotePolicyTests(unittest.TestCase):
         self.assertIs(send.call_args.args[0], fake_socket)
         self.assertEqual(request["type"], "infer")
         self.assertEqual(request["prompt"], "perform task")
-        self.assertEqual(request["context.actions_per_chunk"], 4)
+        self.assertNotIn("context.actions_per_chunk", request)
         np.testing.assert_array_equal(
             request["observation.state"], np.zeros(7, dtype=np.float32)
         )
@@ -79,6 +83,36 @@ class RemotePolicyTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "bad request"),
         ):
             policy.infer({})
+
+    def test_start_rejects_metadata_without_output_chunk_size(self):
+        args = SimpleNamespace(
+            policy_endpoint="tcp://policy.example:5555",
+            policy_ready_timeout_s=1.0,
+        )
+        policy = RemotePolicy(args)
+        fake_socket = Mock()
+
+        def open_socket(_timeout_s):
+            policy._socket = fake_socket
+
+        policy._open_socket = Mock(side_effect=open_socket)
+        policy._request = Mock(return_value={"inputs": {}})
+
+        with self.assertRaisesRegex(ValueError, "outputs"):
+            policy.start()
+
+        self.assertFalse(policy.is_started)
+        self.assertIsNone(policy.metadata)
+
+    def test_output_chunk_size_must_be_a_positive_integer(self):
+        invalid_values = (None, True, 0, -1, 3.5, "30")
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "positive integer"
+            ):
+                RemotePolicy._metadata_output_chunk_size(
+                    {"outputs": {"output_chunk_size": value}}
+                )
 
 
 if __name__ == "__main__":

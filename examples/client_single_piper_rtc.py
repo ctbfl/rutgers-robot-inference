@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """Continuously drive Single Piper with latency-aligned RTC chunk replacement.
 
-The policy returns 10 actions.  After every 5 successfully sent
-actions, the scheduler requests another chunk while continuing to execute the
-old one.  On return, the elapsed prefix is discarded and the unsent queue is
-replaced on the same absolute control timeline.  Stop with Ctrl+C.
+The policy's metadata declares its action horizon. After every configured
+number of successfully sent actions, the scheduler requests another chunk
+while continuing to execute the old one. On return, the elapsed prefix is
+discarded and the unsent queue is replaced on the same absolute control
+timeline. Stop with Ctrl+C.
 """
 
 from __future__ import annotations
@@ -26,11 +27,15 @@ DEFAULT_PROMPT = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--policy-endpoint", default="tcp://172.16.68.130:5555"
+        "--policy-endpoint",
+        required=True,
+        help=(
+            "explicit RTC policy ZeroMQ endpoint; inspect available policies "
+            "with examples/list_policy_servers.py"
+        ),
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--control-hz", type=float, default=30.0)
-    parser.add_argument("--actions-per-chunk", type=int, default=10)
     parser.add_argument(
         "--execution-horizon",
         type=int,

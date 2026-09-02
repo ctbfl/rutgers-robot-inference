@@ -1,8 +1,9 @@
 #!/usr/bin/env python
-"""Continuously run blocking Pi0.5 chunks with smooth starts and stops.
+"""Continuously run blocking policy chunks with smooth starts and stops.
 
-By default, each inference predicts and executes all 10 actions.  Set a shorter
-execution prefix explicitly when faster replanning is desired.  A
+The server metadata declares the full chunk size. By default every returned
+action is executed; set a shorter execution prefix explicitly when faster
+replanning is desired. A
 fixed-duration minimum-jerk time law starts and ends the executed trajectory
 with zero velocity and acceleration, moving faster through the middle instead
 of adding extra time.  Stop with Ctrl+C.
@@ -27,16 +28,20 @@ DEFAULT_PROMPT = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--policy-endpoint", default="tcp://172.16.68.130:5555"
+        "--policy-endpoint",
+        required=True,
+        help=(
+            "explicit policy ZeroMQ endpoint; inspect available policies with "
+            "examples/list_policy_servers.py"
+        ),
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--control-hz", type=float, default=30.0)
-    parser.add_argument("--actions-per-chunk", type=int, default=10)
     parser.add_argument(
         "--execute-actions-per-chunk",
         type=int,
-        default=10,
-        help="execute only this prefix before requesting a new chunk",
+        default=None,
+        help="execute only this prefix; omitted executes the full server chunk",
     )
     parser.add_argument(
         "--max-chunks",

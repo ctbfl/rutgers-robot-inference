@@ -21,7 +21,7 @@ Scheduler、Controller 和 Policy 收到同一个 `args` 对象，各自读取�
 1. 构造 Controller 和 Policy。
 2. 先调用 `policy.start()`，通过 metadata 请求等待远程 server ready。
 3. 再调用 `controller.start()`，等待相机、CAN、MIT worker 和机械臂全部 ready。
-4. 循环获取 observation，由 Scheduler 注入 `args.prompt` 和可选的 `args.actions_per_chunk` 后调用 `policy.infer()`，再解析 `action_chunk`。
+4. 循环获取 observation，由 Scheduler 注入 `args.prompt` 后调用 `policy.infer()`，再解析 `action_chunk`；完整 horizon 以 server metadata 的 `outputs.output_chunk_size` 为准。
 5. 以 `control_hz` 逐行调用 `controller.send_action()`，完整消费当前 chunk 后才请求下一个 chunk。
 6. 退出或异常时依次执行 `controller.stop()` 和 `policy.stop()`。
 

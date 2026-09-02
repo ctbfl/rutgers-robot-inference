@@ -1,7 +1,7 @@
 # Machine-specific launch scripts (absolute checkpoint and venv paths).
 examples/shell_scripts/*
 
-# Server run logs.
+# Runtime logs (server and client scheduler traces).
 logs/
 
 # Byte-compiled
@@ -29,9 +29,6 @@ env/
 .coverage
 .coverage.*
 htmlcov/
-
-# Runtime traces (actions, inference events, and hardware failures)
-logs/
 
 # Editors and OS
 .ipynb_checkpoints/

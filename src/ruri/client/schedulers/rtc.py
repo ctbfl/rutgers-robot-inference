@@ -275,30 +275,28 @@ class RTCScheduler:
     ) -> None:
         """Run a standalone RTC request/execute/replace state machine."""
         control_hz = float(get_arg(args, "control_hz", 30.0))
-        actions_per_chunk = int(get_arg(args, "actions_per_chunk", 10))
         execution_horizon = int(get_arg(args, "execution_horizon", 5))
         max_chunks = get_arg(args, "max_chunks", None)
         latency_window = int(get_arg(args, "rtc_latency_window", 10))
-        initial_delay_steps = int(
-            get_arg(args, "rtc_initial_delay_steps", min(4, actions_per_chunk))
+        configured_initial_delay_steps = get_arg(
+            args, "rtc_initial_delay_steps", None
         )
+        if configured_initial_delay_steps is not None:
+            configured_initial_delay_steps = int(configured_initial_delay_steps)
 
         if not np.isfinite(control_hz) or control_hz <= 0:
             raise ValueError("control_hz must be finite and positive")
-        if actions_per_chunk <= 0:
-            raise ValueError("actions_per_chunk must be positive")
         if execution_horizon <= 0:
             raise ValueError("execution_horizon must be positive")
-        if execution_horizon > actions_per_chunk:
-            raise ValueError("execution_horizon cannot exceed actions_per_chunk")
         if max_chunks is not None and max_chunks < 0:
             raise ValueError("max_chunks cannot be negative")
         if latency_window <= 0:
             raise ValueError("rtc_latency_window must be positive")
-        if not 0 <= initial_delay_steps <= actions_per_chunk:
-            raise ValueError(
-                "rtc_initial_delay_steps must be between 0 and actions_per_chunk"
-            )
+        if (
+            configured_initial_delay_steps is not None
+            and configured_initial_delay_steps < 0
+        ):
+            raise ValueError("rtc_initial_delay_steps cannot be negative")
 
         robot = controller(args)
         remote_policy = policy(args)
@@ -310,9 +308,8 @@ class RTCScheduler:
             trace.record(
                 "run_start",
                 control_hz=control_hz,
-                actions_per_chunk=actions_per_chunk,
                 execution_horizon=execution_horizon,
-                rtc_initial_delay_steps=initial_delay_steps,
+                rtc_initial_delay_steps=configured_initial_delay_steps,
                 max_chunks=max_chunks,
             )
 
@@ -323,9 +320,6 @@ class RTCScheduler:
         stop_token = object()
 
         def inference_worker() -> None:
-            delay_history: deque[int] = deque(
-                [initial_delay_steps], maxlen=latency_window
-            )
             try:
                 try:
                     remote_policy.start()
@@ -339,9 +333,24 @@ class RTCScheduler:
                         )
                     ready_queue.put(("error", error))
                     return
+                output_chunk_size = int(remote_policy.output_chunk_size)
+                initial_delay_steps = (
+                    min(4, output_chunk_size)
+                    if configured_initial_delay_steps is None
+                    else configured_initial_delay_steps
+                )
+                delay_history: deque[int] = deque(
+                    [initial_delay_steps], maxlen=latency_window
+                )
                 if trace is not None:
-                    trace.record("policy_ready")
-                ready_queue.put(("ok", None))
+                    trace.record(
+                        "policy_ready",
+                        output_chunk_size=output_chunk_size,
+                        rtc_initial_delay_steps=initial_delay_steps,
+                    )
+                ready_queue.put(
+                    ("ok", (output_chunk_size, initial_delay_steps))
+                )
 
                 while not stop_worker.is_set():
                     token = request_queue.get()
@@ -384,11 +393,11 @@ class RTCScheduler:
                             )
                         response = remote_policy.infer(inputs)
                         chunk = self._action_chunk(response)
-                        if len(chunk) != actions_per_chunk:
+                        if len(chunk) != output_chunk_size:
                             raise ValueError(
                                 "Policy returned an action chunk whose horizon does "
-                                "not match actions_per_chunk: "
-                                f"{len(chunk)} != {actions_per_chunk}"
+                                "not match metadata outputs.output_chunk_size: "
+                                f"{len(chunk)} != {output_chunk_size}"
                             )
                         rtc_requested = previous_tail is not None
                         rtc_applied = response.get("rtc.applied")
@@ -485,6 +494,21 @@ class RTCScheduler:
             ready_status, ready_payload = ready_queue.get()
             if ready_status == "error":
                 raise ready_payload
+            output_chunk_size, initial_delay_steps = ready_payload
+            output_chunk_size = int(output_chunk_size)
+            initial_delay_steps = int(initial_delay_steps)
+            if execution_horizon > output_chunk_size:
+                raise ValueError(
+                    "execution_horizon cannot exceed server metadata "
+                    "outputs.output_chunk_size: "
+                    f"{execution_horizon} > {output_chunk_size}"
+                )
+            if initial_delay_steps > output_chunk_size:
+                raise ValueError(
+                    "rtc_initial_delay_steps cannot exceed server metadata "
+                    "outputs.output_chunk_size: "
+                    f"{initial_delay_steps} > {output_chunk_size}"
+                )
 
             robot.start()
             if trace is not None:

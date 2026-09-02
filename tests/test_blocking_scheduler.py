@@ -18,7 +18,6 @@ class BlockingSchedulerTests(unittest.TestCase):
             args = SimpleNamespace(
                 control_hz=30.0,
                 max_chunks=1,
-                actions_per_chunk=2,
                 execute_actions_per_chunk=1,
                 scheduler_log_dir=log_dir,
             )
@@ -40,6 +39,8 @@ class BlockingSchedulerTests(unittest.TestCase):
                     pass
 
             class FakePolicy:
+                output_chunk_size = 2
+
                 def __init__(self, received_args):
                     pass
 
@@ -79,7 +80,6 @@ class BlockingSchedulerTests(unittest.TestCase):
             control_hz=30.0,
             max_chunks=2,
             prompt="test task",
-            actions_per_chunk=2,
             scheduler_log_enabled=False,
         )
 
@@ -108,6 +108,8 @@ class BlockingSchedulerTests(unittest.TestCase):
                 events.append("controller.stop")
 
         class FakePolicy:
+            output_chunk_size = 2
+
             def __init__(self, received_args):
                 self.args = received_args
                 self.calls = 0
@@ -122,8 +124,8 @@ class BlockingSchedulerTests(unittest.TestCase):
                 self.assert_shared_args()
                 if observation["prompt"] != args.prompt:
                     raise AssertionError("Scheduler did not inject args.prompt")
-                if observation["context.actions_per_chunk"] != args.actions_per_chunk:
-                    raise AssertionError("Scheduler did not inject actions_per_chunk")
+                if "context.actions_per_chunk" in observation:
+                    raise AssertionError("Scheduler injected obsolete chunk context")
                 events.append(f"policy.infer.{self.calls}")
                 base = self.calls * 10
                 return {
@@ -185,6 +187,8 @@ class BlockingSchedulerTests(unittest.TestCase):
                 events.append("controller.stop")
 
         class FakePolicy:
+            output_chunk_size = 1
+
             def __init__(self, received_args):
                 self.args = received_args
 
@@ -202,12 +206,49 @@ class BlockingSchedulerTests(unittest.TestCase):
             ["policy.start", "controller.start", "controller.stop", "policy.stop"],
         )
 
+    def test_rejects_execution_prefix_before_starting_hardware(self):
+        events = []
+        args = SimpleNamespace(
+            control_hz=30.0,
+            max_chunks=1,
+            execute_actions_per_chunk=3,
+            scheduler_log_enabled=False,
+        )
+
+        class FakeController:
+            def __init__(self, received_args):
+                pass
+
+            def start(self):
+                events.append("controller.start")
+
+            def stop(self):
+                events.append("controller.stop")
+
+        class FakePolicy:
+            output_chunk_size = 2
+
+            def __init__(self, received_args):
+                pass
+
+            def start(self):
+                events.append("policy.start")
+
+            def stop(self):
+                events.append("policy.stop")
+
+        with self.assertRaisesRegex(ValueError, "output_chunk_size"):
+            BlockingScheduler().run(FakeController, FakePolicy, args=args)
+
+        self.assertEqual(
+            events, ["policy.start", "controller.stop", "policy.stop"]
+        )
+
     def test_predicts_ten_but_executes_only_first_five(self):
         instances = {}
         args = SimpleNamespace(
             control_hz=30.0,
             max_chunks=2,
-            actions_per_chunk=10,
             execute_actions_per_chunk=5,
             scheduler_log_enabled=False,
         )
@@ -230,6 +271,8 @@ class BlockingSchedulerTests(unittest.TestCase):
                 pass
 
         class FakePolicy:
+            output_chunk_size = 10
+
             def __init__(self, received_args):
                 self.calls = 0
                 instances["policy"] = self
@@ -239,17 +282,14 @@ class BlockingSchedulerTests(unittest.TestCase):
 
             def infer(self, observation):
                 self.calls += 1
-                self.assertEqual(observation["context.actions_per_chunk"], 10)
+                if "context.actions_per_chunk" in observation:
+                    raise AssertionError("Scheduler injected obsolete chunk context")
                 base = self.calls * 100
                 return {
                     "action_chunk": np.arange(
                         base, base + 10, dtype=np.float32
                     )[:, None]
                 }
-
-            def assertEqual(self, actual, expected):
-                if actual != expected:
-                    raise AssertionError(f"{actual!r} != {expected!r}")
 
             def stop(self):
                 pass

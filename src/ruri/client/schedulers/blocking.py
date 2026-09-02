@@ -117,7 +117,6 @@ class BlockingScheduler:
                 "run_start",
                 control_hz=control_hz,
                 max_chunks=max_chunks,
-                actions_per_chunk=get_arg(args, "actions_per_chunk", None),
                 execute_actions_per_chunk=execute_actions_per_chunk,
                 action_profile=action_profile,
             )
@@ -125,8 +124,20 @@ class BlockingScheduler:
         try:
             # Check the remote dependency before enabling real hardware.
             remote_policy.start()
+            output_chunk_size = int(remote_policy.output_chunk_size)
+            if (
+                execute_actions_per_chunk is not None
+                and execute_actions_per_chunk > output_chunk_size
+            ):
+                raise ValueError(
+                    "execute_actions_per_chunk cannot exceed server metadata "
+                    f"outputs.output_chunk_size: {execute_actions_per_chunk} > "
+                    f"{output_chunk_size}"
+                )
             if trace is not None:
-                trace.record("policy_ready")
+                trace.record(
+                    "policy_ready", output_chunk_size=output_chunk_size
+                )
             robot.start()
             if trace is not None:
                 trace.record("controller_ready")
@@ -136,6 +147,7 @@ class BlockingScheduler:
                 args,
                 control_hz,
                 max_chunks,
+                output_chunk_size,
                 action_profile,
                 execute_actions_per_chunk,
                 trace,
@@ -171,6 +183,7 @@ class BlockingScheduler:
         args: Any,
         control_hz: float,
         max_chunks: int | None,
+        output_chunk_size: int,
         action_profile: str = "none",
         execute_actions_per_chunk: int | None = None,
         trace: _BlockingTrace | None = None,
@@ -182,6 +195,7 @@ class BlockingScheduler:
             "chunks_received": 0,
             "actions_sent": 0,
             "clipped_actions": 0,
+            "output_chunk_size": output_chunk_size,
             "action_profile": action_profile,
         }
 
@@ -201,17 +215,17 @@ class BlockingScheduler:
             if prompt is not None:
                 policy_inputs["prompt"] = prompt
 
-            actions_per_chunk = get_arg(args, "actions_per_chunk", None)
-            if actions_per_chunk is not None:
-                if actions_per_chunk <= 0:
-                    raise ValueError("actions_per_chunk must be positive")
-                policy_inputs["context.actions_per_chunk"] = actions_per_chunk
-
             inference_started_ns = time.monotonic_ns()
             if trace is not None:
                 trace.record("inference_started", chunk_index=chunk_index)
             response = policy.infer(policy_inputs)
             action_chunk = BlockingScheduler._action_chunk(response)
+            if len(action_chunk) != output_chunk_size:
+                raise ValueError(
+                    "Policy returned an action chunk whose horizon does not match "
+                    "metadata outputs.output_chunk_size: "
+                    f"{len(action_chunk)} != {output_chunk_size}"
+                )
             returned_horizon = len(action_chunk)
             stats["chunks_received"] = int(stats["chunks_received"]) + 1
             if trace is not None:

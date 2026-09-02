@@ -19,7 +19,6 @@ class RTCSchedulerTests(unittest.TestCase):
         eight_actions_sent = threading.Event()
         args = SimpleNamespace(
             control_hz=100.0,
-            actions_per_chunk=10,
             execution_horizon=5,
             max_chunks=2,
             prompt="test task",
@@ -48,6 +47,8 @@ class RTCSchedulerTests(unittest.TestCase):
                 pass
 
         class DelayedPolicy:
+            output_chunk_size = 10
+
             def __init__(self, received_args):
                 self.args = received_args
                 self.calls = 0
@@ -109,7 +110,6 @@ class RTCSchedulerTests(unittest.TestCase):
         five_actions_sent = threading.Event()
         args = SimpleNamespace(
             control_hz=100.0,
-            actions_per_chunk=3,
             execution_horizon=2,
             max_chunks=2,
             scheduler_log_enabled=False,
@@ -135,6 +135,8 @@ class RTCSchedulerTests(unittest.TestCase):
                 pass
 
         class SlowPolicy:
+            output_chunk_size = 3
+
             def __init__(self, received_args):
                 self.calls = 0
 
@@ -168,7 +170,6 @@ class RTCSchedulerTests(unittest.TestCase):
             send_times: list[float] = []
             args = SimpleNamespace(
                 control_hz=200.0,
-                actions_per_chunk=2,
                 execution_horizon=1,
                 max_chunks=1,
                 scheduler_log_dir=log_dir,
@@ -192,6 +193,8 @@ class RTCSchedulerTests(unittest.TestCase):
                     pass
 
             class FakePolicy:
+                output_chunk_size = 2
+
                 def __init__(self, received_args):
                     pass
 
@@ -221,7 +224,6 @@ class RTCSchedulerTests(unittest.TestCase):
     def test_rejects_policy_horizon_mismatch(self):
         args = SimpleNamespace(
             control_hz=100.0,
-            actions_per_chunk=3,
             execution_horizon=1,
             max_chunks=1,
             scheduler_log_enabled=False,
@@ -241,6 +243,8 @@ class RTCSchedulerTests(unittest.TestCase):
                 pass
 
         class ShortPolicy:
+            output_chunk_size = 3
+
             def __init__(self, received_args):
                 pass
 
@@ -256,10 +260,48 @@ class RTCSchedulerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             RTCScheduler().run(FakeController, ShortPolicy, args=args)
 
+    def test_rejects_execution_horizon_before_starting_hardware(self):
+        events = []
+        args = SimpleNamespace(
+            control_hz=100.0,
+            execution_horizon=4,
+            max_chunks=0,
+            scheduler_log_enabled=False,
+        )
+
+        class FakeController:
+            def __init__(self, received_args):
+                pass
+
+            def start(self):
+                events.append("controller.start")
+
+            def stop(self):
+                events.append("controller.stop")
+
+        class FakePolicy:
+            output_chunk_size = 3
+
+            def __init__(self, received_args):
+                pass
+
+            def start(self):
+                events.append("policy.start")
+
+            def stop(self):
+                events.append("policy.stop")
+
+        with self.assertRaisesRegex(ValueError, "output_chunk_size"):
+            RTCScheduler().run(FakeController, FakePolicy, args=args)
+
+        self.assertNotIn("controller.start", events)
+        self.assertEqual(events[0], "policy.start")
+        self.assertIn("controller.stop", events)
+        self.assertIn("policy.stop", events)
+
     def test_rejects_silent_rtc_server_fallback(self):
         args = SimpleNamespace(
             control_hz=200.0,
-            actions_per_chunk=4,
             execution_horizon=2,
             max_chunks=2,
             scheduler_log_enabled=False,
@@ -282,6 +324,8 @@ class RTCSchedulerTests(unittest.TestCase):
                 pass
 
         class FallbackPolicy:
+            output_chunk_size = 4
+
             def __init__(self, received_args):
                 self.calls = 0
 

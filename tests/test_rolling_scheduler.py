@@ -43,7 +43,6 @@ class RollingSchedulerTests(unittest.TestCase):
         args = SimpleNamespace(
             control_hz=100.0,
             max_chunks=2,
-            actions_per_chunk=6,
             chunk_size_threshold=0.5,
             aggregate_fn_name="weighted_average",
             prompt="pick the object",
@@ -71,6 +70,8 @@ class RollingSchedulerTests(unittest.TestCase):
                 events.append("controller.stop")
 
         class FakePolicy:
+            output_chunk_size = 6
+
             def __init__(self, received_args):
                 self.args = received_args
                 self.calls = 0
@@ -102,9 +103,7 @@ class RollingSchedulerTests(unittest.TestCase):
         self.assertIs(policy.args, args)
         self.assertEqual(policy.calls, 2)
         self.assertEqual(policy.inputs[0]["prompt"], args.prompt)
-        self.assertEqual(
-            policy.inputs[1]["context.actions_per_chunk"], args.actions_per_chunk
-        )
+        self.assertNotIn("context.actions_per_chunk", policy.inputs[1])
         self.assertEqual(
             robot.observation_threads,
             ["ruri-rolling-inference", "ruri-rolling-inference"],
@@ -119,7 +118,6 @@ class RollingSchedulerTests(unittest.TestCase):
         args = SimpleNamespace(
             control_hz=100.0,
             max_chunks=2,
-            actions_per_chunk=2,
             chunk_size_threshold=0.5,
             scheduler_log_enabled=False,
         )
@@ -142,6 +140,8 @@ class RollingSchedulerTests(unittest.TestCase):
                 pass
 
         class SlowPolicy:
+            output_chunk_size = 2
+
             def __init__(self, received_args):
                 self.calls = 0
 
@@ -171,7 +171,6 @@ class RollingSchedulerTests(unittest.TestCase):
             args = SimpleNamespace(
                 control_hz=200.0,
                 max_chunks=1,
-                actions_per_chunk=2,
                 scheduler_log_dir=log_dir,
             )
 
@@ -193,6 +192,8 @@ class RollingSchedulerTests(unittest.TestCase):
                     pass
 
             class FakePolicy:
+                output_chunk_size = 2
+
                 def __init__(self, received_args):
                     pass
 

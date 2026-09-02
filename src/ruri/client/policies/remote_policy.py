@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Mapping
+from numbers import Integral
 from typing import Any
 
 import zmq
@@ -40,14 +41,40 @@ class RemotePolicy:
         self._context: zmq.Context | None = None
         self._socket: zmq.Socket | None = None
         self._metadata: dict[str, Any] | None = None
+        self._output_chunk_size: int | None = None
 
     @property
     def is_started(self) -> bool:
-        return self._socket is not None and self._metadata is not None
+        return (
+            self._socket is not None
+            and self._metadata is not None
+            and self._output_chunk_size is not None
+        )
 
     @property
     def metadata(self) -> dict[str, Any] | None:
         return None if self._metadata is None else dict(self._metadata)
+
+    @property
+    def output_chunk_size(self) -> int:
+        """Return the server-declared full action horizon after ``start()``."""
+        if self._output_chunk_size is None:
+            raise RuntimeError(
+                "RemotePolicy.start() must complete before reading metadata"
+            )
+        return self._output_chunk_size
+
+    @staticmethod
+    def _metadata_output_chunk_size(metadata: Mapping[str, Any]) -> int:
+        outputs = metadata.get("outputs")
+        if not isinstance(outputs, Mapping):
+            raise ValueError("Policy metadata must contain an 'outputs' mapping")
+        value = outputs.get("output_chunk_size")
+        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+            raise ValueError(
+                "Policy metadata outputs.output_chunk_size must be a positive integer"
+            )
+        return int(value)
 
     def _open_socket(self, timeout_s: float) -> None:
         self._close_socket()
@@ -107,7 +134,13 @@ class RemotePolicy:
             try:
                 self._open_socket(min(self.request_timeout_s, remaining_s))
                 metadata = self._request({"type": "metadata"})
+                try:
+                    output_chunk_size = self._metadata_output_chunk_size(metadata)
+                except (TypeError, ValueError):
+                    self.stop()
+                    raise
                 self._metadata = metadata
+                self._output_chunk_size = output_chunk_size
 
                 # Readiness requests can use a short timeout, but normal
                 # inference gets the full configured request timeout.
@@ -118,7 +151,6 @@ class RemotePolicy:
                 RuntimeError,
                 TimeoutError,
                 TypeError,
-                ValueError,
                 zmq.ZMQError,
             ) as exc:
                 last_error = exc
@@ -139,6 +171,7 @@ class RemotePolicy:
     def stop(self) -> None:
         """Idempotently release the client socket and context."""
         self._metadata = None
+        self._output_chunk_size = None
         self._close_socket()
         if self._context is not None:
             self._context.term()
