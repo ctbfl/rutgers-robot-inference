@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -16,6 +17,9 @@ from ruri.client.controllers.single_piper.normalization import (
     denormalize_action,
     normalize_pose,
     validate_action,
+)
+from ruri.client.controllers.single_piper.single_piper import (
+    _configure_realsense_camera,
 )
 
 
@@ -181,6 +185,125 @@ class NormalizationTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_training_camera_controls_are_explicit_defaults(self):
+        config = SinglePiperConfig()
+        self.assertEqual(config.head_camera_exposure, 200.0)
+        self.assertEqual(config.head_camera_gain, 64.0)
+        self.assertEqual(config.head_camera_brightness, 0.0)
+        self.assertEqual(config.wrist_camera_exposure, 166.0)
+        self.assertEqual(config.wrist_camera_gain, 64.0)
+        self.assertEqual(config.wrist_camera_brightness, 0.0)
+        self.assertEqual(config.camera_controls_warmup_frames, 30)
+
+        with self.assertRaisesRegex(ValueError, "head_camera_exposure"):
+            SinglePiperConfig(head_camera_exposure=float("nan"))
+        with self.assertRaisesRegex(ValueError, "wrist_camera_gain"):
+            SinglePiperConfig(wrist_camera_gain=-1.0)
+        with self.assertRaisesRegex(ValueError, "warmup_frames"):
+            SinglePiperConfig(camera_controls_warmup_frames=-1)
+
+    def test_realsense_controls_are_locked_then_warmed_up(self):
+        option_names = (
+            "enable_auto_exposure",
+            "enable_auto_white_balance",
+            "brightness",
+            "contrast",
+            "gamma",
+            "hue",
+            "saturation",
+            "sharpness",
+            "exposure",
+            "gain",
+            "white_balance",
+            "backlight_compensation",
+        )
+        fake_rs = SimpleNamespace(
+            option=SimpleNamespace(**{name: name for name in option_names})
+        )
+
+        class FakeRange:
+            min = -1000.0
+            max = 10000.0
+            step = 1.0
+            default = 1.0
+
+        class FakeSensor:
+            def __init__(self):
+                self.values = {name: 1.0 for name in option_names}
+                self.values["white_balance"] = 4600.0
+
+            def supports(self, _option):
+                return True
+
+            def get_option_range(self, option):
+                value = FakeRange()
+                value.default = self.values[option]
+                return value
+
+            def set_option(self, option, value):
+                self.values[option] = value
+
+            def get_option(self, option):
+                return self.values[option]
+
+        class ConfigurableCamera(FakeCamera):
+            def __init__(self):
+                super().__init__(0)
+                self.sensor = FakeSensor()
+                device = SimpleNamespace(first_color_sensor=lambda: self.sensor)
+                self.rs_profile = SimpleNamespace(get_device=lambda: device)
+                self.read_count = 0
+
+            def async_read(self, timeout_ms=0):
+                self.read_count += 1
+                return super().async_read(timeout_ms)
+
+        config = SinglePiperConfig(camera_controls_warmup_frames=3)
+        for role, expected_exposure in (("head", 200.0), ("wrist", 166.0)):
+            camera = ConfigurableCamera()
+            with patch.dict("sys.modules", {"pyrealsense2": fake_rs}):
+                controls = _configure_realsense_camera(camera, role, config)
+
+            self.assertEqual(camera.read_count, 3)
+            self.assertEqual(controls["enable_auto_exposure"], 0.0)
+            self.assertEqual(controls["exposure"], expected_exposure)
+            self.assertEqual(controls["gain"], 64.0)
+            self.assertEqual(controls["brightness"], 0.0)
+            self.assertEqual(controls["enable_auto_white_balance"], 1.0)
+            self.assertEqual(controls["white_balance"], 4600.0)
+
+    def test_connect_applies_camera_configurator_after_each_camera_connects(self):
+        calls = []
+
+        def can_discovery(**_):
+            return PiperCanDevice(
+                "can-test",
+                4,
+                frozenset((0x2A1, 0x2A5, 0x2A6, 0x2A7)),
+                find_arm_registration("left", "main").can_hardware_id,
+            )
+
+        def configure_camera(camera, role, _config):
+            self.assertTrue(camera.is_connected)
+            calls.append(role)
+            return {"exposure": 200.0 if role == "head" else 166.0}
+
+        controller = SinglePiperController(
+            SinglePiperConfig(configure_can=False),
+            camera_discovery=lambda: SimpleNamespace(
+                head_serial="head", wrist_serial="wrist"
+            ),
+            can_discovery=can_discovery,
+            camera_factory=lambda *_: FakeCamera(10),
+            camera_configurator=configure_camera,
+        )
+        controller.connect()
+
+        self.assertEqual(calls, ["head", "wrist"])
+        self.assertEqual(controller.status()["head_camera_controls"]["exposure"], 200.0)
+        self.assertEqual(controller.status()["wrist_camera_controls"]["exposure"], 166.0)
+        controller.disconnect()
+
     def test_startup_home_skip_threshold_is_safety_bounded(self):
         self.assertEqual(SinglePiperConfig().startup_home_skip_threshold_rad, 0.05)
         with self.assertRaisesRegex(ValueError, "must be between 0 and 0.05"):

@@ -36,6 +36,113 @@ from ruri.client.controllers.single_piper.normalization import (
 logger = logging.getLogger(__name__)
 
 
+_REALSENSE_FACTORY_DEFAULT_OPTIONS = (
+    "brightness",
+    "contrast",
+    "gamma",
+    "hue",
+    "saturation",
+    "sharpness",
+    "exposure",
+    "gain",
+    "white_balance",
+    "backlight_compensation",
+)
+
+
+def _set_realsense_option(sensor: Any, rs: Any, name: str, value: float) -> float:
+    option = getattr(rs.option, name, None)
+    if option is None or not sensor.supports(option):
+        raise RuntimeError(f"RealSense color sensor does not support {name!r}")
+    option_range = sensor.get_option_range(option)
+    if not option_range.min <= value <= option_range.max:
+        raise ValueError(
+            f"RealSense {name}={value:g} is outside "
+            f"[{option_range.min:g}, {option_range.max:g}]"
+        )
+    sensor.set_option(option, float(value))
+    actual = float(sensor.get_option(option))
+    tolerance = max(abs(float(option_range.step)) / 2.0, 1e-6)
+    if abs(actual - value) > tolerance:
+        raise RuntimeError(
+            f"RealSense rejected {name}={value:g}; read back {actual:g}"
+        )
+    return actual
+
+
+def _configure_realsense_camera(
+    camera: Any,
+    role: str,
+    config: SinglePiperConfig,
+) -> Mapping[str, float]:
+    """Reproduce the UVC state used for the training images.
+
+    Dataset collection and inference both keep LeRobot's RGB async-read path.
+    The original head-camera brightness setup lived outside the recorder and
+    persisted in the camera across processes, so set it explicitly here rather
+    than depending on whichever program last opened either device.
+    """
+    try:
+        import pyrealsense2 as rs
+    except ImportError as exc:
+        raise ImportError(
+            "Single Piper camera controls require pyrealsense2"
+        ) from exc
+
+    profile = getattr(camera, "rs_profile", None)
+    if profile is None:
+        raise RuntimeError("LeRobot RealSense camera has no active rs_profile")
+    sensor = profile.get_device().first_color_sensor()
+
+    # Manual writes are ignored while the corresponding auto control is on.
+    for name in ("enable_auto_exposure", "enable_auto_white_balance"):
+        _set_realsense_option(sensor, rs, name, 0.0)
+    for name in _REALSENSE_FACTORY_DEFAULT_OPTIONS:
+        option = getattr(rs.option, name, None)
+        if option is not None and sensor.supports(option):
+            default = float(sensor.get_option_range(option).default)
+            _set_realsense_option(sensor, rs, name, default)
+
+    if role == "head":
+        exposure = config.head_camera_exposure
+        gain = config.head_camera_gain
+        brightness = config.head_camera_brightness
+    elif role == "wrist":
+        exposure = config.wrist_camera_exposure
+        gain = config.wrist_camera_gain
+        brightness = config.wrist_camera_brightness
+    else:
+        raise ValueError(f"unknown Piper camera role {role!r}")
+
+    readback = {
+        "enable_auto_exposure": _set_realsense_option(
+            sensor, rs, "enable_auto_exposure", 0.0
+        ),
+        "exposure": _set_realsense_option(sensor, rs, "exposure", exposure),
+        "gain": _set_realsense_option(sensor, rs, "gain", gain),
+        "brightness": _set_realsense_option(sensor, rs, "brightness", brightness),
+        "enable_auto_white_balance": _set_realsense_option(
+            sensor, rs, "enable_auto_white_balance", 1.0
+        ),
+    }
+
+    # Match the capture setup's 30-frame discard after changing UVC controls.
+    for _ in range(config.camera_controls_warmup_frames):
+        camera.async_read(timeout_ms=config.camera_timeout_ms)
+    white_balance = getattr(rs.option, "white_balance", None)
+    if white_balance is not None and sensor.supports(white_balance):
+        readback["white_balance"] = float(sensor.get_option(white_balance))
+    return readback
+
+
+def _skip_camera_configuration(
+    _camera: Any,
+    _role: str,
+    _config: SinglePiperConfig,
+) -> Mapping[str, float]:
+    return {}
+
+
 class SinglePiperController(RobotSetupController):
     """Hardware controller exposing standard RURI observations.
 
@@ -52,6 +159,9 @@ class SinglePiperController(RobotSetupController):
         camera_discovery: Callable[[], RealSenseDevices] = discover_realsense_devices,
         can_discovery: Callable[..., PiperCanDevice] = discover_piper_can,
         camera_factory: Callable[[str, SinglePiperConfig], Any] | None = None,
+        camera_configurator: (
+            Callable[[Any, str, SinglePiperConfig], Mapping[str, float]] | None
+        ) = None,
         telemetry_factory: Callable[[str], Any] = MITTelemetryReceiver,
         command_factory: Callable[[str], Any] = MITCommandSender,
         worker_factory: Callable[[SinglePiperConfig, str], Any] = ManagedMITProcess,
@@ -63,7 +173,13 @@ class SinglePiperController(RobotSetupController):
         self.config = SinglePiperConfig.from_args(args)
         self._camera_discovery = camera_discovery
         self._can_discovery = can_discovery
+        using_default_camera_factory = camera_factory is None
         self._camera_factory = camera_factory or self._default_camera_factory
+        self._camera_configurator = camera_configurator or (
+            _configure_realsense_camera
+            if using_default_camera_factory
+            else _skip_camera_configuration
+        )
         self._telemetry_factory = telemetry_factory
         self._command_factory = command_factory
         self._worker_factory = worker_factory
@@ -78,6 +194,7 @@ class SinglePiperController(RobotSetupController):
         self._arm: ArmHardwareRegistration | None = None
         self._arm_started = False
         self._sent_action = False
+        self._camera_controls: dict[str, dict[str, float]] = {}
 
     @staticmethod
     def _default_camera_factory(serial: str, config: SinglePiperConfig) -> Any:
@@ -149,18 +266,28 @@ class SinglePiperController(RobotSetupController):
         try:
             self._head.connect()
             connected.append(self._head)
+            self._camera_controls["head"] = dict(
+                self._camera_configurator(self._head, "head", self.config)
+            )
             self._wrist.connect()
             connected.append(self._wrist)
+            self._camera_controls["wrist"] = dict(
+                self._camera_configurator(self._wrist, "wrist", self.config)
+            )
         except Exception:
             for camera in reversed(connected):
                 camera.disconnect()
             self._head = self._wrist = None
+            self._camera_controls.clear()
             raise
         logger.info(
-            "Single Piper observations ready: CAN=%s head-D435=%s wrist-D415=%s",
+            "Single Piper observations ready: CAN=%s head-D435=%s controls=%s "
+            "wrist-D415=%s controls=%s",
             self._can.interface,
             self._devices.head_serial,
+            self._camera_controls.get("head", {}),
             self._devices.wrist_serial,
+            self._camera_controls.get("wrist", {}),
         )
 
     def start_arm(self) -> None:
@@ -249,6 +376,8 @@ class SinglePiperController(RobotSetupController):
             ),
             "head_camera_serial": None if self._devices is None else self._devices.head_serial,
             "wrist_camera_serial": None if self._devices is None else self._devices.wrist_serial,
+            "head_camera_controls": dict(self._camera_controls.get("head", {})),
+            "wrist_camera_controls": dict(self._camera_controls.get("wrist", {})),
             "last_head_frame_time": getattr(self._head, "latest_timestamp", None),
             "last_wrist_frame_time": getattr(self._wrist, "latest_timestamp", None),
         }
@@ -267,6 +396,7 @@ class SinglePiperController(RobotSetupController):
             if camera is not None and camera.is_connected:
                 camera.disconnect()
         self._head = self._wrist = None
+        self._camera_controls.clear()
         self._arm_started = False
         self._sent_action = False
 

@@ -74,6 +74,15 @@ Policy inference ──补充 action chunk──▶ Scheduler action queue
 - `observation.images.wrist`：D415，序列号 `002422064073`
 - 图像格式：原生 `640x480`、HWC、RGB、`uint8`
 - Client 只做硬件 canonicalization，不做模型特定 resize/crop/normalization。
+- 图像链路与 `piper_teleop_agx/record_lerobot_v3.sh` 相同：标准 LeRobot
+  `RealSenseCamera` 后台流和 `async_read()`，默认 RGB、无旋转，不在 client
+  端做亮度增强或颜色变换。
+- 数据采集 launcher 本身没有设置 UVC 参数；采集前的 D435 亮度优化曾把
+  参数留存在相机内。为避免 inference 取决于上一个打开相机的程序，controller
+  连接后显式复现该状态：head D435 使用手动 exposure `200`、gain `64`，
+  wrist D415 使用手动 exposure `166`、gain `64`，两路 brightness `0`、自动
+  white balance，并在设置后丢弃 `30` 帧。实际 readback 会写入启动日志和
+  `status()`。
 
 机器人 state/action 使用这台机器的数据采集 convention：
 

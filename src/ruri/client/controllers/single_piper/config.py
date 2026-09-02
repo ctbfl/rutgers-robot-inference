@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,13 @@ class SinglePiperConfig:
     camera_height: int = 480
     camera_fps: int = 30
     camera_timeout_ms: int = 500
+    head_camera_exposure: float = 200.0
+    head_camera_gain: float = 64.0
+    head_camera_brightness: float = 0.0
+    wrist_camera_exposure: float = 166.0
+    wrist_camera_gain: float = 64.0
+    wrist_camera_brightness: float = 0.0
+    camera_controls_warmup_frames: int = 30
 
     can_interface: str | None = None
     can_bitrate: int = 1_000_000
@@ -66,6 +74,19 @@ class SinglePiperConfig:
             raise ValueError("camera width, height, and fps must be positive")
         if self.camera_timeout_ms <= 0:
             raise ValueError("camera_timeout_ms must be positive")
+        for name in ("head_camera_exposure", "wrist_camera_exposure"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        for name in ("head_camera_gain", "wrist_camera_gain"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        for name in ("head_camera_brightness", "wrist_camera_brightness"):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        if self.camera_controls_warmup_frames < 0:
+            raise ValueError("camera_controls_warmup_frames must be non-negative")
         if self.can_bitrate <= 0 or self.can_probe_timeout_s <= 0:
             raise ValueError("CAN bitrate and probe timeout must be positive")
         if self.arm_connect_timeout_s <= 0 or self.telemetry_timeout_s <= 0:
