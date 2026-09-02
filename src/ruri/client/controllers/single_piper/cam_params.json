@@ -1,0 +1,35 @@
+{
+  "warmup_frames": 30,
+  "head": {
+    "model": "Intel RealSense D435",
+    "controls": {
+      "enable_auto_exposure": false,
+      "exposure": 200.0,
+      "gain": 64.0,
+      "brightness": 0.0,
+      "contrast": 50.0,
+      "gamma": 300.0,
+      "hue": 0.0,
+      "saturation": 64.0,
+      "sharpness": 50.0,
+      "backlight_compensation": 0.0,
+      "enable_auto_white_balance": true
+    }
+  },
+  "wrist": {
+    "model": "Intel RealSense D415",
+    "controls": {
+      "enable_auto_exposure": false,
+      "exposure": 195.0,
+      "gain": 64.0,
+      "brightness": 0.0,
+      "contrast": 50.0,
+      "gamma": 300.0,
+      "hue": 0.0,
+      "saturation": 64.0,
+      "sharpness": 50.0,
+      "backlight_compensation": 0.0,
+      "enable_auto_white_balance": true
+    }
+  }
+}

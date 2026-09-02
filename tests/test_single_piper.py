@@ -7,6 +7,7 @@ from unittest.mock import patch
 import numpy as np
 
 from ruri.client.controllers.single_piper import SinglePiperConfig, SinglePiperController
+from ruri.client.controllers.single_piper.camera_params import load_camera_params
 from ruri.client.controllers.single_piper.discovery import (
     PiperCanDevice,
     discover_piper_can,
@@ -185,22 +186,19 @@ class NormalizationTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
-    def test_training_camera_controls_are_explicit_defaults(self):
-        config = SinglePiperConfig()
-        self.assertEqual(config.head_camera_exposure, 200.0)
-        self.assertEqual(config.head_camera_gain, 64.0)
-        self.assertEqual(config.head_camera_brightness, 0.0)
-        self.assertEqual(config.wrist_camera_exposure, 166.0)
-        self.assertEqual(config.wrist_camera_gain, 64.0)
-        self.assertEqual(config.wrist_camera_brightness, 0.0)
-        self.assertEqual(config.camera_controls_warmup_frames, 30)
-
-        with self.assertRaisesRegex(ValueError, "head_camera_exposure"):
-            SinglePiperConfig(head_camera_exposure=float("nan"))
-        with self.assertRaisesRegex(ValueError, "wrist_camera_gain"):
-            SinglePiperConfig(wrist_camera_gain=-1.0)
-        with self.assertRaisesRegex(ValueError, "warmup_frames"):
-            SinglePiperConfig(camera_controls_warmup_frames=-1)
+    def test_reviewed_camera_controls_are_loaded_from_json(self):
+        params = load_camera_params()
+        self.assertEqual(params.warmup_frames, 30)
+        self.assertEqual(params.roles["head"].model, "Intel RealSense D435")
+        self.assertEqual(params.roles["head"].controls["exposure"], 200.0)
+        self.assertEqual(params.roles["wrist"].model, "Intel RealSense D415")
+        self.assertEqual(params.roles["wrist"].controls["exposure"], 195.0)
+        for role in ("head", "wrist"):
+            controls = params.roles[role].controls
+            self.assertEqual(controls["gain"], 64.0)
+            self.assertEqual(controls["brightness"], 0.0)
+            self.assertEqual(controls["enable_auto_exposure"], 0.0)
+            self.assertEqual(controls["enable_auto_white_balance"], 1.0)
 
     def test_realsense_controls_are_locked_then_warmed_up(self):
         option_names = (
@@ -258,17 +256,23 @@ class ControllerTests(unittest.TestCase):
                 self.read_count += 1
                 return super().async_read(timeout_ms)
 
-        config = SinglePiperConfig(camera_controls_warmup_frames=3)
-        for role, expected_exposure in (("head", 200.0), ("wrist", 166.0)):
+        config = SinglePiperConfig()
+        for role, expected_exposure in (("head", 200.0), ("wrist", 195.0)):
             camera = ConfigurableCamera()
             with patch.dict("sys.modules", {"pyrealsense2": fake_rs}):
                 controls = _configure_realsense_camera(camera, role, config)
 
-            self.assertEqual(camera.read_count, 3)
+            self.assertEqual(camera.read_count, 30)
             self.assertEqual(controls["enable_auto_exposure"], 0.0)
             self.assertEqual(controls["exposure"], expected_exposure)
             self.assertEqual(controls["gain"], 64.0)
             self.assertEqual(controls["brightness"], 0.0)
+            self.assertEqual(controls["contrast"], 50.0)
+            self.assertEqual(controls["gamma"], 300.0)
+            self.assertEqual(controls["hue"], 0.0)
+            self.assertEqual(controls["saturation"], 64.0)
+            self.assertEqual(controls["sharpness"], 50.0)
+            self.assertEqual(controls["backlight_compensation"], 0.0)
             self.assertEqual(controls["enable_auto_white_balance"], 1.0)
             self.assertEqual(controls["white_balance"], 4600.0)
 
@@ -286,7 +290,7 @@ class ControllerTests(unittest.TestCase):
         def configure_camera(camera, role, _config):
             self.assertTrue(camera.is_connected)
             calls.append(role)
-            return {"exposure": 200.0 if role == "head" else 166.0}
+            return {"exposure": 200.0 if role == "head" else 195.0}
 
         controller = SinglePiperController(
             SinglePiperConfig(configure_can=False),
@@ -301,7 +305,7 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual(calls, ["head", "wrist"])
         self.assertEqual(controller.status()["head_camera_controls"]["exposure"], 200.0)
-        self.assertEqual(controller.status()["wrist_camera_controls"]["exposure"], 166.0)
+        self.assertEqual(controller.status()["wrist_camera_controls"]["exposure"], 195.0)
         controller.disconnect()
 
     def test_startup_home_skip_threshold_is_safety_bounded(self):

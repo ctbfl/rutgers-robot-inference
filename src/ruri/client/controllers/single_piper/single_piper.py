@@ -9,6 +9,10 @@ from typing import Any
 import numpy as np
 
 from ruri.client.controllers.robot_setup_controller import RobotSetupController
+from ruri.client.controllers.single_piper.camera_params import (
+    CAMERA_CONTROL_ORDER,
+    load_camera_params,
+)
 from ruri.client.controllers.single_piper.config import SinglePiperConfig
 from ruri.client.controllers.single_piper.discovery import (
     PiperCanDevice,
@@ -36,20 +40,6 @@ from ruri.client.controllers.single_piper.normalization import (
 logger = logging.getLogger(__name__)
 
 
-_REALSENSE_FACTORY_DEFAULT_OPTIONS = (
-    "brightness",
-    "contrast",
-    "gamma",
-    "hue",
-    "saturation",
-    "sharpness",
-    "exposure",
-    "gain",
-    "white_balance",
-    "backlight_compensation",
-)
-
-
 def _set_realsense_option(sensor: Any, rs: Any, name: str, value: float) -> float:
     option = getattr(rs.option, name, None)
     if option is None or not sensor.supports(option):
@@ -75,12 +65,11 @@ def _configure_realsense_camera(
     role: str,
     config: SinglePiperConfig,
 ) -> Mapping[str, float]:
-    """Reproduce the UVC state used for the training images.
+    """Apply the reviewed UVC state from the bundled camera parameter file.
 
     Dataset collection and inference both keep LeRobot's RGB async-read path.
-    The original head-camera brightness setup lived outside the recorder and
-    persisted in the camera across processes, so set it explicitly here rather
-    than depending on whichever program last opened either device.
+    Set every relevant color control explicitly rather than depending on the
+    state left behind by whichever program last opened either device.
     """
     try:
         import pyrealsense2 as rs
@@ -94,40 +83,25 @@ def _configure_realsense_camera(
         raise RuntimeError("LeRobot RealSense camera has no active rs_profile")
     sensor = profile.get_device().first_color_sensor()
 
+    camera_params = load_camera_params()
+    try:
+        controls = camera_params.roles[role].controls
+    except KeyError as exc:
+        raise ValueError(f"unknown Piper camera role {role!r}") from exc
+
     # Manual writes are ignored while the corresponding auto control is on.
     for name in ("enable_auto_exposure", "enable_auto_white_balance"):
         _set_realsense_option(sensor, rs, name, 0.0)
-    for name in _REALSENSE_FACTORY_DEFAULT_OPTIONS:
-        option = getattr(rs.option, name, None)
-        if option is not None and sensor.supports(option):
-            default = float(sensor.get_option_range(option).default)
-            _set_realsense_option(sensor, rs, name, default)
-
-    if role == "head":
-        exposure = config.head_camera_exposure
-        gain = config.head_camera_gain
-        brightness = config.head_camera_brightness
-    elif role == "wrist":
-        exposure = config.wrist_camera_exposure
-        gain = config.wrist_camera_gain
-        brightness = config.wrist_camera_brightness
-    else:
-        raise ValueError(f"unknown Piper camera role {role!r}")
-
     readback = {
-        "enable_auto_exposure": _set_realsense_option(
-            sensor, rs, "enable_auto_exposure", 0.0
-        ),
-        "exposure": _set_realsense_option(sensor, rs, "exposure", exposure),
-        "gain": _set_realsense_option(sensor, rs, "gain", gain),
-        "brightness": _set_realsense_option(sensor, rs, "brightness", brightness),
-        "enable_auto_white_balance": _set_realsense_option(
-            sensor, rs, "enable_auto_white_balance", 1.0
-        ),
+        name: _set_realsense_option(sensor, rs, name, controls[name])
+        for name in CAMERA_CONTROL_ORDER
+        if name not in {"enable_auto_exposure", "enable_auto_white_balance"}
     }
+    for name in ("enable_auto_exposure", "enable_auto_white_balance"):
+        readback[name] = _set_realsense_option(sensor, rs, name, controls[name])
 
     # Match the capture setup's 30-frame discard after changing UVC controls.
-    for _ in range(config.camera_controls_warmup_frames):
+    for _ in range(camera_params.warmup_frames):
         camera.async_read(timeout_ms=config.camera_timeout_ms)
     white_balance = getattr(rs.option, "white_balance", None)
     if white_balance is not None and sensor.supports(white_balance):
