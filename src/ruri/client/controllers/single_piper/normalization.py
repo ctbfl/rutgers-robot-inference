@@ -13,6 +13,7 @@ JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 GRIPPER_NAME = "gripper"
 ACTION_NAMES = (*JOINT_NAMES, GRIPPER_NAME)
 ACTION_KEYS = tuple(f"{name}.pos" for name in ACTION_NAMES)
+EFFORT_KEYS = tuple(f"{name}.effort" for name in ACTION_NAMES)
 ACTION_LOWER = np.asarray([-100.0] * 6 + [0.0], dtype=np.float32)
 ACTION_UPPER = np.asarray([100.0] * 7, dtype=np.float32)
 
@@ -101,3 +102,41 @@ def normalize_teleop_target(packet: Mapping[str, Any]) -> np.ndarray:
     if not isinstance(action, Mapping):
         raise ValueError("MIT telemetry is missing follower target")
     return normalize_pose(action.get("q", ()), action.get("gripper_width"))
+
+
+def _recording_vector(
+    values: Any,
+    size: int,
+    label: str,
+) -> np.ndarray:
+    result = np.asarray(values, dtype=np.float32)
+    if result.shape != (size,) or not np.all(np.isfinite(result)):
+        raise ValueError(f"MIT telemetry {label} must contain {size} finite values")
+    return result.copy()
+
+
+def recording_observation(packet: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    """Decode one follower packet into RURI's LeRobot recording convention.
+
+    ``observation.state`` preserves the normalized seven-value convention used
+    by the existing Piper datasets. ``observation.joint_effort`` contains six
+    signed joint torques in N*m followed by signed gripper force in N.
+    """
+    follower = packet.get("follower")
+    if not isinstance(follower, Mapping):
+        raise ValueError("MIT telemetry is missing follower state")
+
+    joint_effort = _recording_vector(
+        follower.get("joint_effort"),
+        6,
+        "joint effort",
+    )
+    gripper_effort = _recording_vector(
+        [follower.get("gripper_force")],
+        1,
+        "gripper effort",
+    )
+    return {
+        "observation.state": normalize_telemetry(packet),
+        "observation.joint_effort": np.concatenate((joint_effort, gripper_effort)),
+    }

@@ -67,7 +67,11 @@ class FakeControlArm:
     def get_motor_states(self, joint):
         self.stamp += 0.001
         return SimpleNamespace(
-            msg=SimpleNamespace(velocity=float(self.qd[joint - 1])),
+            msg=SimpleNamespace(
+                velocity=float(self.qd[joint - 1]),
+                current=float(joint),
+                torque=float(joint) / 10.0,
+            ),
             timestamp=self.stamp,
         )
 
@@ -91,6 +95,17 @@ class QuinticBlendTests(unittest.TestCase):
         values = [mit_teleop.quintic_blend(t, 2.0)[0]
                   for t in np.linspace(0.0, 2.0, 101)]
         self.assertTrue(all(a <= b for a, b in zip(values, values[1:])))
+
+
+class ArmSampleTests(unittest.TestCase):
+    def test_one_motor_feedback_read_provides_velocity_and_effort(self):
+        arm = FakeControlArm(np.arange(6, dtype=float) * 0.1)
+
+        sample = mit_teleop.read_sample(arm, "test")
+
+        np.testing.assert_allclose(sample.q, arm.q)
+        np.testing.assert_allclose(sample.qd, 0.0)
+        np.testing.assert_allclose(sample.joint_effort, np.arange(1.0, 7.0) / 10.0)
 
 
 class EngagementReferenceTests(unittest.TestCase):
@@ -271,6 +286,7 @@ class CommandTests(unittest.TestCase):
         self.sample = mit_teleop.ArmSample(
             q=np.arange(6, dtype=float) * 0.1,
             qd=np.arange(6, dtype=float) * 0.01,
+            joint_effort=np.arange(6, dtype=float) * 0.1,
             stamps=(1.0,) * 7,
         )
 

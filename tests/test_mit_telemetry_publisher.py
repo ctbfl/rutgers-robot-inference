@@ -41,6 +41,7 @@ class PublisherTests(unittest.TestCase):
                 leader_qd=qd,
                 follower_q=q,
                 follower_qd=qd - 0.01,
+                follower_joint_effort=qd + 2.0,
                 follower_target_q=q + 0.02,
                 follower_target_qd=qd + 0.02,
                 leader_gripper_width=0.04,
@@ -61,6 +62,7 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(packet["phase"], "engaged")
         self.assertEqual(packet["sequence"], 1)
         np.testing.assert_allclose(packet["follower"]["q"], q)
+        np.testing.assert_allclose(packet["follower"]["joint_effort"], qd + 2.0)
         np.testing.assert_allclose(packet["action"]["q"], q + 0.02)
         self.assertAlmostEqual(packet["action"]["gripper_width"], 0.04)
         self.assertEqual(packet["overruns"], 3)

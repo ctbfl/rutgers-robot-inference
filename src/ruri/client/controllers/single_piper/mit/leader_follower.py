@@ -119,6 +119,7 @@ def _stop(_sig, _frame) -> None:
 class ArmSample:
     q: np.ndarray
     qd: np.ndarray
+    joint_effort: np.ndarray
     stamps: tuple[float, ...]
 
 
@@ -316,10 +317,19 @@ def read_sample(arm, label: str) -> ArmSample:
         raise TeleopAbort(f"{label} is missing joint-angle or motor feedback")
     q = joint_vector(list(angles.msg), f"{label} position")
     qd = joint_vector([motor.msg.velocity for motor in motors], f"{label} velocity")
+    joint_effort = joint_vector(
+        [motor.msg.torque for motor in motors],
+        f"{label} joint effort",
+    )
     stamps = (float(angles.timestamp),) + tuple(
         float(motor.timestamp) for motor in motors
     )
-    return ArmSample(q=q, qd=qd, stamps=stamps)
+    return ArmSample(
+        q=q,
+        qd=qd,
+        joint_effort=joint_effort,
+        stamps=stamps,
+    )
 
 
 def arm_status_text(arm) -> tuple[str, str, str]:
@@ -1255,6 +1265,7 @@ def run(args: argparse.Namespace) -> int:
                     leader_qd=last_leader.qd,
                     follower_q=last_follower.q,
                     follower_qd=last_follower.qd,
+                    follower_joint_effort=last_follower.joint_effort,
                     follower_target_q=q_des,
                     follower_target_qd=qd_des,
                     leader_gripper_width=(

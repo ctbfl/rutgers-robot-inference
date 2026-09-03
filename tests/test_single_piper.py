@@ -44,7 +44,13 @@ class FakeTelemetry:
     def __init__(self, _address):
         self.packet = {
             "phase": "engaged",
-            "follower": {"q": [0.0] * 6, "gripper_width": 0.034},
+            "follower": {
+                "q": [0.0] * 6,
+                "qd": [0.1] * 6,
+                "joint_effort": [0.2, 0.4, 0.6, 0.8, 1.0, 1.2],
+                "gripper_width": 0.034,
+                "gripper_force": 1.5,
+            },
         }
 
     def open(self):
@@ -229,6 +235,26 @@ class ControllerTests(unittest.TestCase):
             observation["observation.state"], normalize_pose([0.0] * 6, 0.034)
         )
         np.testing.assert_array_equal(target, normalize_pose([0.1] * 6, 0.02))
+
+        recording, recording_target = controller.get_teleop_recording_sample()
+        self.assertEqual(
+            set(recording),
+            {
+                "observation.state",
+                "observation.joint_effort",
+                "observation.images.top",
+                "observation.images.wrist",
+            },
+        )
+        np.testing.assert_array_equal(
+            recording["observation.state"],
+            normalize_pose([0.0] * 6, 0.034),
+        )
+        np.testing.assert_array_equal(
+            recording["observation.joint_effort"],
+            np.asarray([0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(recording_target, target)
         controller.disconnect()
         self.assertEqual(controller.cameras, {"top": None, "wrist": None})
         self.assertTrue(telemetry.closed)

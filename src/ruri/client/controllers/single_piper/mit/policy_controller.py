@@ -651,6 +651,7 @@ def run(args) -> int:
                 phase="engaged",
                 follower_q=sample.q,
                 follower_qd=sample.qd,
+                follower_joint_effort=sample.joint_effort,
                 follower_target_q=q_cmd,
                 follower_target_qd=qd_cmd,
                 follower_gripper_width=grip.width,

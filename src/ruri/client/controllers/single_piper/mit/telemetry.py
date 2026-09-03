@@ -83,6 +83,7 @@ class MITTelemetryPublisher:
         leader_qd: Sequence[float] | None = None,
         follower_q: Sequence[float] | None = None,
         follower_qd: Sequence[float] | None = None,
+        follower_joint_effort: Sequence[float] | None = None,
         follower_target_q: Sequence[float] | None = None,
         follower_target_qd: Sequence[float] | None = None,
         leader_gripper_width: float | None = None,
@@ -110,6 +111,7 @@ class MITTelemetryPublisher:
                 "follower": {
                     "q": _finite_vector(follower_q, 6),
                     "qd": _finite_vector(follower_qd, 6),
+                    "joint_effort": _finite_vector(follower_joint_effort, 6),
                     "gripper_width": _finite_optional(follower_gripper_width),
                     "gripper_force": _finite_optional(follower_gripper_force),
                 },

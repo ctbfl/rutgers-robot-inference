@@ -13,17 +13,17 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ruri.client.controllers.single_piper import SinglePiperController
 from ruri.client.controllers.single_piper.mit_io import get_shared_mit_telemetry
-from ruri.client.controllers.single_piper.normalization import ACTION_KEYS
+from ruri.client.controllers.single_piper.normalization import ACTION_KEYS, EFFORT_KEYS
 
 from .config_piper_mit_observer import PiperMITObserverConfig
 
 logger = logging.getLogger(__name__)
 
 
-def _named_action(values: np.ndarray) -> dict[str, float]:
+def _named_vector(keys: tuple[str, ...], values: np.ndarray) -> dict[str, float]:
     return {
         key: float(value)
-        for key, value in zip(ACTION_KEYS, np.asarray(values), strict=True)
+        for key, value in zip(keys, np.asarray(values), strict=True)
     }
 
 
@@ -50,6 +50,7 @@ class PiperMITObserver(Robot):
     def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
         return {
             **{key: float for key in ACTION_KEYS},
+            **{key: float for key in EFFORT_KEYS},
             "top": (self.config.camera_height, self.config.camera_width, 3),
             "hand": (self.config.camera_height, self.config.camera_width, 3),
         }
@@ -86,11 +87,16 @@ class PiperMITObserver(Robot):
 
     @check_if_not_connected
     def get_observation(self) -> dict[str, Any]:
-        observation, target = self.controller.get_teleop_sample()
-        state = _named_action(observation["observation.state"])
-        self._latched_action = _named_action(target)
+        observation, target = self.controller.get_teleop_recording_sample()
+        state = _named_vector(ACTION_KEYS, observation["observation.state"])
+        effort = _named_vector(
+            EFFORT_KEYS,
+            observation["observation.joint_effort"],
+        )
+        self._latched_action = _named_vector(ACTION_KEYS, target)
         return {
             **state,
+            **effort,
             "top": observation["observation.images.top"],
             "hand": observation["observation.images.wrist"],
         }

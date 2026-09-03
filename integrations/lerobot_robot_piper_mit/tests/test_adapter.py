@@ -18,10 +18,11 @@ class FakeRURIController:
         self.is_connected = True
         self.teleop_observer_attached = True
 
-    def get_teleop_sample(self):
+    def get_teleop_recording_sample(self):
         return (
             {
                 "observation.state": np.arange(7, dtype=np.float32),
+                "observation.joint_effort": np.arange(7, dtype=np.float32) + 10,
                 "observation.images.top": np.full((2, 3, 3), 10, np.uint8),
                 "observation.images.wrist": np.full((2, 3, 3), 20, np.uint8),
             },
@@ -60,6 +61,11 @@ class PiperMITObserverTests(unittest.TestCase):
         returned = observer.send_action(action)
 
         self.assertEqual(set(observation), set(observer.observation_features))
+        np.testing.assert_array_equal(
+            [observation[f"joint{index}.effort"] for index in range(1, 7)]
+            + [observation["gripper.effort"]],
+            np.arange(7, dtype=np.float32) + 10,
+        )
         np.testing.assert_array_equal(observation["top"], 10)
         np.testing.assert_array_equal(observation["hand"], 20)
         self.assertEqual(returned, action)

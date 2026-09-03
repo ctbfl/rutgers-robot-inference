@@ -36,6 +36,7 @@ from ruri.client.controllers.single_piper.normalization import (
     denormalize_action,
     normalize_telemetry,
     normalize_teleop_target,
+    recording_observation,
     validate_action,
 )
 
@@ -375,6 +376,16 @@ class SinglePiperController(RobotSetupController):
             **cameras,
         }
 
+    def get_recording_observation(self) -> dict[str, Any]:
+        """Return the normalized state, measured effort, and camera images."""
+        if not self.arm_started or self._telemetry is None:
+            raise RuntimeError("start_arm() must complete before recording an observation")
+        packet = self._telemetry.latest_engaged(self.config.telemetry_timeout_s)
+        return {
+            **recording_observation(packet),
+            **self.get_camera_observation(),
+        }
+
     def get_teleop_sample(self) -> tuple[dict[str, Any], np.ndarray]:
         """Return state/images and follower target from one 30 Hz frame latch."""
         if not self._teleop_observer_attached or self._telemetry is None:
@@ -382,6 +393,17 @@ class SinglePiperController(RobotSetupController):
         packet = self._telemetry.latch_engaged(self.config.telemetry_timeout_s)
         observation = {
             "observation.state": normalize_telemetry(packet),
+            **self.get_camera_observation(),
+        }
+        return observation, normalize_teleop_target(packet)
+
+    def get_teleop_recording_sample(self) -> tuple[dict[str, Any], np.ndarray]:
+        """Return recording fields and target from one telemetry latch."""
+        if not self._teleop_observer_attached or self._telemetry is None:
+            raise RuntimeError("connect_teleop_observer() must complete first")
+        packet = self._telemetry.latch_engaged(self.config.telemetry_timeout_s)
+        observation = {
+            **recording_observation(packet),
             **self.get_camera_observation(),
         }
         return observation, normalize_teleop_target(packet)
