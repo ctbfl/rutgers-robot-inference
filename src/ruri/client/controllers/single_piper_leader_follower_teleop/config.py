@@ -29,6 +29,7 @@ class SinglePiperLeaderFollowerTeleopConfig(SinglePiperConfig):
     max_joint_speed: float = 4.0
     max_reference_speed: float = 3.0
     feedback_timeout_s: float = 0.2
+    show_periodic_status: bool = True
     seconds: float = 0.0
     abort_hold_seconds: float = 10.0
     abort_home_speed: float = 0.2

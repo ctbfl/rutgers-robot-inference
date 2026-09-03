@@ -161,6 +161,8 @@ class ManagedMITTeleopProcess(ManagedMITProcess):
             str(self.config.grip_max_force),
             "--execute",
         ]
+        if not self.config.show_periodic_status:
+            command.append("--quiet-status")
         if not self.config.use_gripper:
             command.append("--no-gripper")
         self.process = subprocess.Popen(

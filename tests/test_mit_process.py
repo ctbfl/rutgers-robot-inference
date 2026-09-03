@@ -50,6 +50,7 @@ class ManagedMITProcessTests(unittest.TestCase):
     def test_teleop_worker_launches_packaged_module_with_both_can_interfaces(self):
         config = SinglePiperLeaderFollowerTeleopConfig(
             python_executable=Path("/usr/bin/python3"),
+            show_periodic_status=False,
         )
         process = MagicMock()
         process.stdout = ()
@@ -73,6 +74,7 @@ class ManagedMITProcessTests(unittest.TestCase):
         )
         self.assertEqual(command[command.index("--leader-can") + 1], "can-right")
         self.assertEqual(command[command.index("--follower-can") + 1], "can-left")
+        self.assertIn("--quiet-status", command)
         self.assertIn("--execute", command)
 
 

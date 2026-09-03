@@ -957,6 +957,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--quiet-status",
+        action="store_true",
+        help="suppress the periodic 0.5 s status line while retaining lifecycle output",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
         help="ENERGIZE AND MOVE both arms; without this flag the script is read-only",
@@ -1301,7 +1306,7 @@ def run(args: argparse.Namespace) -> int:
                 require_can_mit_enabled(leader, "leader")
                 require_can_mit_enabled(follower, "follower")
 
-            if now - last_report >= 0.5:
+            if not args.quiet_status and now - last_report >= 0.5:
                 last_report = now
                 phase = "ENGAGED" if elapsed >= args.engage_seconds else "engaging"
                 grip_report = ""
