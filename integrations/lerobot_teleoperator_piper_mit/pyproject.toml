@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lerobot_teleoperator_piper_mit"
-version = "0.2.0"
-description = "Thin LeRobot teleoperator adapter for RURI Piper MIT targets"
-requires-python = ">=3.10"
+version = "0.3.0"
+description = "LeRobot 0.6.1 teleoperator adapter for RURI Piper MIT targets"
+requires-python = ">=3.12"
 dependencies = []
 
 [tool.setuptools.packages.find]

@@ -5,14 +5,16 @@ from unittest.mock import patch
 
 import numpy as np
 
-from lerobot_robot_piper_mit import PiperMITObserver, PiperMITObserverConfig
+from lerobot_robot_piper_mit_lerobot0_5_2 import (
+    PiperMITObserver,
+    PiperMITObserverConfig,
+)
 
 
 class FakeRURIController:
     def __init__(self, *_args, **_kwargs):
         self.is_connected = False
         self.teleop_observer_attached = False
-        self.cameras = {"top": object(), "wrist": object()}
 
     def connect_teleop_observer(self):
         self.is_connected = True
@@ -36,7 +38,7 @@ class FakeRURIController:
 class PiperMITObserverTests(unittest.TestCase):
     def test_adapter_uses_ruri_sample_and_validates_same_frame_target(self):
         with patch(
-            "lerobot_robot_piper_mit.piper_mit_observer.SinglePiperController",
+            "lerobot_robot_piper_mit_lerobot0_5_2.piper_mit_observer.SinglePiperController",
             FakeRURIController,
         ):
             observer = PiperMITObserver(
@@ -46,11 +48,7 @@ class PiperMITObserverTests(unittest.TestCase):
                     camera_height=2,
                 )
             )
-        self.assertEqual(list(observer.cameras), ["top", "hand"])
-        self.assertEqual(list(observer.cameras.values()), [None, None])
         observer.connect()
-        self.assertIs(observer.cameras["top"], observer.controller.cameras["top"])
-        self.assertIs(observer.cameras["hand"], observer.controller.cameras["wrist"])
         observation = observer.get_observation()
         action = {
             key: float(index + 1)
@@ -64,7 +62,6 @@ class PiperMITObserverTests(unittest.TestCase):
         np.testing.assert_array_equal(observation["hand"], 20)
         self.assertEqual(returned, action)
         observer.disconnect()
-        self.assertEqual(list(observer.cameras.values()), [None, None])
 
 
 if __name__ == "__main__":

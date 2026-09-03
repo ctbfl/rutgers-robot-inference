@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from lerobot_teleoperator_piper_mit import PiperMIT, PiperMITConfig
+from lerobot_teleoperator_piper_mit_lerobot0_5_2 import PiperMIT, PiperMITConfig
 from ruri.client.controllers.single_piper.normalization import (
     ACTION_KEYS,
     normalize_pose,
@@ -12,9 +12,10 @@ from ruri.client.controllers.single_piper.normalization import (
 
 
 class FakeTelemetry:
+    is_open = True
+
     def __init__(self, packet):
         self.packet = packet
-        self.is_open = False
 
     def latest_engaged(self, _timeout_s):
         return self.packet
@@ -33,14 +34,7 @@ class PiperMITTests(unittest.TestCase):
         }
         teleop = PiperMIT(PiperMITConfig(id="test"))
         teleop.telemetry = FakeTelemetry(packet)
-
-        # LeRobot 0.6.1 connects the teleoperator before the robot observer.
         teleop.connect()
-        self.assertTrue(teleop.is_connected)
-        with self.assertRaisesRegex(ConnectionError, "observer did not open"):
-            teleop.get_action()
-
-        teleop.telemetry.is_open = True
 
         action = teleop.get_action()
 

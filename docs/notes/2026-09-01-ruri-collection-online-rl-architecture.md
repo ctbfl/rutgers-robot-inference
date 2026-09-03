@@ -108,8 +108,13 @@ single-Piper controller 家族。
 ```text
 integrations/
 ├── lerobot_robot_piper_mit/
-└── lerobot_teleoperator_piper_mit/
+├── lerobot_teleoperator_piper_mit/
+├── lerobot_robot_piper_mit_lerobot0_5_2/
+└── lerobot_teleoperator_piper_mit_lerobot0_5_2/
 ```
+
+无后缀 adapter 是 LeRobot 0.6.1 的当前实现；带 `lerobot0_5_2` 后缀的两个
+distribution 只为尚未迁移的团队保留。一个环境只安装其中一对。
 
 它们不复制：
 

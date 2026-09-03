@@ -1,4 +1,4 @@
-"""RURI Piper MIT teleoperator adapter for LeRobot 0.6.1."""
+"""Legacy RURI Piper MIT teleoperator adapter for LeRobot 0.5.2."""
 
 from __future__ import annotations
 
@@ -46,8 +46,10 @@ class PiperMIT(Teleoperator):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        """Mark ready before the observer connects, as required by LeRobot 0.6.1."""
         del calibrate
+        if not self.telemetry.is_open:
+            raise ConnectionError("The RURI Piper observer must connect first")
+        self.telemetry.latest_engaged(self.config.telemetry_timeout_s)
         self._connected = True
 
     @property
@@ -62,10 +64,6 @@ class PiperMIT(Teleoperator):
 
     @check_if_not_connected
     def get_action(self) -> dict[str, Any]:
-        if not self.telemetry.is_open:
-            raise ConnectionError(
-                "The RURI Piper observer did not open the shared telemetry receiver"
-            )
         values = normalize_teleop_target(self.telemetry.latched())
         return {
             key: float(value)

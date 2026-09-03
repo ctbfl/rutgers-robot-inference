@@ -210,6 +210,11 @@ class SinglePiperController(RobotSetupController):
         return self._teleop_observer_attached and self._telemetry is not None
 
     @property
+    def cameras(self) -> Mapping[str, Any | None]:
+        """Expose the two standard camera slots without changing their lifecycle."""
+        return {"top": self._head, "wrist": self._wrist}
+
+    @property
     def action_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         return ACTION_LOWER.copy(), ACTION_UPPER.copy()
 

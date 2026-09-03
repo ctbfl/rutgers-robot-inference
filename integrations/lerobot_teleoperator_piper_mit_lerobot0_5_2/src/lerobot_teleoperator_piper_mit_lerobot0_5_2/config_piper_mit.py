@@ -1,4 +1,4 @@
-"""Piper MIT teleoperator configuration for LeRobot 0.6.1."""
+"""Legacy Piper MIT teleoperator configuration for LeRobot 0.5.2."""
 
 from dataclasses import dataclass
 

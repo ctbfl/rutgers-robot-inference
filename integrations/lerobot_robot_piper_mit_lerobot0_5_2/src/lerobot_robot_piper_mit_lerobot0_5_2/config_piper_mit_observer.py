@@ -1,4 +1,4 @@
-"""Piper observer configuration for LeRobot 0.6.1."""
+"""Legacy Piper observer configuration for LeRobot 0.5.2."""
 
 from __future__ import annotations
 

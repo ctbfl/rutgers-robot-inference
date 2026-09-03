@@ -70,7 +70,7 @@ It identifies right/secondary as the leader and left/main as the follower by
 the registered USB-CAN hardware IDs. The follower target and follower state are
 published in the same MIT telemetry packet.
 
-Install the optional LeRobot adapters into your already-prepared LeRobot 0.5.2
+Install the optional LeRobot adapters into your already-prepared LeRobot 0.6.1
 environment:
 
 ```bash
@@ -88,8 +88,11 @@ lerobot-record \
   --teleop.id=piper_mit \
   --dataset.repo_id=local/my_dataset \
   --dataset.single_task='describe the task' \
+  --dataset.root=/absolute/path/to/my_dataset \
   --dataset.fps=30 \
   --dataset.num_episodes=50 \
+  --dataset.rgb_encoder.vcodec=h264 \
+  --dataset.no_stamp=true \
   --dataset.push_to_hub=false
 ```
 
@@ -98,3 +101,7 @@ follower state/target packet and reads the latest head and wrist camera frames.
 LeRobot's 30 Hz frame index remains the dataset timebase; camera or telemetry
 timestamps are not added to the dataset. Both cameras use RURI's reviewed
 `cam_params.json` controls and warm-up procedure.
+
+Legacy adapters for LeRobot 0.5.2 are retained under the corresponding
+`*_lerobot0_5_2` integration directories. Install one generation only; both
+generations intentionally register the same CLI type names.

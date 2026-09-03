@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_teleoperator_piper_mit_lerobot0_5_2"
+version = "0.2.0"
+description = "Legacy LeRobot 0.5.2 teleoperator adapter for RURI Piper MIT targets"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lerobot_teleoperator_piper_mit_lerobot0_5_2*"]

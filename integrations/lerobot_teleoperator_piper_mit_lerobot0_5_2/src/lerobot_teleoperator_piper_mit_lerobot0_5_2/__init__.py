@@ -1,4 +1,4 @@
-"""LeRobot 0.6.1 registration entrypoint for RURI MIT frame targets."""
+"""Legacy LeRobot 0.5.2 registration entrypoint for RURI MIT frame targets."""
 
 from .config_piper_mit import PiperMITConfig
 from .piper_mit import PiperMIT

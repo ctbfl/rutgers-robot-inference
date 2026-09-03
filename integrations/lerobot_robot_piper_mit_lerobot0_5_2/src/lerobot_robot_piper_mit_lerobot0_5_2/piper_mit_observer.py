@@ -1,4 +1,4 @@
-"""RURI Piper observer adapter for LeRobot 0.6.1."""
+"""Legacy RURI Piper observer adapter for LeRobot 0.5.2."""
 
 from __future__ import annotations
 
@@ -40,10 +40,6 @@ class PiperMITObserver(Robot):
             config,
             telemetry_factory=get_shared_mit_telemetry,
         )
-        # LeRobot creates the dataset before connecting the robot and uses this
-        # mapping to size its image-writer pool. Keep both slots present before
-        # hardware discovery, then replace the placeholders after connect().
-        self.cameras: dict[str, Any | None] = {"top": None, "hand": None}
         self._latched_action: dict[str, float] | None = None
 
     @cached_property
@@ -69,9 +65,6 @@ class PiperMITObserver(Robot):
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
         self.controller.connect_teleop_observer()
-        controller_cameras = self.controller.cameras
-        self.cameras["top"] = controller_cameras["top"]
-        self.cameras["hand"] = controller_cameras["wrist"]
         logger.info("%s connected through RURI without opening CAN", self)
 
     @property
@@ -118,6 +111,5 @@ class PiperMITObserver(Robot):
     @check_if_not_connected
     def disconnect(self) -> None:
         self.controller.disconnect()
-        self.cameras.update(top=None, hand=None)
         self._latched_action = None
         logger.info("%s disconnected from RURI telemetry and cameras", self)

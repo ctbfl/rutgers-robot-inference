@@ -217,6 +217,9 @@ class ControllerTests(unittest.TestCase):
         )
 
         controller.connect_teleop_observer()
+        self.assertEqual(list(controller.cameras), ["top", "wrist"])
+        self.assertIsNotNone(controller.cameras["top"])
+        self.assertIsNotNone(controller.cameras["wrist"])
         observation, target = controller.get_teleop_sample()
 
         self.assertTrue(controller.teleop_observer_attached)
@@ -227,6 +230,7 @@ class ControllerTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(target, normalize_pose([0.1] * 6, 0.02))
         controller.disconnect()
+        self.assertEqual(controller.cameras, {"top": None, "wrist": None})
         self.assertTrue(telemetry.closed)
 
     def test_reviewed_camera_controls_are_loaded_from_json(self):
