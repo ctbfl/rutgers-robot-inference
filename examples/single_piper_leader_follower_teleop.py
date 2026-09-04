@@ -20,6 +20,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seconds", type=float, default=0.0)
     parser.add_argument("--no-gripper", dest="use_gripper", action="store_false")
     parser.add_argument(
+        "--no-joint-limits",
+        dest="enforce_joint_limits",
+        action="store_false",
+        help="do not clamp the follower target to the recordable action space",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
         help="required acknowledgement: energize and move both arms",

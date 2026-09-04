@@ -103,6 +103,28 @@ HOME_TOLERANCE = 0.05
 # gravity scripts. Exceeding one means the model/pose deserves inspection.
 TAU_CLAMP = np.array([10.0, 12.0, 10.0, 3.0, 3.0, 3.0])
 
+# Teleoperated action-space limits, radians. Same values as the nominal envelope
+# in calibration/piper_range.json, which the dataset layer also reads and which
+# stores them in the Piper raw unit of 0.001 deg. Duplicated here so this
+# real-time loop does not import the dataset layer or parse JSON on startup; a
+# unit test asserts the two stay identical.
+#
+# Clamping the follower target to this box is what keeps collection symmetric
+# with inference, and it is now the only place the box is enforced: the
+# recording normalizer no longer truncates, so a value it receives outside this
+# range means the control path let one through rather than being silently
+# rounded into the dataset. That silent truncation is what recorded joint6 at
+# bit-exact -100 for 29.2% of the tight_insertion_row_1 frames.
+#
+# No torque is rendered on the leader for these limits. The operator closes the
+# loop on the follower, which simply stops at the boundary; the leader stays a
+# free, gravity-compensated handle. The follower's measured pose may still
+# overshoot while tracking, which is a bounded tracking error that happens
+# identically under policy control.
+JOINT_LIMIT_LOWER = np.radians([-154.0, 0.0, -175.0, -106.0, -75.0, -172.0])
+JOINT_LIMIT_UPPER = np.radians([154.0, 195.0, 0.0, 106.0, 75.0, 172.0])
+
+
 _running = True
 
 
@@ -286,6 +308,28 @@ def bounded_torque(raw: Sequence[float], label: str) -> np.ndarray:
     return torque
 
 
+def clamp_joint_target(
+    q_des: Sequence[float],
+    qd_des: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Restrict a follower target to the action-space box.
+
+    Velocity is only zeroed where it would drive further out, so a target that
+    already sits outside can still travel back in.
+    """
+    target = joint_vector(q_des, "follower target")
+    velocity = joint_vector(qd_des, "follower target velocity")
+    clamped = np.clip(target, JOINT_LIMIT_LOWER, JOINT_LIMIT_UPPER)
+    if np.array_equal(clamped, target):
+        return clamped, velocity
+    velocity = velocity.copy()
+    at_lower = target <= JOINT_LIMIT_LOWER
+    at_upper = target >= JOINT_LIMIT_UPPER
+    velocity[at_lower] = np.maximum(velocity[at_lower], 0.0)
+    velocity[at_upper] = np.minimum(velocity[at_upper], 0.0)
+    return clamped, velocity
+
+
 def build_arm(channel: str):
     try:
         from pyAgxArm import (
@@ -307,6 +351,7 @@ def build_arm(channel: str):
     arm = AgxArmFactory.create_arm(config)
     arm.connect()
     time.sleep(0.5)
+
     return arm
 
 
@@ -923,6 +968,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ABORT_HOME_SPEED,
         help="maximum quintic target speed during abort recovery, rad/s",
     )
+    parser.add_argument(
+        "--no-joint-limits",
+        action="store_true",
+        help="do not clamp the follower target to the recordable action space",
+    )
     parser.add_argument("--no-gripper", action="store_true")
     parser.add_argument(
         "--grip-force",
@@ -1044,6 +1094,7 @@ def run(args: argparse.Namespace) -> int:
     telemetry: Optional[MITTelemetryPublisher] = None
     aborted: Optional[str] = None
     commands = overruns = 0
+    enforce_limits = not args.no_joint_limits
     peak_track = 0.0
     started = False
     teleop_started = False
@@ -1198,6 +1249,8 @@ def run(args: argparse.Namespace) -> int:
                 elapsed,
                 args.engage_seconds,
             )
+            if enforce_limits:
+                q_des, qd_des = clamp_joint_target(q_des, qd_des)
             send_leader(
                 leader,
                 last_leader,

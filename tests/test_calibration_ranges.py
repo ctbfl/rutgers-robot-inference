@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import unittest
 
 import numpy as np
 
 from ruri.client.controllers.single_piper import calibration_ranges as base
+from ruri.client.controllers.single_piper.mit import leader_follower as mit_teleop
 from ruri.client.controllers.single_piper.normalization import CALIBRATION_RANGES
 from ruri.client.controllers.single_piper_leader_follower_teleop import (
     calibration_ranges as teleop,
@@ -65,6 +67,20 @@ class NominalIsTheSingleSourceTests(unittest.TestCase):
             {k: tuple(v) for k, v in CALIBRATION_RANGES.items()},
             {k: tuple(v) for k, v in base.NOMINAL.ranges.items()},
         )
+
+    def test_mit_loop_limits_match_the_nominal_envelope(self):
+        # The real-time loop duplicates these in radians so it never imports the
+        # dataset layer or parses JSON on startup.
+        for index, name in enumerate(base.RANGE_NAMES[:6]):
+            low, high = base.NOMINAL[name]
+            self.assertAlmostEqual(
+                mit_teleop.JOINT_LIMIT_LOWER[index], math.radians(low / 1000.0),
+                places=12, msg=f"{name} lower limit drifted",
+            )
+            self.assertAlmostEqual(
+                mit_teleop.JOINT_LIMIT_UPPER[index], math.radians(high / 1000.0),
+                places=12, msg=f"{name} upper limit drifted",
+            )
 
 
 class MeasurementsAreConsistentTests(unittest.TestCase):

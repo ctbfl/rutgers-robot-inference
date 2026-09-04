@@ -80,3 +80,27 @@ class ManagedMITProcessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TeleopJointLimitFlagTests(unittest.TestCase):
+    def _launch(self, **config_kwargs):
+        config = SinglePiperLeaderFollowerTeleopConfig(
+            python_executable=Path("/usr/bin/python3"), **config_kwargs
+        )
+        process = MagicMock()
+        process.stdout = ()
+        process.poll.return_value = None
+        with patch(
+            "ruri.client.controllers.single_piper.mit_process.subprocess.Popen",
+            return_value=process,
+        ) as popen:
+            ManagedMITTeleopProcess(config, "can-right", "can-left").start()
+        return popen.call_args.args[0]
+
+    def test_limits_are_enforced_by_default(self):
+        self.assertNotIn("--no-joint-limits", self._launch())
+
+    def test_limits_can_be_disabled(self):
+        self.assertIn(
+            "--no-joint-limits", self._launch(enforce_joint_limits=False)
+        )

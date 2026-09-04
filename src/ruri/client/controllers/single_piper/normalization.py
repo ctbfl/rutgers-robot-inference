@@ -37,9 +37,18 @@ CALIBRATION_RANGES = {
 
 
 def _normalize_raw(name: str, raw_value: float) -> float:
+    """Map one Piper raw value onto the dataset convention without truncating.
+
+    This deliberately does not clamp. The teleop control path clamps the
+    follower target to the same box, so an action reaching here is already
+    inside it, and a state may sit marginally outside it because the follower
+    overshoots its target while tracking -- a real, bounded quantity that the
+    dataset should carry rather than round away. Clamping here instead of in
+    the control path is what recorded joint6 at bit-exact -100 for 29.2% of the
+    tight_insertion_row_1 frames while the arm was physically past the limit.
+    """
     minimum, maximum = CALIBRATION_RANGES[name]
-    bounded = min(maximum, max(minimum, float(raw_value)))
-    fraction = (bounded - minimum) / (maximum - minimum)
+    fraction = (float(raw_value) - minimum) / (maximum - minimum)
     return fraction * 100.0 if name == GRIPPER_NAME else fraction * 200.0 - 100.0
 
 

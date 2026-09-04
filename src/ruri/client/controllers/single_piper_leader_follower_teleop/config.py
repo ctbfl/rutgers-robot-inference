@@ -38,6 +38,7 @@ class SinglePiperLeaderFollowerTeleopConfig(SinglePiperConfig):
     grip_base: float = 0.1
     grip_gain: float = 1.0
     grip_max_force: float = 5.0
+    enforce_joint_limits: bool = True
 
     def __post_init__(self) -> None:
         SinglePiperConfig.__post_init__(self)

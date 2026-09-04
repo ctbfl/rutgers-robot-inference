@@ -411,5 +411,79 @@ class GripperCommandTests(unittest.TestCase):
         self.assertEqual(leader.commands, [(0.025, 5.0)])
 
 
+class JointLimitTests(unittest.TestCase):
+    def test_limits_match_the_recording_normalizer(self):
+        # The MIT loop duplicates these numbers so it never imports the dataset
+        # layer. If the two disagree, a demonstration can hold a target that
+        # inference cannot command, which is what the clamp exists to prevent.
+        from ruri.client.controllers.single_piper.normalization import (
+            CALIBRATION_RANGES,
+            JOINT_NAMES,
+        )
+
+        for index, name in enumerate(JOINT_NAMES):
+            raw_min, raw_max = CALIBRATION_RANGES[name]
+            self.assertAlmostEqual(
+                mit_teleop.JOINT_LIMIT_LOWER[index], np.radians(raw_min / 1000.0),
+                places=12, msg=f"{name} lower limit drifted",
+            )
+            self.assertAlmostEqual(
+                mit_teleop.JOINT_LIMIT_UPPER[index], np.radians(raw_max / 1000.0),
+                places=12, msg=f"{name} upper limit drifted",
+            )
+
+    def test_in_range_target_passes_through(self):
+        qd = np.full(6, 0.3)
+        clamped, velocity = mit_teleop.clamp_joint_target(np.zeros(6), qd)
+
+        np.testing.assert_allclose(clamped, np.zeros(6))
+        np.testing.assert_allclose(velocity, qd)
+
+    def test_out_of_range_target_is_clamped(self):
+        clamped, _ = mit_teleop.clamp_joint_target(
+            mit_teleop.JOINT_LIMIT_LOWER - 0.2, np.zeros(6)
+        )
+        np.testing.assert_allclose(clamped, mit_teleop.JOINT_LIMIT_LOWER)
+
+    def test_clamped_velocity_may_return_but_not_leave(self):
+        outside = mit_teleop.JOINT_LIMIT_UPPER + 0.1
+
+        _, held = mit_teleop.clamp_joint_target(outside, np.full(6, 0.5))
+        _, released = mit_teleop.clamp_joint_target(outside, np.full(6, -0.5))
+
+        np.testing.assert_allclose(held, np.zeros(6))
+        np.testing.assert_allclose(released, np.full(6, -0.5))
+
+
+class LeaderIsUnconstrainedTests(unittest.TestCase):
+    """The box is enforced only on the follower target.
+
+    The operator closes the loop on the follower, which stops at the boundary,
+    so no wall torque is rendered on the leader and it stays a free handle.
+    """
+
+    def test_leader_command_is_gravity_and_damping_only_outside_the_box(self):
+        gravity = FakeGravity([0.0, 2.0, -3.0, 0.4, -0.5, 0.1])
+        sample = mit_teleop.ArmSample(
+            q=mit_teleop.JOINT_LIMIT_UPPER + 1.0,
+            qd=np.full(6, 0.1),
+            joint_effort=np.zeros(6),
+            stamps=(1.0,) * 7,
+        )
+
+        torque = mit_teleop.send_leader(FakeArm(), sample, gravity, 0.2)
+
+        np.testing.assert_allclose(
+            torque, gravity.torque(sample.q) - 0.2 * sample.qd
+        )
+
+    def test_no_wall_is_exposed(self):
+        for name in ("joint_limit_wall", "LIMIT_WALL_KP", "LIMIT_WALL_TORQUE"):
+            self.assertFalse(
+                hasattr(mit_teleop, name),
+                f"{name} should have been removed with the leader wall",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

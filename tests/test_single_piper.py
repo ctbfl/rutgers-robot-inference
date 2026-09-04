@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import math
+
 import numpy as np
 
 from ruri.client.controllers.single_piper import SinglePiperConfig, SinglePiperController
@@ -170,6 +172,24 @@ class NormalizationTests(unittest.TestCase):
         restored_q, restored_gripper = denormalize_action(normalized)
         np.testing.assert_allclose(restored_q, q, atol=1e-6)
         self.assertAlmostEqual(restored_gripper, 0.034, places=6)
+
+    def test_recording_does_not_truncate_a_pose_outside_the_box(self):
+        # Clamping here instead of in the control path recorded joint6 at
+        # bit-exact -100 for 29.2% of tight_insertion_row_1 while the arm was
+        # physically past the limit. The follower may legitimately overshoot
+        # its clamped target by a small tracking error; the dataset carries it.
+        from ruri.client.controllers.single_piper.normalization import (
+            CALIBRATION_RANGES,
+        )
+
+        # A degree past joint6's lower bound, whatever that bound currently is.
+        limit_deg = CALIBRATION_RANGES["joint6"][0] / 1000.0
+        past = math.radians(limit_deg - 1.0)
+        q = np.asarray([0.0, math.radians(90.0), 0.0, 0.0, 0.0, past])
+
+        normalized = normalize_pose(q, 0.034)
+
+        self.assertLess(normalized[5], -100.0)
 
     def test_finite_policy_overshoot_is_rejected_without_mutating_input(self):
         action = np.asarray(
