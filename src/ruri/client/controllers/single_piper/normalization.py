@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from . import calibration_ranges
+
 
 JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 GRIPPER_NAME = "gripper"
@@ -18,15 +20,19 @@ ACTION_LOWER = np.asarray([-100.0] * 6 + [0.0], dtype=np.float32)
 ACTION_UPPER = np.asarray([100.0] * 7, dtype=np.float32)
 
 # Piper raw joint values are 0.001 degree and gripper values are micrometres.
-# This is the stable convention used by this machine's LeRobot collection path.
+#
+# The envelope lives in calibration/piper_range.json rather than here, next to
+# the two files recording what each arm on this rig actually reaches. It is the
+# AgileX manual's figures with joint6 and the gripper corrected: the manual is
+# accurate to 3.4 deg on joint1-joint5, but states joint6 as +/-100 deg when
+# both arms measure +/-172, and the gripper as 70 mm against a measured 82.4 mm.
+#
+# Replaces the table inherited from WeGo, which additionally narrowed joint5 to
+# +/-65 and gave joint6 the asymmetric [-100, 130] that matched neither the
+# manual nor either arm, and which truncated joint6 on 29.2% of the frames in
+# tight_insertion_row_1.
 CALIBRATION_RANGES = {
-    "joint1": (-150_000.0, 150_000.0),
-    "joint2": (0.0, 180_000.0),
-    "joint3": (-170_000.0, 0.0),
-    "joint4": (-100_000.0, 100_000.0),
-    "joint5": (-65_000.0, 65_000.0),
-    "joint6": (-100_000.0, 130_000.0),
-    "gripper": (0.0, 68_000.0),
+    name: tuple(bounds) for name, bounds in calibration_ranges.NOMINAL.ranges.items()
 }
 
 

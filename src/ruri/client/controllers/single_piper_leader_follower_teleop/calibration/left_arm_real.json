@@ -1,0 +1,51 @@
+{
+  "kind": "measured",
+  "name": "left_arm",
+  "side": "left",
+  "role": "main",
+  "teleop_role": "follower",
+  "can_hardware_id": "usb:1d50:606f:0042002F4759530820353131",
+  "units": {
+    "joints": "0.001 deg",
+    "gripper": "micrometre"
+  },
+  "measured_on": "2026-09-04",
+  "method": [
+    "Motors de-energized, every joint dragged by hand onto both mechanical stops.",
+    "Angles decoded from the raw 0x2A5/0x2A6/0x2A7 encoder feedback frames and the",
+    "gripper from 0x2A8, so no SDK software limit, URDF value or calibration table",
+    "is applied. 59112 joint frames and 13198 gripper frames.",
+    "joint2 comes from a second run: the first stopped 15 deg short of the upper",
+    "stop, which is hard to reach against gravity with the gripper fitted."
+  ],
+  "ranges": {
+    "joint1": [
+      -155130.0,
+      154910.0
+    ],
+    "joint2": [
+      -9110.0,
+      188260.0
+    ],
+    "joint3": [
+      -173920.0,
+      2130.0
+    ],
+    "joint4": [
+      -102720.0,
+      102570.0
+    ],
+    "joint5": [
+      -75330.0,
+      75740.0
+    ],
+    "joint6": [
+      -172330.0,
+      170550.0
+    ],
+    "gripper": [
+      -2240.0,
+      79940.0
+    ]
+  }
+}

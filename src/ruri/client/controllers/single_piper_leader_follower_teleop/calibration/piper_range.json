@@ -1,0 +1,27 @@
+{
+  "kind": "nominal",
+  "model": "AgileX PiPER",
+  "units": {"joints": "0.001 deg", "gripper": "micrometre"},
+  "source": "AgileX PiPER quick-start manual, with joint6 and gripper corrected by measurement",
+  "notes": [
+    "This is the abstract Piper envelope. It is what normalization maps onto",
+    "[-100, 100] and what teleop clamps the follower target to. It is deliberately",
+    "not any one arm's measured travel: it must be stable across arms and across",
+    "datasets, because two datasets normalized with different tables cannot be",
+    "trained together.",
+    "The manual is accurate for joint1-joint5 (within 3.4 deg of measurement) but",
+    "states joint6 as +/-100 deg, which is wrong by about 72 deg per side; both",
+    "arms here reach +/-172. The manual's gripper figure of 70 mm is likewise",
+    "short of the 82.4 mm both grippers travel.",
+    "See left_arm_real.json and right_arm_real.json for the per-arm measurements."
+  ],
+  "ranges": {
+    "joint1": [-154000.0, 154000.0],
+    "joint2": [0.0, 195000.0],
+    "joint3": [-175000.0, 0.0],
+    "joint4": [-106000.0, 106000.0],
+    "joint5": [-75000.0, 75000.0],
+    "joint6": [-172000.0, 172000.0],
+    "gripper": [0.0, 80000.0]
+  }
+}

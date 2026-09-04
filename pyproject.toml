@@ -42,7 +42,11 @@ include = ["ruri*", "pyAgxArm*"]
 [tool.setuptools.package-data]
 "ruri.client.controllers.single_piper" = [
     "cam_params.json",
+    "calibration/*.json",
     "mit/assets/*.json",
     "mit/assets/*.urdf",
     "mit/assets/LICENSE*",
+]
+"ruri.client.controllers.single_piper_leader_follower_teleop" = [
+    "calibration/*.json",
 ]
