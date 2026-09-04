@@ -1113,12 +1113,6 @@ def run(args: argparse.Namespace) -> int:
             "\n*** BOTH ARMS WILL ENTER MIT CONTROL AND GO HOME. "
             "SUPPORT THEM; E-STOP IN HAND. ***"
         )
-        for remaining in range(5, 0, -1):
-            print(f"    starting in {remaining} ...")
-            time.sleep(1.0)
-            if not _running:
-                raise TeleopAbort("startup cancelled by signal")
-
         # Keep both devices in the broadcasting/PC-controlled linkage setting.
         # Do not call set_motion_mode(): move_mit performs the transition and an
         # explicit set_motion_mode has de-energized this hardware before.
