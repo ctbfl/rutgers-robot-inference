@@ -65,6 +65,7 @@ import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import math
 import signal
 import time
 from typing import Optional, Sequence
@@ -330,6 +331,50 @@ def clamp_joint_target(
     return clamped, velocity
 
 
+class HardwareLimitedArm:
+    """One arm, unable to be commanded past its own measured mechanical stops.
+
+    The travel envelope belongs to the physical arm -- it is looked up by the
+    USB-CAN adapter's serial, not by a SocketCAN name -- so binding the clamp to
+    the object rather than applying it at each send site is what makes it
+    impossible to route around. Every position command in this package reaches
+    hardware through ``move_mit``, so that is the only method to intercept.
+
+    This is a last line of defence, distinct from the nominal clamp that
+    ``clamp_joint_target`` applies to the follower target. Nominal keeps
+    collection symmetric with inference and is identical on every arm; this one
+    protects one particular arm and differs between them by a degree or two.
+    A command reaching this clamp is already a bug somewhere upstream, so the
+    first time each joint is clamped it says so rather than silently correcting.
+    """
+
+    def __init__(self, arm, lower: np.ndarray, upper: np.ndarray, arm_name: str):
+        self._arm = arm
+        self._lower = np.asarray(lower, dtype=float)
+        self._upper = np.asarray(upper, dtype=float)
+        self.arm_name = arm_name
+        self._reported = set()
+
+    def __getattr__(self, name):
+        return getattr(self._arm, name)
+
+    def move_mit(self, joint_index: int, p_des: float, **kwargs):
+        index = int(joint_index) - 1
+        if 0 <= index < N_JOINTS:
+            low, high = self._lower[index], self._upper[index]
+            bounded = min(high, max(low, float(p_des)))
+            if bounded != p_des and index not in self._reported:
+                self._reported.add(index)
+                print(
+                    f"  {self.arm_name} J{index + 1} command "
+                    f"{math.degrees(p_des):.2f} deg "
+                    f"clamped to its hardware limit "
+                    f"[{math.degrees(low):.2f}, {math.degrees(high):.2f}]"
+                )
+            p_des = bounded
+        return self._arm.move_mit(joint_index=joint_index, p_des=p_des, **kwargs)
+
+
 def build_arm(channel: str):
     try:
         from pyAgxArm import (
@@ -352,7 +397,18 @@ def build_arm(channel: str):
     arm.connect()
     time.sleep(0.5)
 
-    return arm
+    from ..calibration_ranges import arm_name_for_hardware_id, measured_for_arm
+    from ..discovery import read_can_hardware_id
+
+    # The CAN interface only tells us which arm this cable leads to today; from
+    # here on the arm is referred to by name, and its limits are its own.
+    hardware_id = read_can_hardware_id(channel)
+    arm_name = arm_name_for_hardware_id(hardware_id)
+    measured = measured_for_arm(arm_name)
+    lower = np.radians([measured[f"joint{i}"][0] / 1000.0 for i in JOINTS])
+    upper = np.radians([measured[f"joint{i}"][1] / 1000.0 for i in JOINTS])
+    print(f"  {channel} -> {arm_name}  (adapter {hardware_id})")
+    return HardwareLimitedArm(arm, lower, upper, arm_name)
 
 
 def read_sample(arm, label: str) -> ArmSample:

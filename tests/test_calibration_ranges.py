@@ -129,3 +129,66 @@ class FilesAreWellFormedTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+class HardwareLimitedArmTests(unittest.TestCase):
+    """The per-arm clamp is bound to the arm, not to any call site."""
+
+    class FakeArm:
+        def __init__(self):
+            self.sent = []
+            self.other_called = False
+
+        def move_mit(self, joint_index, p_des, **kwargs):
+            self.sent.append((joint_index, p_des))
+
+        def enable(self):
+            self.other_called = True
+
+    def _wrap(self, arm, lower_deg, upper_deg):
+        return mit_teleop.HardwareLimitedArm(
+            arm, np.radians(lower_deg), np.radians(upper_deg), "test"
+        )
+
+    def test_in_range_command_passes_through_untouched(self):
+        arm = self.FakeArm()
+        wrapped = self._wrap(arm, [-10] * 6, [10] * 6)
+        wrapped.move_mit(joint_index=1, p_des=0.1, v_des=0.0, kp=0.0, kd=0.0, t_ff=0.0)
+        self.assertEqual(arm.sent, [(1, 0.1)])
+
+    def test_command_past_the_hardware_stop_is_clamped(self):
+        arm = self.FakeArm()
+        wrapped = self._wrap(arm, [-10] * 6, [10] * 6)
+        wrapped.move_mit(joint_index=3, p_des=5.0, v_des=0.0, kp=0.0, kd=0.0, t_ff=0.0)
+        self.assertAlmostEqual(arm.sent[0][1], math.radians(10.0), places=12)
+
+    def test_each_joint_keeps_its_own_bound(self):
+        arm = self.FakeArm()
+        wrapped = self._wrap(arm, [-172, 0, -175, -106, -75, -154],
+                                  [172, 195, 0, 106, 75, 154])
+        for joint in range(1, 7):
+            wrapped.move_mit(joint_index=joint, p_des=-99.0, t_ff=0.0)
+        sent = [value for _, value in arm.sent]
+        self.assertAlmostEqual(sent[1], 0.0, places=12, msg="joint2 floors at 0")
+        self.assertAlmostEqual(sent[2], math.radians(-175.0), places=12)
+
+    def test_other_methods_are_delegated(self):
+        arm = self.FakeArm()
+        self._wrap(arm, [-10] * 6, [10] * 6).enable()
+        self.assertTrue(arm.other_called)
+
+    def test_the_two_arms_get_different_envelopes(self):
+        # Binding by hardware id is the point: the same command is legal on one
+        # arm and out of range on the other.
+        left = base.measured_for_arm(
+            base.arm_name_for_hardware_id("usb:1d50:606f:0042002F4759530820353131"))
+        right = base.measured_for_arm(
+            base.arm_name_for_hardware_id("usb:1d50:606f:002B00464759530920353131"))
+        self.assertNotEqual(left["joint6"], right["joint6"])
+        self.assertEqual(left.ranges, base.LEFT_ARM.ranges)
+        self.assertEqual(right.ranges, base.RIGHT_ARM.ranges)
+
+    def test_an_unregistered_adapter_is_refused(self):
+        with self.assertRaises(RuntimeError):
+            base.arm_name_for_hardware_id("usb:1d50:606f:deadbeef")
+        with self.assertRaises(RuntimeError):
+            base.measured_for_arm("middle_arm")
