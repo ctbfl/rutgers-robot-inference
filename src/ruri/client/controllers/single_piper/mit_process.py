@@ -163,6 +163,12 @@ class ManagedMITTeleopProcess(ManagedMITProcess):
         ]
         if not self.config.enforce_joint_limits:
             command.append("--no-joint-limits")
+        control_address = getattr(self.config, "teleop_control_address", None)
+        if control_address:
+            command += [
+                "--control-address", str(control_address),
+                "--reset-home-speed", str(self.config.reset_home_speed),
+            ]
         if not self.config.show_periodic_status:
             command.append("--quiet-status")
         if not self.config.use_gripper:

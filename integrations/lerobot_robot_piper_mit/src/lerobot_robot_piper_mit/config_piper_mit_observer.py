@@ -13,6 +13,7 @@ from ruri.client.controllers.single_piper.mit_io import parse_local_udp
 @dataclass(kw_only=True)
 class PiperMITObserverConfig(RobotConfig):
     telemetry_address: str = "udp://127.0.0.1:6670"
+    teleop_control_address: str | None = None
     telemetry_timeout_s: float = 0.25
     arm_connect_timeout_s: float = 120.0
     camera_timeout_ms: int = 500
@@ -26,6 +27,8 @@ class PiperMITObserverConfig(RobotConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         parse_local_udp(self.telemetry_address)
+        if self.teleop_control_address is not None:
+            parse_local_udp(self.teleop_control_address)
         if not 0.05 <= self.telemetry_timeout_s <= 2.0:
             raise ValueError("telemetry_timeout_s must be between 0.05 and 2.0")
         if not 1.0 <= self.arm_connect_timeout_s <= 600.0:

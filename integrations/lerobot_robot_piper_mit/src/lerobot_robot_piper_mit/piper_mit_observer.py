@@ -122,6 +122,15 @@ class PiperMITObserver(Robot):
         return dict(self._latched_action)
 
     @check_if_not_connected
+    def request_home(self) -> bool:
+        """Ask the teleop worker to send the arms home between episodes.
+
+        This adapter never opens CAN, so it cannot move anything itself; the
+        request travels to the worker that does, which is free to refuse it.
+        """
+        return self.controller.request_home()
+
+    @check_if_not_connected
     def disconnect(self) -> None:
         self.controller.disconnect()
         self.cameras.update(top=None, hand=None)

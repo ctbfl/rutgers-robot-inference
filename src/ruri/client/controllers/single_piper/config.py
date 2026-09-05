@@ -30,6 +30,10 @@ class SinglePiperConfig:
 
     telemetry_address: str = "udp://127.0.0.1:6670"
     command_address: str = "udp://127.0.0.1:6671"
+    #: Where a running teleop worker accepts control requests. None means it
+    #: accepts none, which is the default: an arm motion triggered from another
+    #: process is opt-in. 6671 is the policy command port, so this is 6672.
+    teleop_control_address: str | None = None
     arm_connect_timeout_s: float = 120.0
     telemetry_timeout_s: float = 0.25
     command_timeout_s: float = 0.30
@@ -57,6 +61,10 @@ class SinglePiperConfig:
         return cls(**values)
 
     def __post_init__(self) -> None:
+        if self.teleop_control_address is not None:
+            from .mit_io import parse_local_udp
+
+            parse_local_udp(self.teleop_control_address)
         if (self.arm_side is None) != (self.arm_role is None):
             raise ValueError("arm_side and arm_role must either both be set or both be omitted")
         if self.arm_side == "" or self.arm_role == "":

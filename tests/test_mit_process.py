@@ -104,3 +104,9 @@ class TeleopJointLimitFlagTests(unittest.TestCase):
         self.assertIn(
             "--no-joint-limits", self._launch(enforce_joint_limits=False)
         )
+
+    def test_reset_home_is_opt_in_and_forwards_speed(self):
+        self.assertNotIn("--control-address", self._launch())
+        command = self._launch(teleop_control_address="udp://127.0.0.1:6672")
+        self.assertEqual(command[command.index("--control-address") + 1], "udp://127.0.0.1:6672")
+        self.assertEqual(command[command.index("--reset-home-speed") + 1], "1.0")

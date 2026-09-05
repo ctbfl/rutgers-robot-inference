@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 
 TELEMETRY_PROTOCOL = "piper_mit_telemetry"
 COMMAND_PROTOCOL = "piper_mit_policy_command"
+CONTROL_PROTOCOL = "piper_mit_teleop_control"
+CONTROL_MAX_AGE_NS = 500_000_000
 PROTOCOL_VERSION = 1
 
 
@@ -154,6 +156,98 @@ class MITCommandSender:
             json.dumps(packet, allow_nan=False, separators=(",", ":")).encode(),
             self.destination,
         )
+
+    def close(self) -> None:
+        self._socket.close()
+
+
+class MITControlSender:
+    """Ask a running teleop worker to do something. Currently only "home".
+
+    Separate from MITCommandSender: that one streams policy targets to the
+    policy worker, this one sends a rare, discrete request to the teleop worker.
+    Sharing a socket would mean a dropped policy frame and an ignored request
+    look the same on the wire.
+    """
+
+    def __init__(self, address: str):
+        self.destination = parse_local_udp(address)
+        self.session = uuid.uuid4().hex
+        self.sequence = 0
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def request_home(self) -> None:
+        self.sequence += 1
+        packet = {
+            "protocol": CONTROL_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "session": self.session,
+            "sequence": self.sequence,
+            "monotonic_ns": time.monotonic_ns(),
+            "type": "home",
+        }
+        self._socket.sendto(
+            json.dumps(packet, allow_nan=False, separators=(",", ":")).encode(),
+            self.destination,
+        )
+
+    def close(self) -> None:
+        self._socket.close()
+
+
+class ControlRequestReceiver:
+    """Non-blocking receiver for teleop control requests.
+
+    ``take_home_request`` drains whatever arrived and reports whether a home was
+    asked for, so a burst of duplicates during one 10 ms tick is one request.
+    """
+
+    def __init__(self, address: str):
+        self.endpoint = parse_local_udp(address)
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._socket.bind(self.endpoint)
+        except OSError:
+            self._socket.close()
+            raise
+        self._socket.setblocking(False)
+        self._seen: dict[str, int] = {}
+
+    def take_home_request(self) -> bool:
+        requested = False
+        # Bound work per tick so a burst cannot starve the motor loop.
+        for _ in range(64):
+            try:
+                payload, _ = self._socket.recvfrom(65_535)
+            except BlockingIOError:
+                return requested
+            except OSError:
+                return requested
+            try:
+                packet = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if (
+                not isinstance(packet, dict)
+                or packet.get("protocol") != CONTROL_PROTOCOL
+                or packet.get("version") != PROTOCOL_VERSION
+                or packet.get("type") != "home"
+            ):
+                continue
+            session = packet.get("session")
+            sequence = packet.get("sequence")
+            stamp = packet.get("monotonic_ns")
+            if (
+                not isinstance(session, str) or not session or len(session) > 128
+                or type(sequence) is not int or type(stamp) is not int
+                or not 0 <= time.monotonic_ns() - stamp <= CONTROL_MAX_AGE_NS
+            ):
+                continue
+            if sequence <= self._seen.get(session, 0):
+                continue
+            self._seen[session] = sequence
+            requested = True
+        return requested
 
     def close(self) -> None:
         self._socket.close()

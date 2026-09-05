@@ -166,6 +166,7 @@ class SinglePiperController(RobotSetupController):
         self._wrist: Any | None = None
         self._telemetry: Any | None = None
         self._commands: Any | None = None
+        self._control: Any | None = None
         self._worker: Any | None = None
         self._devices: RealSenseDevices | None = None
         self._can: PiperCanDevice | None = None
@@ -218,6 +219,22 @@ class SinglePiperController(RobotSetupController):
     @property
     def action_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         return ACTION_LOWER.copy(), ACTION_UPPER.copy()
+
+    def request_home(self) -> bool:
+        """Ask the teleop worker to return the arms home. Returns whether sent.
+
+        The worker owns CAN and decides; this only asks. It refuses while the
+        leader is moving. A successful send is not an acknowledgement of motion.
+        """
+        address = self.config.teleop_control_address
+        if not address:
+            return False
+        if self._control is None:
+            from .mit_io import MITControlSender
+
+            self._control = MITControlSender(address)
+        self._control.request_home()
+        return True
 
     def start(self) -> None:
         """Connect all devices, enable the arm, and block until MIT is engaged."""
@@ -441,6 +458,9 @@ class SinglePiperController(RobotSetupController):
         if self._commands is not None:
             self._commands.close()
             self._commands = None
+        if self._control is not None:
+            self._control.close()
+            self._control = None
         if self._worker is not None:
             self._worker.stop(allow_watchdog_recovery=self._sent_action)
             self._worker = None

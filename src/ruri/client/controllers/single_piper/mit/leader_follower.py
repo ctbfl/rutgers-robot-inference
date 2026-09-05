@@ -99,6 +99,18 @@ HOME_MIN_SECONDS = 5.0
 HOME_SETTLE_SECONDS = 2.0
 HOME_TOLERANCE = 0.05
 
+# Reset homing drives only the leader; the follower reaches home by tracking it
+# through the coupling that is already running, so nothing is decoupled and no
+# re-engagement is needed. The binding constraint is therefore the follower's
+# tracking error, not any joint speed limit -- max_track_error aborts the run at
+# 0.35 rad, and the run reports its peak so the speed can be raised on evidence.
+# The startup and abort paths keep their own much slower speed: those recover an
+# arm in an unknown state, this one returns a known one between episodes.
+DEFAULT_RESET_HOME_SPEED = 1.0
+RESET_HOME_MIN_SECONDS = 0.5
+# Reject a moving start; velocity cannot detect a hand holding a stationary arm.
+RESET_HOME_STILL_SPEED = 0.05
+
 # These are feed-forward ceilings, not total MIT torque ceilings. They are well
 # below what the SDK accepts on J1-3 and match the already validated leader
 # gravity scripts. Exceeding one means the model/pose deserves inspection.
@@ -296,6 +308,14 @@ def recovery_home_duration(
         float(np.max(np.abs(joint_vector(follower_start, "follower home start")))),
     )
     return max(HOME_MIN_SECONDS, 1.875 * farthest / float(max_speed))
+
+
+def reset_home_duration(leader_start: Sequence[float], max_speed: float) -> float:
+    """Quintic duration bounding the leader's peak target speed on a reset home."""
+    if not np.isfinite(max_speed) or max_speed <= 0:
+        raise ValueError("reset home speed must be finite and positive")
+    farthest = float(np.max(np.abs(joint_vector(leader_start, "reset home start"))))
+    return max(RESET_HOME_MIN_SECONDS, 1.875 * farthest / float(max_speed))
 
 
 def bounded_torque(raw: Sequence[float], label: str) -> np.ndarray:
@@ -1029,6 +1049,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not clamp the follower target to the recordable action space",
     )
+    parser.add_argument(
+        "--control-address",
+        default=None,
+        help="local UDP address to accept teleop control requests on, e.g. "
+             "udp://127.0.0.1:6672; omitted means none are accepted",
+    )
+    parser.add_argument(
+        "--reset-home-speed",
+        type=float,
+        default=DEFAULT_RESET_HOME_SPEED,
+        help="maximum leader target speed while returning home between "
+             f"episodes, rad/s (default {DEFAULT_RESET_HOME_SPEED})",
+    )
     parser.add_argument("--no-gripper", action="store_true")
     parser.add_argument(
         "--grip-force",
@@ -1092,6 +1125,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-start-gap must be in (0, 0.5]")
     if not 0.0 < args.max_track_error <= 0.7:
         raise ValueError("--max-track-error must be in (0, 0.7]")
+    if not 0.0 < args.reset_home_speed <= 3.0:
+        raise ValueError("--reset-home-speed must be in (0, 3] rad/s")
+    if args.control_address is not None:
+        from ..mit_io import parse_local_udp
+
+        parse_local_udp(args.control_address)
+        if args.reset_home_speed > args.max_reference_speed:
+            raise ValueError("--reset-home-speed cannot exceed --max-reference-speed")
     if not 0.0 < args.max_joint_speed <= 5.0:
         raise ValueError("--max-joint-speed must be in (0, 5]")
     if not 0.0 < args.max_reference_speed <= 5.0:
@@ -1155,6 +1196,7 @@ def run(args: argparse.Namespace) -> int:
     started = False
     teleop_started = False
     recovered_home = False
+    control = None
 
     if args.execute and args.telemetry_address:
         telemetry = MITTelemetryPublisher(args.telemetry_address)
@@ -1164,6 +1206,11 @@ def run(args: argparse.Namespace) -> int:
         )
 
     try:
+        if args.execute and args.control_address is not None:
+            from ..mit_io import ControlRequestReceiver
+
+            # Reserve the port before energizing either arm.
+            control = ControlRequestReceiver(args.control_address)
         leader = build_arm(args.leader_can)
         follower = build_arm(args.follower_can)
         reject_teaching_mode(leader, "leader")
@@ -1283,6 +1330,12 @@ def run(args: argparse.Namespace) -> int:
         last_report = start
         last_status_check = start
         engaged_reported = False
+        if control is not None:
+            control.take_home_request()  # Discard requests received during startup.
+            print(f"  accepting teleop control requests at {args.control_address}")
+        reset_home_start: Optional[np.ndarray] = None
+        reset_home_began = 0.0
+        reset_home_seconds = 0.0
         grip_difference = 0.0
         grip_measured_force = 0.0
         grip_rendered_force = 0.0
@@ -1298,6 +1351,64 @@ def run(args: argparse.Namespace) -> int:
             leader_fresh.observe(last_leader.stamps, now)
             follower_fresh.observe(last_follower.stamps, now)
 
+            if control is not None and control.take_home_request():
+                if reset_home_start is not None:
+                    print("  reset home already running; request ignored")
+                elif elapsed < args.engage_seconds:
+                    print("  still engaging; reset home request ignored")
+                elif float(np.max(np.abs(last_leader.qd))) > RESET_HOME_STILL_SPEED:
+                    print("  leader is still moving; reset home request refused")
+                else:
+                    reset_home_start = last_leader.q.copy()
+                    reset_home_seconds = reset_home_duration(
+                        reset_home_start, args.reset_home_speed
+                    )
+                    reset_home_began = now
+                    print(
+                        f"RESET HOME: returning the leader over "
+                        f"{reset_home_seconds:.1f}s; the follower tracks it"
+                    )
+
+            homing = reset_home_start is not None
+            if homing:
+                home_elapsed = now - reset_home_began
+                leader_ref, leader_ref_vel = home_reference(
+                    reset_home_start, home_elapsed, reset_home_seconds
+                )
+                home_track = float(np.max(np.abs(last_leader.q - leader_ref)))
+                if home_track > args.max_track_error:
+                    raise TeleopAbort(
+                        f"leader reset home tracking error {home_track:.3f} rad exceeds "
+                        f"{args.max_track_error:.3f} rad"
+                    )
+                send_position_impedance(
+                    leader,
+                    last_leader,
+                    leader_ref,
+                    leader_ref_vel,
+                    leader_gravity,
+                    args.follower_kp,
+                    args.follower_kd,
+                    args.max_reference_speed,
+                    "leader reset home",
+                )
+                if home_elapsed >= reset_home_seconds:
+                    residual = max(
+                        float(np.max(np.abs(last_leader.q))),
+                        float(np.max(np.abs(last_follower.q))),
+                    )
+                    settled = max(
+                        float(np.max(np.abs(last_leader.qd))),
+                        float(np.max(np.abs(last_follower.qd))),
+                    ) <= RESET_HOME_STILL_SPEED
+                    if residual <= HOME_TOLERANCE and settled:
+                        print(f"RESET HOME COMPLETE: residual {residual * R2D:.1f} deg")
+                        reset_home_start = None
+                    elif home_elapsed >= reset_home_seconds + HOME_SETTLE_SECONDS:
+                        raise TeleopAbort(
+                            f"reset home did not settle: residual {residual:.3f} rad"
+                        )
+
             q_des, qd_des = engagement_reference(
                 follower_start,
                 last_leader.q,
@@ -1307,12 +1418,13 @@ def run(args: argparse.Namespace) -> int:
             )
             if enforce_limits:
                 q_des, qd_des = clamp_joint_target(q_des, qd_des)
-            send_leader(
-                leader,
-                last_leader,
-                leader_gravity,
-                args.leader_kd,
-            )
+            if not homing:
+                send_leader(
+                    leader,
+                    last_leader,
+                    leader_gravity,
+                    args.leader_kd,
+                )
             send_follower(
                 follower,
                 last_follower,
@@ -1434,7 +1546,7 @@ def run(args: argparse.Namespace) -> int:
                 overruns += 1
                 next_tick = time.perf_counter()
 
-    except (TeleopAbort, ValueError, FileNotFoundError) as exc:
+    except (TeleopAbort, ValueError, OSError) as exc:
         aborted = str(exc)
         print(f"\nABORTED: {aborted}")
         if telemetry is not None:
@@ -1528,6 +1640,8 @@ def run(args: argparse.Namespace) -> int:
 
         if telemetry is not None:
             telemetry.close()
+        if control is not None:
+            control.close()
 
     if started:
         print(

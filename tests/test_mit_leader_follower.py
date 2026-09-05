@@ -1,8 +1,9 @@
 import argparse
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -132,6 +133,16 @@ class EngagementReferenceTests(unittest.TestCase):
 
 
 class HomeReferenceTests(unittest.TestCase):
+    def test_reset_home_peak_speed_and_invalid_speed(self):
+        start = np.array([0, 1.5, -1, 0, 0, 0])
+        duration = mit_teleop.reset_home_duration(start, 1.0)
+        self.assertAlmostEqual(duration, 2.8125)
+        _, velocity = mit_teleop.home_reference(start, duration / 2, duration)
+        self.assertAlmostEqual(float(np.max(np.abs(velocity))), 1.0)
+        for speed in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                mit_teleop.reset_home_duration(start, speed)
+
     def test_home_reference_starts_at_pose_and_ends_at_zero(self):
         start = np.array([0.2, 1.0, -0.8, 0.1, -0.2, 0.3])
         q0, qd0 = mit_teleop.home_reference(start, 0.0, 10.0)
@@ -220,6 +231,83 @@ class HomeReferenceTests(unittest.TestCase):
         self.assertTrue(homed)
         np.testing.assert_allclose(leader.q, 0.0, atol=1e-12)
         np.testing.assert_allclose(follower.q, 0.0, atol=1e-12)
+
+
+class ResetHomeLoopTests(unittest.TestCase):
+    def run_reset(self, *, stuck=False, moving=False):
+        leader = FakeControlArm([0, 0.2, -0.1, 0, 0, 0])
+        follower = FakeControlArm(leader.q.copy())
+        for arm in (leader, follower):
+            arm.set_follower_mode = lambda: None
+            arm.disconnect = lambda: None
+        if moving:
+            leader.qd[0] = 0.1
+        clock = FakeClock()
+        request_times = iter([0.3, 0.4, 1.0, 1.1])  # startup, engaging, home, duplicate
+        next_request = next(request_times)
+
+        def poll():
+            nonlocal next_request
+            if clock.now + 1e-8 >= next_request:
+                next_request = next(request_times, float("inf"))
+                return True
+            return False
+
+        receiver = MagicMock()
+        receiver.take_home_request.side_effect = poll
+        args = mit_teleop.build_parser().parse_args([
+            "--execute", "--no-gripper", "--quiet-status", "--seconds", "4",
+            "--engage-seconds", "0.5", "--control-address", "udp://127.0.0.1:6672",
+        ])
+        original_move = leader.move_mit
+        if stuck:
+            leader.move_mit = lambda **kwargs: None
+        else:
+            # Gravity-only MIT commands do not target p_des when kp is zero.
+            leader.move_mit = lambda **kwargs: original_move(**kwargs) if kwargs["kp"] else None
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(mit_teleop.time, "perf_counter", clock.perf_counter))
+            stack.enter_context(patch.object(mit_teleop.time, "sleep", clock.sleep))
+            stack.enter_context(patch.object(mit_teleop.signal, "signal"))
+            stack.enter_context(patch.object(mit_teleop, "GravityCompensator", return_value=FakeGravity(np.zeros(6))))
+            stack.enter_context(patch.object(mit_teleop, "print_calibration"))
+            stack.enter_context(patch.object(mit_teleop, "build_arm", side_effect=[leader, follower]))
+            stack.enter_context(patch.object(mit_teleop, "enable_both_with_safe_commands", return_value=(None, None)))
+            startup = stack.enter_context(patch.object(mit_teleop, "home_both_with_mit", return_value=True))
+            recovery = stack.enter_context(patch.object(mit_teleop, "recover_home_after_abort", return_value=False))
+            stack.enter_context(patch("ruri.client.controllers.single_piper.mit_io.ControlRequestReceiver", return_value=receiver))
+            printed = stack.enter_context(patch("builtins.print"))
+            follow = stack.enter_context(patch.object(mit_teleop, "send_follower", wraps=mit_teleop.send_follower))
+            result = mit_teleop.run(args)
+        messages = "\n".join(str(call.args[0]) for call in printed.call_args_list if call.args)
+        receiver.close.assert_called_once()
+        startup.assert_called_once()
+        return result, leader, follower, follow, recovery, messages
+
+    def test_home_keeps_follower_tracking_and_resumes_teleop(self):
+        result, leader, follower, follow, recovery, messages = self.run_reset()
+        self.assertEqual(result, 0)
+        self.assertIn("still engaging", messages)
+        self.assertIn("already running", messages)
+        self.assertEqual(messages.count("RESET HOME COMPLETE"), 1)
+        self.assertGreater(follow.call_count, 300)
+        recovery.assert_not_called()
+        np.testing.assert_allclose(leader.q, 0, atol=1e-6)
+        np.testing.assert_allclose(follower.q, 0, atol=1e-6)
+
+    def test_stuck_leader_does_not_report_false_completion(self):
+        result, _, _, _, recovery, messages = self.run_reset(stuck=True)
+        self.assertEqual(result, 1)
+        self.assertNotIn("RESET HOME COMPLETE", messages)
+        self.assertIn("reset home did not settle", messages)
+        recovery.assert_called_once()
+
+    def test_moving_leader_refuses_request(self):
+        result, _, _, _, recovery, messages = self.run_reset(moving=True)
+        self.assertEqual(result, 0)
+        self.assertIn("leader is still moving", messages)
+        self.assertNotIn("RESET HOME COMPLETE", messages)
+        recovery.assert_not_called()
 
 
 class GravityCalibrationTests(unittest.TestCase):

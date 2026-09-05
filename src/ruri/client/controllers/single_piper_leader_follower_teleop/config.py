@@ -39,6 +39,7 @@ class SinglePiperLeaderFollowerTeleopConfig(SinglePiperConfig):
     grip_gain: float = 1.0
     grip_max_force: float = 5.0
     enforce_joint_limits: bool = True
+    reset_home_speed: float = 1.0
 
     def __post_init__(self) -> None:
         SinglePiperConfig.__post_init__(self)
@@ -50,6 +51,8 @@ class SinglePiperLeaderFollowerTeleopConfig(SinglePiperConfig):
             raise ValueError("follower_kp must be in (0, 50]")
         if not 0.0 < self.follower_kd <= 2.0:
             raise ValueError("follower_kd must be in (0, 2]")
+        if not 0.0 < self.reset_home_speed <= 3.0:
+            raise ValueError("reset_home_speed must be in (0, 3] rad/s")
         if self.engage_seconds < 0.5:
             raise ValueError("engage_seconds must be at least 0.5")
         if not 0.05 <= self.start_home_speed <= 0.5:
