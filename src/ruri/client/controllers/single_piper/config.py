@@ -36,7 +36,9 @@ class SinglePiperConfig:
     teleop_control_address: str | None = None
     arm_connect_timeout_s: float = 120.0
     telemetry_timeout_s: float = 0.25
-    command_timeout_s: float = 0.30
+    #: Server liveness deadline handed to the MIT worker: no new policy chunk
+    #: reaching this machine for this long means the policy server is gone.
+    command_timeout_s: float = 1.0
     worker_shutdown_timeout_s: float = 45.0
     startup_home_skip_threshold_rad: float = 0.05
     diagnostic_log: Path | None = None
