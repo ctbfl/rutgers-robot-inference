@@ -36,6 +36,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--include-effort-observation", action="store_true",
+        help="send measured joint/gripper effort; required for effort policy servers",
+    )
     parser.add_argument("--control-hz", type=float, default=30.0)
     parser.add_argument(
         "--execute-actions-per-chunk",

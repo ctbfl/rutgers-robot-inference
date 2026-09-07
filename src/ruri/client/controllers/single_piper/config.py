@@ -42,6 +42,7 @@ class SinglePiperConfig:
     diagnostic_log: Path | None = None
 
     python_executable: Path | None = None
+    include_effort_observation: bool = False
 
     @classmethod
     def from_args(cls, args: Any) -> "SinglePiperConfig":

@@ -209,6 +209,22 @@ class NormalizationTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_effort_inference_reads_state_and_force_from_one_packet(self):
+        controller = SinglePiperController(
+            SimpleNamespace(include_effort_observation=True),
+        )
+        telemetry = FakeTelemetry("unused")
+        controller._telemetry = telemetry
+        controller._arm_started = True
+        controller._worker = SimpleNamespace(running=True)
+        controller.get_camera_observation = lambda: {}
+        observation = controller.get_observation()
+        np.testing.assert_array_equal(
+            observation["observation.joint_effort"],
+            np.asarray([0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5], dtype=np.float32),
+        )
+        self.assertEqual(observation["observation.state"].shape, (7,))
+
     def test_teleop_observer_reads_state_and_target_without_touching_can(self):
         class TeleopTelemetry(FakeTelemetry):
             def __init__(self, address):

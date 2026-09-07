@@ -388,8 +388,13 @@ class SinglePiperController(RobotSetupController):
             raise RuntimeError("start_arm() must complete before reading a full observation")
         cameras = self.get_camera_observation()
         packet = self._telemetry.latest_engaged(self.config.telemetry_timeout_s)
+        proprioception = (
+            recording_observation(packet)
+            if self.config.include_effort_observation
+            else {"observation.state": normalize_telemetry(packet)}
+        )
         return {
-            "observation.state": normalize_telemetry(packet),
+            **proprioception,
             **cameras,
         }
 
