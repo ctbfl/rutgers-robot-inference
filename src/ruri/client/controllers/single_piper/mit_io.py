@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import queue
 import select
 import socket
+import threading
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -30,6 +33,54 @@ def parse_local_udp(address: str) -> tuple[str, int]:
     return "127.0.0.1", parsed.port
 
 
+class _EffortTrace:
+    """Append every telemetry packet to disk without delaying the caller.
+
+    The receiver runs on the control client's own thread, so the file write has
+    to leave it: one queue hand-off per packet, one writer thread, same shape as
+    the schedulers' own trace. Line-buffered and flushed per record, because
+    these runs end with Ctrl-C and a buffered tail would be the part worth
+    keeping.
+    """
+
+    def __init__(self, path: Path, address: str):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = self.path.open("a", encoding="utf-8", buffering=1)
+        self._records: queue.SimpleQueue[dict[str, Any] | object] = queue.SimpleQueue()
+        self._stop_token = object()
+        self._thread = threading.Thread(
+            target=self._write_loop, name="ruri-effort-log", daemon=True
+        )
+        self._thread.start()
+        self.record(
+            {
+                "kind": "trace_header",
+                "schema_version": 1,
+                "telemetry_address": address,
+                "wall_time_ns": time.time_ns(),
+            }
+        )
+
+    def record(self, packet: Mapping[str, Any]) -> None:
+        self._records.put(dict(packet))
+
+    def close(self) -> None:
+        self._records.put(self._stop_token)
+        self._thread.join()
+        self._stream.close()
+
+    def _write_loop(self) -> None:
+        while True:
+            record = self._records.get()
+            if record is self._stop_token:
+                return
+            self._stream.write(
+                json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n"
+            )
+            self._stream.flush()
+
+
 class MITTelemetryReceiver:
     def __init__(self, address: str):
         self.address = address
@@ -38,6 +89,19 @@ class MITTelemetryReceiver:
         self._latest: dict[str, Any] | None = None
         self._latched: dict[str, Any] | None = None
         self._received_at: float | None = None
+        self._trace: _EffortTrace | None = None
+
+    def record_to(self, path: Path) -> None:
+        """Keep every packet drained from here, not just the latest one.
+
+        The effort a rollout produced is already in every telemetry packet, at
+        the worker's full rate; this receiver simply throws all but the newest
+        away. Recording is therefore a tee on the drain, and costs the control
+        path one queue put per packet.
+        """
+        if self._trace is not None:
+            raise RuntimeError("MIT telemetry is already being recorded")
+        self._trace = _EffortTrace(Path(path), self.address)
 
     @property
     def is_open(self) -> bool:
@@ -68,6 +132,8 @@ class MITTelemetryReceiver:
                 continue
             self._latest = packet
             self._received_at = time.monotonic()
+            if self._trace is not None:
+                self._trace.record(packet)
 
     def latest_engaged(self, timeout_s: float) -> Mapping[str, Any]:
         self._drain(timeout_s)
@@ -118,6 +184,9 @@ class MITTelemetryReceiver:
         self._latest = None
         self._latched = None
         self._received_at = None
+        if self._trace is not None:
+            self._trace.close()
+            self._trace = None
 
 
 _SHARED_TELEMETRY: dict[str, MITTelemetryReceiver] = {}

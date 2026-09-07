@@ -73,6 +73,11 @@ def parse_args() -> argparse.Namespace:
         help="skip startup homing when max joint error from home is below this",
     )
     parser.add_argument(
+        "--record-effort",
+        action="store_true",
+        help="write every MIT telemetry packet of this run to logs/effort-*.jsonl",
+    )
+    parser.add_argument(
         "--diagnostic-log",
         default=None,
         help="MIT 100 Hz pre-abort q/qd/q_target JSONL path",

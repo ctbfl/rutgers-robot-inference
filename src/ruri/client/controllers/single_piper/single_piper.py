@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Mapping
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -169,6 +172,7 @@ class SinglePiperController(RobotSetupController):
         self._control: Any | None = None
         self._worker: Any | None = None
         self._devices: RealSenseDevices | None = None
+        self._effort_log: Path | None = None
         self._can: PiperCanDevice | None = None
         self._arm: ArmHardwareRegistration | None = None
         self._arm_started = False
@@ -332,6 +336,16 @@ class SinglePiperController(RobotSetupController):
         self._telemetry = telemetry
         self._teleop_observer_attached = True
 
+    def _effort_log_path(self) -> Path:
+        """Name the effort log like the scheduler names its own, in one place."""
+        if self._effort_log is None:
+            timestamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
+            self._effort_log = (
+                Path(self.config.effort_log_dir)
+                / f"effort-{timestamp}-{os.getpid()}.jsonl"
+            )
+        return self._effort_log
+
     def start_arm(self) -> None:
         """Explicitly start the managed MIT worker; this enables and homes the arm."""
         if not self.is_connected or self._can is None:
@@ -340,6 +354,9 @@ class SinglePiperController(RobotSetupController):
             raise RuntimeError("Single Piper arm is already started")
 
         self._telemetry = self._telemetry_factory(self.config.telemetry_address)
+        if self.config.record_effort:
+            self._telemetry.record_to(self._effort_log_path())
+            logger.info("Recording MIT telemetry to %s", self._effort_log_path())
         self._telemetry.open()
         try:
             self._worker = self._worker_factory(self.config, self._can.interface)

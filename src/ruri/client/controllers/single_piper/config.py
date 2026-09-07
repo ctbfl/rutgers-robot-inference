@@ -42,6 +42,10 @@ class SinglePiperConfig:
     worker_shutdown_timeout_s: float = 45.0
     startup_home_skip_threshold_rad: float = 0.05
     diagnostic_log: Path | None = None
+    #: Keep every MIT telemetry packet of a run, not just the newest one,
+    #: so the effort the arm produced can be read back afterwards.
+    record_effort: bool = False
+    effort_log_dir: Path = Path("logs")
 
     python_executable: Path | None = None
 
@@ -57,7 +61,7 @@ class SinglePiperConfig:
             item.name: get_arg(args, item.name, item.default)
             for item in fields(cls)
         }
-        for name in ("diagnostic_log", "python_executable"):
+        for name in ("diagnostic_log", "effort_log_dir", "python_executable"):
             if values[name] is not None:
                 values[name] = Path(values[name])
         return cls(**values)
