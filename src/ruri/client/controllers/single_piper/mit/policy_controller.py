@@ -31,8 +31,12 @@ from .leader_follower import (
     DEFAULT_RATE_HZ,
     DEFAULT_START_HOME_SPEED,
     FOLLOWER_CAN,
+    GRIPPER_LIMIT_LOWER,
+    GRIPPER_LIMIT_UPPER,
     HOME_SETTLE_SECONDS,
     HOME_TOLERANCE,
+    JOINT_LIMIT_LOWER,
+    JOINT_LIMIT_UPPER,
     N_JOINTS,
     R2D,
     ArmSample,
@@ -60,11 +64,11 @@ DEFAULT_COMMAND_TIMEOUT = 0.30
 MAX_PACKET_BYTES = 8192
 DIAGNOSTIC_HISTORY_SECONDS = 5.0
 
-# Same physical domain used to normalize the demonstrations.
-POLICY_Q_MIN = np.deg2rad(np.array([-150.0, 0.0, -170.0, -100.0, -65.0, -100.0]))
-POLICY_Q_MAX = np.deg2rad(np.array([150.0, 180.0, 0.0, 100.0, 65.0, 130.0]))
-POLICY_GRIPPER_MIN = 0.0
-POLICY_GRIPPER_MAX = 0.068
+# The admission box is the nominal envelope the teleop loop already clamps to,
+# imported rather than restated. A private copy of it here is what silently
+# rejected every legal joint5 target past 65 deg after the measured table
+# replaced the inherited one: this file kept the old numbers, and a rejected
+# command is indistinguishable from one that never arrived.
 
 _running = True
 
@@ -143,12 +147,15 @@ class PolicyCommandReceiver:
             or not math.isfinite(gripper)
         ):
             raise ValueError("policy target must contain finite 6-D q and gripper")
-        if np.any(q < POLICY_Q_MIN) or np.any(q > POLICY_Q_MAX):
+        if np.any(q < JOINT_LIMIT_LOWER) or np.any(q > JOINT_LIMIT_UPPER):
             raise ValueError(
                 "policy joint target is outside the dataset calibration domain"
             )
-        if not POLICY_GRIPPER_MIN <= gripper <= POLICY_GRIPPER_MAX:
-            raise ValueError("policy gripper target is outside [0, 0.068] m")
+        if not GRIPPER_LIMIT_LOWER <= gripper <= GRIPPER_LIMIT_UPPER:
+            raise ValueError(
+                "policy gripper target is outside "
+                f"[{GRIPPER_LIMIT_LOWER:.3f}, {GRIPPER_LIMIT_UPPER:.3f}] m"
+            )
         return PolicyTarget(
             session=session, sequence=sequence, q=q, gripper_width=gripper
         )

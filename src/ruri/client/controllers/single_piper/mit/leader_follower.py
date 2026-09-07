@@ -137,6 +137,13 @@ TAU_CLAMP = np.array([10.0, 12.0, 10.0, 3.0, 3.0, 3.0])
 JOINT_LIMIT_LOWER = np.radians([-154.0, 0.0, -175.0, -106.0, -75.0, -172.0])
 JOINT_LIMIT_UPPER = np.radians([154.0, 195.0, 0.0, 106.0, 75.0, 172.0])
 
+# The same box for the gripper, in metres because that is what the effector and
+# the policy command protocol both speak. Duplicated in the same style and for
+# the same reason as the joint rows above, and held to piper_range.json by
+# tests/test_calibration_ranges.py.
+GRIPPER_LIMIT_LOWER = 0.0
+GRIPPER_LIMIT_UPPER = 0.080
+
 
 _running = True
 
