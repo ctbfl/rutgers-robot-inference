@@ -405,6 +405,14 @@ class SinglePiperController(RobotSetupController):
             raise RuntimeError("start_arm() must complete before reading a full observation")
         cameras = self.get_camera_observation()
         packet = self._telemetry.latest_engaged(self.config.telemetry_timeout_s)
+        if self.config.send_effort:
+            # recording_observation already decodes this packet into the state
+            # and effort pair the datasets were written with, so an effort-
+            # conditioned policy is served the same two vectors it was trained
+            # on. Reused rather than restated: a second decoder here would be
+            # free to drift from the one that produced the training data, and
+            # the arm would be the place that difference showed up.
+            return {**recording_observation(packet), **cameras}
         return {
             "observation.state": normalize_telemetry(packet),
             **cameras,

@@ -88,6 +88,14 @@ def parse_args() -> argparse.Namespace:
         help="write every MIT telemetry packet of this run to logs/effort-*.jsonl",
     )
     parser.add_argument(
+        "--send-effort",
+        action="store_true",
+        help=(
+            "include observation.joint_effort in the observation sent to the "
+            "policy; required by policies that declare it as an input"
+        ),
+    )
+    parser.add_argument(
         "--diagnostic-log",
         default=None,
         help="MIT 100 Hz pre-abort q/qd/q_target JSONL path",

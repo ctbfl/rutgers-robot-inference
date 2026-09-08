@@ -46,6 +46,10 @@ class SinglePiperConfig:
     #: so the effort the arm produced can be read back afterwards.
     record_effort: bool = False
     effort_log_dir: Path = Path("logs")
+    #: Put the measured effort in the observation handed to the policy. Off
+    #: unless the served policy declares observation.joint_effort as an input:
+    #: a policy that was not trained on it has no use for the extra key.
+    send_effort: bool = False
 
     python_executable: Path | None = None
 
