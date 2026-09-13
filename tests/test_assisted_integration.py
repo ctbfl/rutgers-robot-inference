@@ -19,14 +19,21 @@ def udp_address():
 
 class AssistedIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.robot = SinglePiperAssistedController({"simulate": True,
-            "command_address": udp_address(), "telemetry_address": udp_address(),
-            "camera_width": 32, "camera_height": 24, "arm_connect_timeout_s": 5.})
+        self.robot = SinglePiperAssistedController(
+            {
+                "simulate": True,
+                "command_address": udp_address(),
+                "telemetry_address": udp_address(),
+                "camera_width": 32,
+                "camera_height": 24,
+                "arm_connect_timeout_s": 5.0,
+            }
+        )
         self.addCleanup(self.robot.stop)
         self.robot.start()
         self.traces = []
 
-    def drive(self, scheduler, condition, timeout=4.):
+    def drive(self, scheduler, condition, timeout=4.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             sample = self.robot.get_sample()
@@ -34,30 +41,36 @@ class AssistedIntegrationTests(unittest.TestCase):
             scheduler.step(sample)
             if condition():
                 return
-            time.sleep(1./30.)
+            time.sleep(1.0 / 30.0)
         self.fail(f"condition not reached; status={self.robot.status()}")
 
     def test_policy_human_resume_and_version_switch_share_real_worker(self):
         class Policy:
             output_chunk_size = 6
+
             def infer(self, inputs):
                 target = inputs["observation.state"].copy()
-                target[0] += 2.
+                target[0] += 2.0
                 return {"action_chunk": np.tile(target, (6, 1))}
-        scheduler = AssistedScheduler(self.robot, Policy(), policy_version="v0", prompt="test")
+
+        scheduler = AssistedScheduler(
+            self.robot, Policy(), policy_version="v0", prompt="test"
+        )
         self.addCleanup(scheduler.close)
         before = self.robot.get_sample()
         self.assertEqual(before["telemetry"]["control"]["mode"], "HOLD")
-        self.assertEqual(before["observation"]["observation.images.top"].shape, (24,32,3))
+        self.assertEqual(
+            before["observation"]["observation.images.top"].shape, (24, 32, 3)
+        )
         scheduler.resume()
-        self.drive(scheduler, lambda: self.robot.status()["target"][0] > .5)
+        self.drive(scheduler, lambda: self.robot.status()["target"][0] > 0.5)
         self.assertEqual(self.robot.status()["mode"], "POLICY")
         scheduler.takeover()
         self.assertEqual(self.robot.status()["mode"], "HUMAN")
         q = self.robot.get_sample()["observation"]["observation.state"].copy()
-        q[0] += 5.
+        q[0] += 5.0
         self.robot.simulate_leader(q)
-        self.drive(scheduler, lambda: self.robot.status()["target"][0] > 3.)
+        self.drive(scheduler, lambda: self.robot.status()["target"][0] > 3.0)
         scheduler.pause()
         scheduler.replace_policy(Policy(), "v1")
         scheduler.resume()
@@ -72,29 +85,58 @@ class AssistedIntegrationTests(unittest.TestCase):
 
     def test_late_inference_cannot_reclaim_human_control(self):
         entered, release = threading.Event(), threading.Event()
+
         class SlowPolicy:
             output_chunk_size = 4
+
             def infer(self, inputs):
                 entered.set()
-                release.wait(3.)
-                return {"action_chunk": np.tile(inputs["observation.state"], (4,1))}
-        scheduler = AssistedScheduler(self.robot, SlowPolicy(), policy_version="slow", prompt="test",
-                                      inference_timeout_s=.1)
+                release.wait(3.0)
+                return {"action_chunk": np.tile(inputs["observation.state"], (4, 1))}
+
+        scheduler = AssistedScheduler(
+            self.robot,
+            SlowPolicy(),
+            policy_version="slow",
+            prompt="test",
+            inference_timeout_s=0.1,
+        )
         self.addCleanup(scheduler.close)
         self.addCleanup(release.set)
         scheduler.resume()
         self.drive(scheduler, entered.is_set)
         start = time.monotonic()
         scheduler.takeover()
-        self.assertLess(time.monotonic() - start, .2)
+        self.assertLess(time.monotonic() - start, 0.2)
         # Exceed the inference deadline during human control. It must not issue
         # HOLD or interrupt the operator because of an obsolete GPU request.
-        time.sleep(.15)
+        time.sleep(0.15)
         scheduler.step(self.robot.get_sample())
         self.assertEqual(self.robot.status()["mode"], "HUMAN")
         release.set()
         self.drive(scheduler, lambda: scheduler.discarded_results == 1)
         self.assertEqual(self.robot.status()["mode"], "HUMAN")
+
+    def test_wrong_served_version_enters_hold_without_executing_chunk(self):
+        class WrongVersion:
+            output_chunk_size = 4
+
+            def infer(self, inputs):
+                return {
+                    "action_chunk": np.tile(inputs["observation.state"] + 10.0, (4, 1)),
+                    "policy_version": "wrong",
+                }
+
+        scheduler = AssistedScheduler(
+            self.robot, WrongVersion(), policy_version="expected", prompt="test"
+        )
+        self.addCleanup(scheduler.close)
+        initial = np.array(self.robot.status()["target"])
+        scheduler.resume()
+        with self.assertRaisesRegex(RuntimeError, "policy inference failed"):
+            self.drive(scheduler, lambda: False)
+        self.assertEqual(self.robot.status()["mode"], "HOLD")
+        np.testing.assert_allclose(self.robot.status()["target"], initial)
 
 
 if __name__ == "__main__":

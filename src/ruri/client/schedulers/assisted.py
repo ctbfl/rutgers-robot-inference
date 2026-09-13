@@ -7,11 +7,11 @@ chunk execution and control-mode requests. Inference never holds the mode lock.
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass
 import queue
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -28,13 +28,25 @@ class InferenceToken:
 
 
 class AssistedScheduler:
-    def __init__(self, controller, policy, *, policy_version, prompt,
-                 control_hz=30., inference_timeout_s=5., max_target_speed=20.,
-                 execution_horizon=None):
+    def __init__(
+        self,
+        controller,
+        policy,
+        *,
+        policy_version,
+        prompt,
+        control_hz=30.0,
+        inference_timeout_s=5.0,
+        max_target_speed=20.0,
+        execution_horizon=None,
+    ):
         if not policy_version or not prompt:
             raise ValueError("policy_version and prompt are required")
-        for name, value in (("control_hz", control_hz), ("inference_timeout_s", inference_timeout_s),
-                            ("max_target_speed", max_target_speed)):
+        for name, value in (
+            ("control_hz", control_hz),
+            ("inference_timeout_s", inference_timeout_s),
+            ("max_target_speed", max_target_speed),
+        ):
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         self.controller, self.policy = controller, policy
@@ -42,7 +54,9 @@ class AssistedScheduler:
         self.control_hz, self.timeout = control_hz, inference_timeout_s
         self.max_target_speed = max_target_speed
         self.horizon = int(policy.output_chunk_size)
-        self.execute = self.horizon if execution_horizon is None else int(execution_horizon)
+        self.execute = (
+            self.horizon if execution_horizon is None else int(execution_horizon)
+        )
         if not 1 <= self.execute <= self.horizon:
             raise ValueError("execution_horizon must fit the model's output chunk")
         self._generation = 0
@@ -54,7 +68,9 @@ class AssistedScheduler:
         self._results = queue.Queue(maxsize=2)
         self._closed = threading.Event()
         self._lock = threading.RLock()
-        self._thread = threading.Thread(target=self._infer, name="assisted-inference", daemon=True)
+        self._thread = threading.Thread(
+            target=self._infer, name="assisted-inference", daemon=True
+        )
         self._thread.start()
         self.last_step = {}
         self.discarded_results = 0
@@ -70,9 +86,18 @@ class AssistedScheduler:
             token, policy, inputs, horizon = item
             try:
                 result = policy.infer(inputs)
+                if (
+                    result.get("policy_version", token.policy_version)
+                    != token.policy_version
+                ):
+                    raise ValueError(
+                        "inference response came from a different policy version"
+                    )
                 chunk = np.asarray(result["action_chunk"], dtype=np.float32)
                 if chunk.shape != (horizon, 7) or not np.all(np.isfinite(chunk)):
-                    raise ValueError(f"policy returned invalid chunk {chunk.shape}; expected {(horizon, 7)}")
+                    raise ValueError(
+                        f"policy returned invalid chunk {chunk.shape}; expected {(horizon, 7)}"
+                    )
                 output = (token, chunk, None)
             except Exception as exc:
                 output = (token, None, exc)
@@ -108,7 +133,9 @@ class AssistedScheduler:
         with self._lock:
             state = self.controller.status()
             if state["mode"] != "HOLD":
-                raise RuntimeError("release human control into HOLD before resuming policy")
+                raise RuntimeError(
+                    "release human control into HOLD before resuming policy"
+                )
             self._invalidate()
             self._want_policy = True
 
@@ -118,7 +145,9 @@ class AssistedScheduler:
                 raise RuntimeError("pause before replacing policy")
             horizon = int(policy.output_chunk_size)
             if horizon != self.horizon:
-                raise ValueError("policy replacement changed the configured action horizon")
+                raise ValueError(
+                    "policy replacement changed the configured action horizon"
+                )
             if not version:
                 raise ValueError("immutable policy version is required")
             self._invalidate()
@@ -145,18 +174,25 @@ class AssistedScheduler:
                     break
                 if token == self._pending:
                     self._pending = None
-                if (token.generation != self._generation or token.epoch != state["epoch"]
-                        or token.policy_version != self.policy_version or not self._want_policy):
+                if (
+                    token.generation != self._generation
+                    or token.epoch != state["epoch"]
+                    or token.policy_version != self.policy_version
+                    or not self._want_policy
+                ):
                     self.discarded_results += 1
                     continue
                 if error is not None:
                     self.pause()
                     raise RuntimeError("policy inference failed; holding") from error
-                self._chunk = deque(enumerate(chunk[:self.execute]))
+                self._chunk = deque(enumerate(chunk[: self.execute]))
                 self._chunk_token = token
-            if (self._pending is not None and self._want_policy
-                    and self._pending.generation == self._generation
-                    and time.monotonic() - self._pending.sent_at > self.timeout):
+            if (
+                self._pending is not None
+                and self._want_policy
+                and self._pending.generation == self._generation
+                and time.monotonic() - self._pending.sent_at > self.timeout
+            ):
                 self.pause()
                 raise TimeoutError("policy inference deadline exceeded; holding")
             self.last_step = {"waiting": False, "policy_version": self.policy_version}
@@ -180,19 +216,35 @@ class AssistedScheduler:
                 row, proposal = self._chunk.popleft()
                 target, clipped = clip_target(self.controller, proposal)
                 max_step = self.max_target_speed / self.control_hz
-                target = self._last_target + np.clip(target - self._last_target, -max_step, max_step)
+                target = self._last_target + np.clip(
+                    target - self._last_target, -max_step, max_step
+                )
                 self.controller.send_action(target)
                 self._last_target = target.copy()
-                self.last_step.update({"command_id": self.controller.last_command_id,
-                                       "proposal": proposal.copy(), "target": target.copy(), "clipped": clipped,
-                                       "row": row, "inference": self._chunk_token})
+                self.last_step.update(
+                    {
+                        "command_id": self.controller.last_command_id,
+                        "proposal": proposal.copy(),
+                        "target": target.copy(),
+                        "clipped": clipped,
+                        "row": row,
+                        "inference": self._chunk_token,
+                    }
+                )
             else:
                 self.last_step["waiting"] = True
                 if self._pending is None:
-                    token = InferenceToken(self._generation, state["epoch"], self.policy_version,
-                                           sample["observation_id"], time.monotonic())
+                    token = InferenceToken(
+                        self._generation,
+                        state["epoch"],
+                        self.policy_version,
+                        sample["observation_id"],
+                        time.monotonic(),
+                    )
                     inputs = {**sample["observation"], "prompt": self.prompt}
-                    self._requests.put_nowait((token, self.policy, inputs, self.horizon))
+                    self._requests.put_nowait(
+                        (token, self.policy, inputs, self.horizon)
+                    )
                     self._pending = token
                 # Keep the MIT reference alive while the bounded inference call
                 # runs. The separately enforced inference deadline still holds.
