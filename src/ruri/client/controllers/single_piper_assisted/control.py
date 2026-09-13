@@ -1,6 +1,6 @@
 """Deterministic control authority and references, independent of sockets/SDK.
 
-Policy drives the leader; the follower tracks its measured, mapped position.
+Policy sets a shared virtual leader reference, sent directly to both arms.
 Physical correction labels never revoke policy execution authority. Explicit
 manual HUMAN mode remains available with an anchored relative reference.
 There are deliberately no episode, dataset, model or reward concepts here.
@@ -22,7 +22,7 @@ from ruri.client.controllers.single_piper.normalization import normalize_pose
 
 from .config import SinglePiperAssistedConfig
 
-PROTOCOL = "ruri_assisted_control_v2"
+PROTOCOL = "ruri_assisted_control_v3"
 
 
 def pose(values) -> np.ndarray:
@@ -99,9 +99,9 @@ class AssistedControl:
         self.intervention_id = 0
         self.correcting = False
         self._deviation_since = self._agreement_since = None
-        self._replan_anchor = self.target.copy()
         self.policy_error = np.zeros(7)
         self.coupling_error = np.zeros(7)
+        self._previous_leader = (self.leader - self.offset) * self.sign
         self.source = "hold"
 
     def mapped(self, follower):
@@ -131,6 +131,7 @@ class AssistedControl:
         self._deviation_since = self._agreement_since = None
         self.source = "human" if mode == "HUMAN" else "hold"
         self.policy_reference = (self.leader - self.offset) * self.sign
+        self._previous_leader = self.policy_reference.copy()
         self.policy_observation_ns = None
         if mode == "HUMAN":
             self.intervention_id += 1
@@ -208,23 +209,19 @@ class AssistedControl:
             target = pose(packet.get("target"))
             if np.any(target < self.lower - 1e-7) or np.any(target > self.upper + 1e-7):
                 raise ValueError("target outside common leader/follower bounds")
-            # Scheduler bounds the final policy reference. Actual follower
-            # targets follow measured leader motion and are logged separately.
-            elapsed = max(
-                1.0 / self.config.mit_rate_hz, min(now - self.last_command, 0.1)
-            )
-            speed = np.r_[
-                np.full(6, self.config.max_reference_speed),
-                self.config.gripper_reference_speed,
-            ]
-            if model_action and np.any(
-                np.abs(target - self.policy_reference) > speed * elapsed + 1e-6
+            # Match the existing direct MIT policy path: no additional slew
+            # filter. Reject a gross tracking jump instead of changing its value.
+            if (
+                model_action
+                and np.max(np.abs(target[:6] - self.follower[:6]))
+                > self.config.max_track_error
             ):
-                raise ValueError("policy reference jump exceeds admission speed")
+                raise ValueError("policy target exceeds follower tracking envelope")
             if model_action:
                 self.policy_reference = target
                 self.policy_observation_ns = observation_ns
                 self.policy_valid = True
+                self.target = target.copy()
                 self.leader_target = self.mapped(target)
             self.mode, self.armed, self.reason = "POLICY", False, "policy command"
             self.command_id = sequence
@@ -266,8 +263,8 @@ class AssistedControl:
         """Revoke old predictions, not execution authority or leader/follower coupling."""
         self.reference_revision += 1
         self.policy_reference = np.clip(leader, self.lower, self.upper)
-        self.leader_target = self.mapped(self.policy_reference)
-        self._replan_anchor = leader.copy()
+        self.target = self.policy_reference.copy()
+        self.leader_target = self.mapped(self.target)
         self.policy_valid = False
         self.policy_observation_ns = None
         self._agreement_since = None
@@ -275,8 +272,8 @@ class AssistedControl:
     def _coupled_tick(self, now, dt):
         c = self.config
         leader = (self.leader - self.offset) * self.sign
-        # The follower follows measured leader motion regardless of the label.
-        # Policy drives only the leader reference; no inferred hand-release gate.
+        delta = leader - self._previous_leader
+        self._previous_leader = leader.copy()
         self.coupling_error = leader - self.follower
         self.policy_error = leader - self.policy_reference
         if (
@@ -290,16 +287,19 @@ class AssistedControl:
         release = np.r_[
             np.full(6, c.intervention_release_rad), c.intervention_gripper_release_m
         ]
-        divergent = self.policy_valid and bool(
-            np.any(np.abs(self.policy_error) > entry)
-        )
-        # A blocked follower is not evidence of a human correction on the leader.
+        shared_error = leader - self.target
+        # A passive leader travelling toward the shared target does not move
+        # that target. This prevents normal mechanical lag becoming a cascade.
+        toward = np.sign(shared_error) * delta < -np.r_[np.full(6, 0.005), 0.001] * dt
+        separated = np.abs(self.coupling_error) > release
+        displaced = np.abs(shared_error) > entry
+        override = bool(np.any(displaced & separated & ~toward))
         follower_healthy = (
             np.max(np.abs(self.follower[:6] - self.target[:6])) < c.max_track_error
             and abs(self.follower[6] - self.target[6]) < 0.015
         )
         if not self.correcting:
-            if divergent and follower_healthy:
+            if self.policy_valid and override and follower_healthy:
                 if self._deviation_since is None:
                     self._deviation_since = now
                 if now - self._deviation_since >= c.intervention_confirm_s:
@@ -309,14 +309,25 @@ class AssistedControl:
             else:
                 self._deviation_since = None
         else:
-            moved = (
-                np.max(np.abs(leader[:6] - self._replan_anchor[:6]))
-                > c.replan_distance_rad
-                or abs(leader[6] - self._replan_anchor[6])
-                > c.intervention_gripper_error_m
-            )
-            if moved and (divergent or not self.policy_valid):
-                self._rebase_policy(leader)
+            # During a correction, smaller outward manual motion can update the
+            # shared reference. Fresh model targets still drive BOTH arms right
+            # away, even while the data label remains human/transition.
+            outward = np.sign(shared_error) * delta > 1e-8
+            manual_motion = bool(np.any(outward & (np.abs(shared_error) > release)))
+            if not self.policy_valid or override or manual_motion:
+                speed = np.r_[
+                    np.full(6, c.max_reference_speed), c.gripper_reference_speed
+                ]
+                corrected = self.target + np.clip(
+                    np.clip(leader, self.lower, self.upper) - self.target,
+                    -speed * dt,
+                    speed * dt,
+                )
+                if np.any(np.abs(corrected - self.target) > 1e-9):
+                    # The RTC prefix is no longer the trajectory being executed.
+                    # Invalidate it on every manual reference edit, even if an
+                    # older inference is still in flight (it remains auditable).
+                    self._rebase_policy(corrected)
             agrees = self.policy_valid and bool(
                 np.all(np.abs(self.policy_error) < release)
             )
@@ -340,13 +351,10 @@ class AssistedControl:
             )
         )
         if not self.policy_valid:
-            # While awaiting a fresh result, keep supporting the current leader
-            # pose. Never pull back to the checkpoint's pre-correction reference.
-            self.policy_reference = np.clip(leader, self.lower, self.upper)
-            self.leader_target = self.mapped(self.policy_reference)
-        desired = np.clip(leader, self.lower, self.upper)
-        step = np.r_[np.full(6, c.max_reference_speed), c.gripper_reference_speed] * dt
-        self.target += np.clip(desired - self.target, -step, step)
+            self.policy_reference = self.target.copy()
+        # The virtual leader is the one shared reference. The physical leader
+        # is a parallel actuator/input device, never in the policy -> follower path.
+        self.leader_target = self.mapped(self.target)
 
     def tick(self, leader, follower, now: float | None = None):
         now = self.clock() if now is None else now
@@ -404,7 +412,10 @@ class AssistedControl:
             "epoch": self.epoch,
             "mode": self.mode,
             "source": self.source,
-            "control_schema": "ruri_coupled_policy_v1",
+            "control_schema": "ruri_virtual_leader_rtc_v1",
+            "virtual_reference": normalize_pose(
+                self.target[:6], self.target[6]
+            ).tolist(),
             "reference_revision": self.reference_revision,
             "policy_reference": normalize_pose(
                 self.policy_reference[:6], self.policy_reference[6]

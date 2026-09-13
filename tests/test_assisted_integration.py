@@ -53,7 +53,11 @@ class AssistedIntegrationTests(unittest.TestCase):
             def infer(self, inputs):
                 target = inputs["observation.state"].copy()
                 target[0] += 2.0
-                return {"action_chunk": np.tile(target, (6, 1))}
+                return {
+                    "action_chunk": np.tile(target, (6, 1)),
+                    "rtc.applied": True,
+                    "rtc.method": "training-time",
+                }
 
         scheduler = AssistedScheduler(
             self.robot, Policy(), policy_version="v0", prompt="test"
@@ -94,7 +98,10 @@ class AssistedIntegrationTests(unittest.TestCase):
             def infer(self, inputs):
                 entered.set()
                 release.wait(3.0)
-                return {"action_chunk": np.tile(inputs["observation.state"], (4, 1))}
+                return {
+                    "action_chunk": np.tile(inputs["observation.state"], (4, 1)),
+                    "rtc.applied": True,
+                }
 
         scheduler = AssistedScheduler(
             self.robot,
@@ -152,7 +159,10 @@ class AssistedIntegrationTests(unittest.TestCase):
                 if len(states) == 2:
                     entered.set()
                     release.wait(2.0)
-                return {"action_chunk": np.tile(inputs["observation.state"], (12, 1))}
+                return {
+                    "action_chunk": np.tile(inputs["observation.state"], (12, 1)),
+                    "rtc.applied": True,
+                }
 
         scheduler = AssistedScheduler(
             self.robot, Policy(), policy_version="continuous", prompt="test"
@@ -172,7 +182,9 @@ class AssistedIntegrationTests(unittest.TestCase):
         self.drive(
             scheduler, lambda: scheduler.discarded_results >= 1 and len(states) >= 4
         )
-        self.assertGreater(states[-1][0], target[0] - 0.8)
+        # The next query uses the actual follower observation during catch-up,
+        # not a fictitious exact copy of the human's leader pose.
+        self.assertGreater(states[-1][0], target[0] - 1.5)
         self.drive(scheduler, lambda: self.robot.status()["source"] == "policy")
         self.assertEqual(self.robot.status()["epoch"], epoch)
         self.assertEqual(self.robot.status()["intervention_id"], 1)

@@ -55,14 +55,14 @@ class CoupledControlTests(unittest.TestCase):
         self.assertTrue(self.control.correcting)
         return leader
 
-    def test_follower_tracks_actual_leader_before_detection_and_policy_never_disarms(
+    def test_manual_correction_updates_shared_reference_without_disarming(
         self,
     ):
         epoch = self.control.epoch
         leader = self.q.copy()
         leader[0] += 0.09
         self.tick(leader)
-        self.assertGreater(self.control.target[0], 0.0)
+        self.assertEqual(self.control.target[0], 0.0)
         self.assertFalse(self.control.correcting)
         self.intervene()
         self.assertEqual(self.control.mode, "POLICY")
@@ -128,10 +128,12 @@ class CoupledControlTests(unittest.TestCase):
         self.control = AssistedControl(config, self.q, self.q, clock=lambda: self.now)
         self.send("mode", mode="POLICY", request_id="mapped")
         self.send("target", target=self.q.tolist())
-        leader = self.q.copy()
-        leader[0] -= 0.02
-        self.tick(leader)
-        self.assertGreater(self.control.target[0], 0.0)
+        target = self.q.copy()
+        target[0] += 0.02
+        self.send("target", target=target.tolist())
+        self.tick(self.q)
+        np.testing.assert_allclose(self.control.target, target)
+        self.assertAlmostEqual(self.control.leader_target[0], -0.02)
 
     def test_observation_expiry_is_not_refreshed_by_keepalive_commands(self):
         self.control.config = replace(self.control.config, policy_max_age_s=0.1)
@@ -150,6 +152,43 @@ class CoupledControlTests(unittest.TestCase):
         self.assertFalse(self.control.policy_valid)
         self.assertTrue(self.send("target", target=self.q.tolist()))
         self.assertTrue(self.control.policy_valid)
+
+    def test_virtual_reference_drives_both_arms_without_leader_response(self):
+        target = self.q.copy()
+        target[0] += 0.08
+        target[6] += 0.012
+        self.assertTrue(self.send("target", target=target.tolist()))
+        # Both motors have not moved yet: policy targets must still reach both
+        # outputs exactly, including the gripper, without a second slew filter.
+        self.tick(self.q, self.q)
+        np.testing.assert_allclose(self.control.target, target)
+        np.testing.assert_allclose(self.control.leader_target, target)
+        self.assertFalse(self.control.correcting)
+
+    def test_passive_leader_lag_does_not_steer_the_virtual_reference(self):
+        leader = self.q.copy()
+        for i in range(20):
+            target = self.q.copy()
+            target[0] = 0.04 + i * 0.005
+            leader[0] = i * 0.003
+            self.assertTrue(self.send("target", target=target.tolist()))
+            self.tick(leader, target)
+            np.testing.assert_allclose(self.control.target, target)
+            np.testing.assert_allclose(self.control.leader_target, target)
+        self.assertEqual(self.control.intervention_id, 0)
+
+    def test_corrected_virtual_reference_is_shared_and_policy_can_move_it_immediately(
+        self,
+    ):
+        leader = self.intervene()
+        np.testing.assert_allclose(self.control.leader_target, self.control.target)
+        target = leader.copy()
+        target[0] += 0.08
+        self.assertTrue(self.send("target", target=target.tolist()))
+        np.testing.assert_allclose(self.control.target, target)
+        np.testing.assert_allclose(self.control.leader_target, target)
+        # A still-human data label is not an authority gate for a fresh policy.
+        self.assertTrue(self.control.correcting)
 
 
 if __name__ == "__main__":

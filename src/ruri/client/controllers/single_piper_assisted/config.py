@@ -24,7 +24,6 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
     intervention_gripper_release_m: float = 0.001
     intervention_confirm_s: float = 0.04
     intervention_release_s: float = 0.4
-    replan_distance_rad: float = 0.05
     policy_max_age_s: float = 1.0
     leader_sign: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     leader_offset_rad: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -61,7 +60,6 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
             ("intervention_gripper_release_m", 0.0001, 0.01),
             ("intervention_confirm_s", 0.01, 0.5),
             ("intervention_release_s", 0.1, 2.0),
-            ("replan_distance_rad", 0.01, 0.3),
             ("policy_max_age_s", 0.1, 5.0),
         ):
             value = getattr(self, name)
