@@ -33,6 +33,7 @@ class SimulatedRig:
         self.previous = self.leader.copy(), self.follower.copy()
         self.samples = None
         self.enabled = False
+        self.human_until = 0.0
 
     def read(self):
         return self.leader.copy(), self.follower.copy()
@@ -45,12 +46,15 @@ class SimulatedRig:
 
     def send(self, control, dt):
         self.previous = self.leader.copy(), self.follower.copy()
-        if control.mode != "HUMAN":
+        if control.mode != "HUMAN" and time.monotonic() >= self.human_until:
             self.leader += np.clip(control.leader_target - self.leader, -dt, dt)
         self.follower += np.clip(control.target - self.follower, -dt, dt)
 
-    def human(self, target):
+    def human(self, target, duration_s=0.0):
+        if not np.isfinite(duration_s) or not 0 <= duration_s <= 10.0:
+            raise ValueError("simulated human duration must be in [0,10] seconds")
         self.leader = pose(target)
+        self.human_until = time.monotonic() + duration_s
 
     def telemetry(self):
         return {
@@ -371,8 +375,10 @@ def run(
                     if packet.get("kind") == "simulation_leader" and config.simulate:
                         target = packet.get("target")
                         admitted = control.receive({**packet, "kind": "heartbeat"})
-                        if admitted and control.mode == "HUMAN":
-                            rig.human(target)
+                        if admitted and control.mode in ("HUMAN", "POLICY"):
+                            rig.human(target, packet.get("duration_s", 0.0))
+                            leader, follower = rig.read()
+                            control.leader, control.follower = leader, follower
                     else:
                         control.receive(packet)
                 except (ValueError, TypeError):

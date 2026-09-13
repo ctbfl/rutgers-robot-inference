@@ -18,6 +18,14 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
     human_reference_speed: float = 0.5
     gripper_reference_speed: float = 0.04
     heartbeat_timeout_s: float = 0.5
+    intervention_error_rad: float = 0.035
+    intervention_release_rad: float = 0.012
+    intervention_gripper_error_m: float = 0.003
+    intervention_gripper_release_m: float = 0.001
+    intervention_confirm_s: float = 0.04
+    intervention_release_s: float = 0.4
+    replan_distance_rad: float = 0.05
+    policy_max_age_s: float = 1.0
     leader_sign: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     leader_offset_rad: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     trace_queue_size: int = 4096
@@ -47,10 +55,25 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
             ("human_reference_speed", 0.01, 2.0),
             ("gripper_reference_speed", 0.001, 0.1),
             ("heartbeat_timeout_s", 0.1, 2.0),
+            ("intervention_error_rad", 0.005, 0.2),
+            ("intervention_release_rad", 0.001, 0.1),
+            ("intervention_gripper_error_m", 0.001, 0.02),
+            ("intervention_gripper_release_m", 0.0001, 0.01),
+            ("intervention_confirm_s", 0.01, 0.5),
+            ("intervention_release_s", 0.1, 2.0),
+            ("replan_distance_rad", 0.01, 0.3),
+            ("policy_max_age_s", 0.1, 5.0),
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or not low <= value <= high:
                 raise ValueError(f"{name} must be finite in [{low}, {high}]")
+        if (
+            self.intervention_release_rad >= self.intervention_error_rad
+            or self.intervention_gripper_release_m >= self.intervention_gripper_error_m
+        ):
+            raise ValueError(
+                "intervention release thresholds must be below entry thresholds"
+            )
         if len(self.leader_sign) != 6 or any(
             v not in (-1.0, 1.0) for v in self.leader_sign
         ):

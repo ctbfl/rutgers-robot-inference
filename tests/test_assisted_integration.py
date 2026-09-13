@@ -32,13 +32,15 @@ class AssistedIntegrationTests(unittest.TestCase):
         self.addCleanup(self.robot.stop)
         self.robot.start()
         self.traces = []
+        self.inference_results = []
 
     def drive(self, scheduler, condition, timeout=4.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             sample = self.robot.get_sample()
             self.traces.extend(sample["trace"]["packets"])
-            scheduler.step(sample)
+            result = scheduler.step(sample)
+            self.inference_results.extend(result.get("inference_results", []))
             if condition():
                 return
             time.sleep(1.0 / 30.0)
@@ -137,6 +139,54 @@ class AssistedIntegrationTests(unittest.TestCase):
             self.drive(scheduler, lambda: False)
         self.assertEqual(self.robot.status()["mode"], "HOLD")
         np.testing.assert_allclose(self.robot.status()["target"], initial)
+
+    def test_automatic_correction_keeps_inference_running_and_rejects_old_result(self):
+        entered, release = threading.Event(), threading.Event()
+        states = []
+
+        class Policy:
+            output_chunk_size = 12
+
+            def infer(self, inputs):
+                states.append(inputs["observation.state"].copy())
+                if len(states) == 2:
+                    entered.set()
+                    release.wait(2.0)
+                return {"action_chunk": np.tile(inputs["observation.state"], (12, 1))}
+
+        scheduler = AssistedScheduler(
+            self.robot, Policy(), policy_version="continuous", prompt="test"
+        )
+        self.addCleanup(scheduler.close)
+        self.addCleanup(release.set)
+        scheduler.resume()
+        self.drive(scheduler, entered.is_set)
+        epoch = self.robot.status()["epoch"]
+        target = states[-1].copy()
+        target[0] += 4.0
+        self.robot.simulate_leader(target, duration_s=0.5)
+        self.drive(scheduler, lambda: self.robot.status()["intervention_active"])
+        self.assertEqual(self.robot.status()["mode"], "POLICY")
+        self.assertEqual(self.robot.status()["epoch"], epoch)
+        release.set()
+        self.drive(
+            scheduler, lambda: scheduler.discarded_results >= 1 and len(states) >= 4
+        )
+        self.assertGreater(states[-1][0], target[0] - 0.8)
+        self.drive(scheduler, lambda: self.robot.status()["source"] == "policy")
+        self.assertEqual(self.robot.status()["epoch"], epoch)
+        self.assertEqual(self.robot.status()["intervention_id"], 1)
+        self.assertLess(np.max(np.abs(self.robot.status()["coupling_error"])), 0.02)
+        # Periodic inference was issued while a previous chunk still had rows.
+        self.assertGreater(len(states), 3)
+        obsolete = [
+            r
+            for r in self.inference_results
+            if r["disposition"] == "discarded_obsolete"
+        ]
+        self.assertTrue(obsolete)
+        np.testing.assert_allclose(obsolete[0]["action_chunk"][0], states[1])
+        self.assertEqual(obsolete[0]["inference"].epoch, epoch)
 
 
 if __name__ == "__main__":

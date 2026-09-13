@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
-from pathlib import Path
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from dataclasses import asdict
+from pathlib import Path
 
 import numpy as np
 
@@ -17,9 +17,16 @@ from ruri.client.controllers.robot_setup_controller import RobotSetupController
 from ruri.client.controllers.single_piper import SinglePiperController
 from ruri.client.controllers.single_piper.mit_process import ManagedMITProcess
 from ruri.client.controllers.single_piper.normalization import (
-    denormalize_action, normalize_pose, normalize_teleop_target, recording_observation, validate_action,
+    denormalize_action,
+    normalize_pose,
+    normalize_teleop_target,
+    recording_observation,
+    validate_action,
 )
-from ruri.client.controllers.single_piper_leader_follower_teleop import SinglePiperLeaderFollowerTeleopController
+from ruri.client.controllers.single_piper_leader_follower_teleop import (
+    SinglePiperLeaderFollowerTeleopController,
+)
+
 from .config import SinglePiperAssistedConfig
 from .control import synchronized_bounds
 from .io import AssistedIO
@@ -33,14 +40,35 @@ class ManagedAssistedProcess(ManagedMITProcess):
     def start(self):
         if self.running:
             raise RuntimeError("assisted worker is already running")
-        config_json = json.dumps(asdict(self.config), default=lambda v: str(v) if isinstance(v, Path) else v)
-        command = [str(self.config.python_executable or sys.executable), "-u", "-m",
-                   "ruri.client.controllers.single_piper.mit.assisted", "--config-json", config_json,
-                   "--worker-session", self.session]
+        config_json = json.dumps(
+            asdict(self.config), default=lambda v: str(v) if isinstance(v, Path) else v
+        )
+        command = [
+            str(self.config.python_executable or sys.executable),
+            "-u",
+            "-m",
+            "ruri.client.controllers.single_piper.mit.assisted",
+            "--config-json",
+            config_json,
+            "--worker-session",
+            self.session,
+        ]
         if not self.config.simulate:
-            command += ["--leader-can", self.leader_can, "--follower-can", self.can_interface, "--execute"]
-        self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        text=True, bufsize=1, start_new_session=True)
+            command += [
+                "--leader-can",
+                self.leader_can,
+                "--follower-can",
+                self.can_interface,
+                "--execute",
+            ]
+        self.process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
         self._log_thread = threading.Thread(target=self._copy_logs, daemon=True)
         self._log_thread.start()
 
@@ -51,7 +79,7 @@ class ManagedAssistedProcess(ManagedMITProcess):
             super().stop(allow_watchdog_recovery=False)
         finally:
             if self._log_thread is not None:
-                self._log_thread.join(timeout=1.)
+                self._log_thread.join(timeout=1.0)
             if process is not None and process.stdout is not None:
                 process.stdout.close()
 
@@ -78,7 +106,9 @@ class SinglePiperAssistedController(RobotSetupController):
     def action_bounds(self):
         if self._io is not None:
             state = self._io.snapshot()["control"]
-            return np.asarray(state["action_lower"], dtype=np.float32), np.asarray(state["action_upper"], dtype=np.float32)
+            return np.asarray(state["action_lower"], dtype=np.float32), np.asarray(
+                state["action_upper"], dtype=np.float32
+            )
         low, high = synchronized_bounds(self.config)
         return normalize_pose(low[:6], low[6]), normalize_pose(high[:6], high[6])
 
@@ -104,13 +134,19 @@ class SinglePiperAssistedController(RobotSetupController):
         try:
             self._io = AssistedIO(self.config, self._session)
             can = {} if self._discovery is None else self._discovery.status()
-            self._worker = ManagedAssistedProcess(self.config, self._session,
-                                                 can.get("leader_can_interface"), can.get("follower_can_interface"))
+            self._worker = ManagedAssistedProcess(
+                self.config,
+                self._session,
+                can.get("leader_can_interface"),
+                can.get("follower_can_interface"),
+            )
             self._worker.start()
             deadline = time.monotonic() + self.config.arm_connect_timeout_s
             while True:
                 if not self._worker.running:
-                    raise RuntimeError(f"assisted worker exited: {list(self._worker.logs)[-20:]}")
+                    raise RuntimeError(
+                        f"assisted worker exited: {list(self._worker.logs)[-20:]}"
+                    )
                 try:
                     packet = self._io.snapshot(wait_s=0.1)
                     if packet["phase"] == "engaged":
@@ -118,7 +154,9 @@ class SinglePiperAssistedController(RobotSetupController):
                     raise RuntimeError(f"worker startup failed: {packet.get('reason')}")
                 except TimeoutError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError(f"assisted worker not ready: {list(self._worker.logs)[-20:]}")
+                        raise TimeoutError(
+                            f"assisted worker not ready: {list(self._worker.logs)[-20:]}"
+                        )
         except BaseException:
             self.disconnect()
             raise
@@ -127,9 +165,14 @@ class SinglePiperAssistedController(RobotSetupController):
         if self._io is None:
             return {"connected": self.is_connected, "mode": "STOPPED"}
         packet = self._io.snapshot()
-        return {**packet["control"], "connected": self.is_connected,
-                "phase": packet["phase"], "target": normalize_teleop_target(packet),
-                "monotonic_ns": packet["monotonic_ns"], "sequence": packet["sequence"]}
+        return {
+            **packet["control"],
+            "connected": self.is_connected,
+            "phase": packet["phase"],
+            "target": normalize_teleop_target(packet),
+            "monotonic_ns": packet["monotonic_ns"],
+            "sequence": packet["sequence"],
+        }
 
     def request_mode(self, mode):
         if self._io is None:
@@ -139,17 +182,32 @@ class SinglePiperAssistedController(RobotSetupController):
             self._policy_epoch = result["epoch"]
         return result
 
-    def send_action(self, action):
+    def send_action(
+        self, action, *, reference_revision=None, observation_ns=None, model_action=True
+    ):
         if self._io is None or self._policy_epoch is None:
             raise RuntimeError("POLICY must be explicitly armed before sending targets")
         q, grip = denormalize_action(validate_action(action))
-        self.last_command_id = self._io.send("target", epoch=self._policy_epoch, target=np.r_[q, grip].tolist())
+        if reference_revision is None:
+            reference_revision = self.status()["reference_revision"]
+        self.last_command_id = self._io.send(
+            "target",
+            epoch=self._policy_epoch,
+            target=np.r_[q, grip].tolist(),
+            reference_revision=reference_revision,
+            observation_ns=time.monotonic_ns()
+            if observation_ns is None
+            else observation_ns,
+            model_action=model_action,
+        )
 
-    def simulate_leader(self, normalized_pose):
+    def simulate_leader(self, normalized_pose, *, duration_s=0.0):
         if not self.config.simulate or self._io is None:
             raise RuntimeError("leader injection is available only in simulation")
         q, grip = denormalize_action(normalized_pose)
-        self._io.send("simulation_leader", target=np.r_[q, grip].tolist())
+        self._io.send(
+            "simulation_leader", target=np.r_[q, grip].tolist(), duration_s=duration_s
+        )
 
     def _images(self):
         images, times = {}, {}
@@ -157,15 +215,23 @@ class SinglePiperAssistedController(RobotSetupController):
             if self.config.simulate:
                 # Changing RGB buffers exercise real image storage/encoding.
                 stamp = time.monotonic_ns()
-                image = np.zeros((self.config.camera_height, self.config.camera_width, 3), dtype=np.uint8)
+                image = np.zeros(
+                    (self.config.camera_height, self.config.camera_width, 3),
+                    dtype=np.uint8,
+                )
                 image[..., 0] = self._observation_sequence % 256
-                image[..., 1 if name == "top" else 2] = np.arange(image.shape[1], dtype=np.uint8)
+                image[..., 1 if name == "top" else 2] = np.arange(
+                    image.shape[1], dtype=np.uint8
+                )
             else:
                 camera = self._camera_owner.cameras[name]
                 # LeRobot 0.6.1 publishes these together under frame_lock. Its
                 # stamp is host post-receive perf_counter, not sensor exposure.
                 with camera.frame_lock:
-                    frame, timestamp = camera.latest_color_frame, camera.latest_timestamp
+                    frame, timestamp = (
+                        camera.latest_color_frame,
+                        camera.latest_timestamp,
+                    )
                     if frame is None or timestamp is None:
                         raise TimeoutError(f"{name} has no image")
                     image = SinglePiperController._image(frame, name)
@@ -174,8 +240,12 @@ class SinglePiperAssistedController(RobotSetupController):
                     raise TimeoutError(f"{name} image is stale")
             image.setflags(write=False)
             images[f"observation.images.{name}"] = image
-            times[name] = {"host_received_ns": stamp, "frame_id": f"{name}:{stamp}",
-                           "clock": "host_monotonic", "device_capture_ns": None}
+            times[name] = {
+                "host_received_ns": stamp,
+                "frame_id": f"{name}:{stamp}",
+                "clock": "host_monotonic",
+                "device_capture_ns": None,
+            }
         return images, times
 
     def get_sample(self):
@@ -185,14 +255,21 @@ class SinglePiperAssistedController(RobotSetupController):
         images, camera_times = self._images()
         packet = self._io.snapshot()
         if packet["phase"] != "engaged":
-            raise RuntimeError(f"worker phase={packet['phase']}: {packet.get('reason')}")
+            raise RuntimeError(
+                f"worker phase={packet['phase']}: {packet.get('reason')}"
+            )
         observation = {**recording_observation(packet), **images}
         for value in observation.values():
             value.setflags(write=False)
-        return {"observation_id": f"{self._session}:{self._observation_sequence}",
-                "monotonic_ns": time.monotonic_ns(), "observation": observation,
-                "action": normalize_teleop_target(packet), "telemetry": packet,
-                "cameras": camera_times, "trace": self._io.drain_trace()}
+        return {
+            "observation_id": f"{self._session}:{self._observation_sequence}",
+            "monotonic_ns": time.monotonic_ns(),
+            "observation": observation,
+            "action": normalize_teleop_target(packet),
+            "telemetry": packet,
+            "cameras": camera_times,
+            "trace": self._io.drain_trace(),
+        }
 
     def get_observation(self):
         return self.get_sample()["observation"]

@@ -25,6 +25,8 @@ class InferenceToken:
     policy_version: str
     observation_id: str
     sent_at: float
+    reference_revision: int
+    observation_ns: int
 
 
 class AssistedScheduler:
@@ -39,6 +41,8 @@ class AssistedScheduler:
         inference_timeout_s=5.0,
         max_target_speed=20.0,
         execution_horizon=None,
+        inference_interval_s=0.2,
+        max_observation_age_s=1.0,
     ):
         if not policy_version or not prompt:
             raise ValueError("policy_version and prompt are required")
@@ -46,6 +50,8 @@ class AssistedScheduler:
             ("control_hz", control_hz),
             ("inference_timeout_s", inference_timeout_s),
             ("max_target_speed", max_target_speed),
+            ("inference_interval_s", inference_interval_s),
+            ("max_observation_age_s", max_observation_age_s),
         ):
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
@@ -53,6 +59,10 @@ class AssistedScheduler:
         self.policy_version, self.prompt = policy_version, prompt
         self.control_hz, self.timeout = control_hz, inference_timeout_s
         self.max_target_speed = max_target_speed
+        self.inference_interval_s = inference_interval_s
+        self.max_observation_age_s = max_observation_age_s
+        self._last_request_at = 0.0
+        self._reference_revision = None
         self.horizon = int(policy.output_chunk_size)
         self.execute = (
             self.horizon if execution_horizon is None else int(execution_horizon)
@@ -98,9 +108,9 @@ class AssistedScheduler:
                     raise ValueError(
                         f"policy returned invalid chunk {chunk.shape}; expected {(horizon, 7)}"
                     )
-                output = (token, chunk, None)
+                output = (token, chunk, None, time.monotonic_ns())
             except Exception as exc:
-                output = (token, None, exc)
+                output = (token, None, exc, time.monotonic_ns())
             while not self._closed.is_set():
                 try:
                     self._results.put(output, timeout=0.05)
@@ -114,6 +124,8 @@ class AssistedScheduler:
         self._chunk_token = None
         self._last_target = None
         self._epoch = None
+        self._reference_revision = None
+        self._last_request_at = 0.0
         # Keep the in-flight request known until it returns: at most one GPU
         # call is ever active and obsolete results cannot create request floods.
 
@@ -159,6 +171,11 @@ class AssistedScheduler:
         with self._lock:
             if self._closed.is_set():
                 raise RuntimeError("scheduler is closed")
+            self.last_step = {
+                "waiting": False,
+                "policy_version": self.policy_version,
+                "inference_results": [],
+            }
             state = self.controller.status()
             if state.get("phase", "engaged") != "engaged" or state["mode"] == "FAULT":
                 self._want_policy = False
@@ -167,35 +184,61 @@ class AssistedScheduler:
             if self._epoch is not None and state["epoch"] != self._epoch:
                 self._want_policy = False
                 self._invalidate()
+            revision = state["reference_revision"]
+            if self._want_policy and revision != self._reference_revision:
+                # Physical corrections invalidate predictions but keep execution
+                # and periodic inference running in the same authority epoch.
+                self._generation += 1
+                self._chunk.clear()
+                self._chunk_token = None
+                self._last_target = np.asarray(state["policy_reference"]).copy()
+                self._reference_revision = revision
+                self._last_request_at = 0.0
             while True:
                 try:
-                    token, chunk, error = self._results.get_nowait()
+                    token, chunk, error, completed_ns = self._results.get_nowait()
                 except queue.Empty:
                     break
                 if token == self._pending:
                     self._pending = None
+                audit = {
+                    "inference": token,
+                    "action_chunk": chunk,
+                    "completed_ns": completed_ns,
+                    "disposition": "accepted",
+                    "error": None if error is None else str(error),
+                }
+                self.last_step["inference_results"].append(audit)
                 if (
                     token.generation != self._generation
                     or token.epoch != state["epoch"]
                     or token.policy_version != self.policy_version
+                    or token.reference_revision != revision
                     or not self._want_policy
                 ):
+                    audit["disposition"] = "discarded_obsolete"
                     self.discarded_results += 1
                     continue
                 if error is not None:
+                    audit["disposition"] = "failed"
                     self.pause()
                     raise RuntimeError("policy inference failed; holding") from error
+                if (
+                    time.monotonic() - token.observation_ns / 1e9
+                    > self.max_observation_age_s
+                ):
+                    audit["disposition"] = "discarded_stale"
+                    self.discarded_results += 1
+                    continue
                 self._chunk = deque(enumerate(chunk[: self.execute]))
                 self._chunk_token = token
             if (
                 self._pending is not None
                 and self._want_policy
-                and self._pending.generation == self._generation
                 and time.monotonic() - self._pending.sent_at > self.timeout
             ):
                 self.pause()
                 raise TimeoutError("policy inference deadline exceeded; holding")
-            self.last_step = {"waiting": False, "policy_version": self.policy_version}
             if not self._want_policy:
                 return self.last_step
             sample_epoch = sample.get("telemetry", {}).get("control", {}).get("epoch")
@@ -208,10 +251,41 @@ class AssistedScheduler:
                     return self.last_step
                 state = {**state, **self.controller.request_mode("POLICY")}
                 self._epoch = state["epoch"]
-                self._last_target = np.asarray(state["target"]).copy()
+                self._last_target = np.asarray(state["policy_reference"]).copy()
             if state["mode"] not in ("HOLD", "POLICY"):
                 self._want_policy = False
                 return self.last_step
+            if (
+                sample.get("telemetry", {})
+                .get("control", {})
+                .get("reference_revision", revision)
+                != revision
+            ):
+                return self.last_step
+            now = time.monotonic()
+            if (
+                self._chunk_token
+                and now - self._chunk_token.observation_ns / 1e9
+                > self.max_observation_age_s
+            ):
+                self._chunk.clear()
+            if (
+                self._pending is None
+                and now - self._last_request_at >= self.inference_interval_s
+            ):
+                token = InferenceToken(
+                    self._generation,
+                    state["epoch"],
+                    self.policy_version,
+                    sample["observation_id"],
+                    now,
+                    revision,
+                    sample["monotonic_ns"],
+                )
+                inputs = {**sample["observation"], "prompt": self.prompt}
+                self._requests.put_nowait((token, self.policy, inputs, self.horizon))
+                self._pending = token
+                self._last_request_at = now
             if self._chunk:
                 row, proposal = self._chunk.popleft()
                 target, clipped = clip_target(self.controller, proposal)
@@ -219,7 +293,12 @@ class AssistedScheduler:
                 target = self._last_target + np.clip(
                     target - self._last_target, -max_step, max_step
                 )
-                self.controller.send_action(target)
+                self.controller.send_action(
+                    target,
+                    reference_revision=revision,
+                    observation_ns=self._chunk_token.observation_ns,
+                    model_action=True,
+                )
                 self._last_target = target.copy()
                 self.last_step.update(
                     {
@@ -229,28 +308,24 @@ class AssistedScheduler:
                         "clipped": clipped,
                         "row": row,
                         "inference": self._chunk_token,
+                        "reference_revision": revision,
+                        "model_action": True,
                     }
                 )
             else:
                 self.last_step["waiting"] = True
-                if self._pending is None:
-                    token = InferenceToken(
-                        self._generation,
-                        state["epoch"],
-                        self.policy_version,
-                        sample["observation_id"],
-                        time.monotonic(),
-                    )
-                    inputs = {**sample["observation"], "prompt": self.prompt}
-                    self._requests.put_nowait(
-                        (token, self.policy, inputs, self.horizon)
-                    )
-                    self._pending = token
                 # Keep the MIT reference alive while the bounded inference call
                 # runs. The separately enforced inference deadline still holds.
                 if self._last_target is not None:
-                    self.controller.send_action(self._last_target)
+                    self.controller.send_action(
+                        np.asarray(state["policy_reference"]),
+                        reference_revision=revision,
+                        model_action=False,
+                    )
                     self.last_step["command_id"] = self.controller.last_command_id
+                    self.last_step.update(
+                        reference_revision=revision, model_action=False
+                    )
             return self.last_step
 
     def close(self):
