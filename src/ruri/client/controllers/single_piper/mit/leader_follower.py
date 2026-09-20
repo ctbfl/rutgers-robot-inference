@@ -562,35 +562,63 @@ def enable_both_with_safe_commands(
     follower_kd: float,
     max_reference_speed: float,
     timeout: float = 5.0,
+    *,
+    leader_hold: np.ndarray | None = None,
+    leader_hold_kp: float | None = None,
+    leader_hold_kd: float | None = None,
+    follower_hold: np.ndarray | None = None,
+    read_feedback=None,
+    should_stop=None,
+    before_enable=None,
+    rate_hz: float = 50.0,
 ) -> tuple[ArmSample, ArmSample]:
     """Enable and enter MIT while immediately supporting every enabled arm.
 
     ``move_mit`` normally sends a mode-control frame before every joint frame.
     Once both controllers report CAN/MIT, automatic mode setting is disabled so
     the steady-state loop sends only the six MIT joint frames per arm and tick.
+
+    Assisted control supplies held poses and a feedback callback so it can use
+    this same handshake with position support on both arms and per-stream
+    watchdogs. With no optional arguments, teleop retains its existing sequence.
     """
     deadline = time.perf_counter() + timeout
-    follower_hold: Optional[np.ndarray] = None
     last_leader: Optional[ArmSample] = None
     last_follower: Optional[ArmSample] = None
 
     while time.perf_counter() < deadline:
+        if should_stop is not None and should_stop():
+            raise TeleopAbort("startup cancelled")
         leader_enabled = leader.get_joints_enable_status_list()
         follower_enabled = follower.get_joints_enable_status_list()
+        if before_enable is not None:
+            before_enable()
         if not (leader_enabled and all(leader_enabled)):
             leader.enable()
         if not (follower_enabled and all(follower_enabled)):
             follower.enable()
 
-        last_leader = read_sample(leader, "leader")
-        last_follower = read_sample(follower, "follower")
+        if read_feedback is None:
+            last_leader = read_sample(leader, "leader")
+            last_follower = read_sample(follower, "follower")
+        else:
+            last_leader, last_follower = read_feedback()
         if follower_hold is None:
             follower_hold = last_follower.q.copy()
 
         leader_enabled = leader.get_joints_enable_status_list()
         follower_enabled = follower.get_joints_enable_status_list()
         if leader_enabled and all(leader_enabled):
-            send_leader(leader, last_leader, leader_gravity, leader_kd)
+            if leader_hold is None:
+                send_leader(leader, last_leader, leader_gravity, leader_kd)
+            else:
+                send_position_impedance(
+                    leader, last_leader, leader_hold, np.zeros(N_JOINTS),
+                    leader_gravity,
+                    follower_kp if leader_hold_kp is None else leader_hold_kp,
+                    follower_kd if leader_hold_kd is None else leader_hold_kd,
+                    max_reference_speed, "leader startup hold",
+                )
         if follower_enabled and all(follower_enabled):
             send_follower(
                 follower,
@@ -612,7 +640,7 @@ def enable_both_with_safe_commands(
                 leader.set_auto_set_motion_mode_enabled(False)
                 follower.set_auto_set_motion_mode_enabled(False)
                 return last_leader, last_follower
-        time.sleep(0.02)
+        time.sleep(1.0 / rate_hz)
 
     raise TeleopAbort(
         "failed to enable both arms and confirm CAN/MIT: "
@@ -708,6 +736,8 @@ def home_both_with_mit(
     hold_seconds: float,
     home_speed: float,
     phase_label: str,
+    read_feedback=None,
+    should_stop=None,
 ) -> bool:
     """Optionally hold, then home both arms with planner-free MIT commands.
 
@@ -717,10 +747,17 @@ def home_both_with_mit(
     command_label = phase_label.lower()
     leader_label = f"leader {command_label}"
     follower_label = f"follower {command_label}"
+    def running():
+        return _running if should_stop is None else not should_stop()
+
+    def read_pair():
+        if read_feedback is not None:
+            return read_feedback()
+        return read_sample(leader, leader_label), read_sample(follower, follower_label)
+
     require_can_mit_enabled(leader, leader_label)
     require_can_mit_enabled(follower, follower_label)
-    leader_sample = read_sample(leader, leader_label)
-    follower_sample = read_sample(follower, follower_label)
+    leader_sample, follower_sample = read_pair()
     leader_hold = leader_sample.q.copy()
     follower_hold = follower_sample.q.copy()
     leader_fresh = FeedbackWatchdog(args.feedback_timeout)
@@ -735,10 +772,9 @@ def home_both_with_mit(
     hold_start = time.perf_counter()
     next_tick = hold_start
     next_report = hold_start
-    while _running and time.perf_counter() - hold_start < hold_seconds:
+    while running() and time.perf_counter() - hold_start < hold_seconds:
         now = time.perf_counter()
-        leader_sample = read_sample(leader, leader_label)
-        follower_sample = read_sample(follower, follower_label)
+        leader_sample, follower_sample = read_pair()
         leader_fresh.observe(leader_sample.stamps, now)
         follower_fresh.observe(follower_sample.stamps, now)
         send_position_impedance(
@@ -788,14 +824,13 @@ def home_both_with_mit(
         next_tick += dt
         time.sleep(max(0.0, next_tick - time.perf_counter()))
 
-    if not _running:
+    if not running():
         print(f"  {command_label} cancelled by signal; staying at current pose")
         return False
 
     # Re-anchor after the hold, then send each arm along its own C2-continuous
     # path to zero. No move_j or firmware trajectory planner is involved.
-    leader_sample = read_sample(leader, leader_label)
-    follower_sample = read_sample(follower, follower_label)
+    leader_sample, follower_sample = read_pair()
     leader_start = leader_sample.q.copy()
     follower_start = follower_sample.q.copy()
     duration = recovery_home_duration(
@@ -811,11 +846,10 @@ def home_both_with_mit(
     next_tick = home_start
     next_report = home_start
     peak_track = 0.0
-    while _running and time.perf_counter() - home_start < duration:
+    while running() and time.perf_counter() - home_start < duration:
         now = time.perf_counter()
         elapsed = now - home_start
-        leader_sample = read_sample(leader, leader_label)
-        follower_sample = read_sample(follower, follower_label)
+        leader_sample, follower_sample = read_pair()
         leader_fresh.observe(leader_sample.stamps, now)
         follower_fresh.observe(follower_sample.stamps, now)
         leader_des, leader_vel = home_reference(leader_start, elapsed, duration)
@@ -878,16 +912,15 @@ def home_both_with_mit(
         next_tick += dt
         time.sleep(max(0.0, next_tick - time.perf_counter()))
 
-    if not _running:
+    if not running():
         print(f"  {command_label} cancelled by signal; staying at current pose")
         return False
 
     # Give the low-gain impedance loop time to settle at exactly zero.
     settle_start = time.perf_counter()
     next_tick = settle_start
-    while _running and time.perf_counter() - settle_start < HOME_SETTLE_SECONDS:
-        leader_sample = read_sample(leader, leader_label)
-        follower_sample = read_sample(follower, follower_label)
+    while running() and time.perf_counter() - settle_start < HOME_SETTLE_SECONDS:
+        leader_sample, follower_sample = read_pair()
         send_position_impedance(
             leader,
             leader_sample,
@@ -913,14 +946,13 @@ def home_both_with_mit(
         next_tick += dt
         time.sleep(max(0.0, next_tick - time.perf_counter()))
 
-    if not _running:
+    if not running():
         print(f"  {command_label} cancelled by signal; staying at current pose")
         return False
 
     require_can_mit_enabled(leader, leader_label)
     require_can_mit_enabled(follower, follower_label)
-    leader_sample = read_sample(leader, leader_label)
-    follower_sample = read_sample(follower, follower_label)
+    leader_sample, follower_sample = read_pair()
     residual = max(
         float(np.max(np.abs(leader_sample.q))),
         float(np.max(np.abs(follower_sample.q))),
@@ -945,6 +977,9 @@ def recover_home_after_abort(
     leader_gripper,
     follower_gripper,
     args: argparse.Namespace,
+    *,
+    read_feedback=None,
+    should_stop=None,
 ) -> bool:
     """Hold for the configured delay, then slowly home after a runtime abort."""
     return home_both_with_mit(
@@ -958,6 +993,8 @@ def recover_home_after_abort(
         hold_seconds=args.abort_hold_seconds,
         home_speed=args.abort_home_speed,
         phase_label="ABORT RECOVERY",
+        read_feedback=read_feedback,
+        should_stop=should_stop,
     )
 
 

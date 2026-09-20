@@ -1,8 +1,9 @@
 """Deterministic control authority and references, independent of sockets/SDK.
 
 Policy sets a shared virtual leader reference, sent directly to both arms.
-Physical correction labels never revoke policy execution authority. Explicit
-manual HUMAN mode remains available with an anchored relative reference.
+During correction the physical leader supplies the shared reference; policy
+inference continues as a preview. Release starts a fresh policy timeline.
+Explicit manual HUMAN mode remains available with an anchored relative reference.
 There are deliberately no episode, dataset, model or reward concepts here.
 """
 
@@ -16,7 +17,6 @@ import numpy as np
 
 from ruri.client.controllers.single_piper.calibration_ranges import (
     NOMINAL,
-    measured_for_arm,
 )
 from ruri.client.controllers.single_piper.normalization import normalize_pose
 
@@ -43,17 +43,14 @@ def physical_bounds(ranges):
 
 
 def synchronized_bounds(config, leader_name="right_arm", follower_name="left_arm"):
-    nominal_low, nominal_high = physical_bounds(NOMINAL)
-    leader_low, leader_high = physical_bounds(measured_for_arm(leader_name))
-    follower_low, follower_high = physical_bounds(measured_for_arm(follower_name))
-    sign = np.r_[config.leader_sign, 1.0]
-    offset = np.r_[config.leader_offset_rad, 0.0]
-    ends = np.stack(((leader_low - offset) * sign, (leader_high - offset) * sign))
-    low = np.maximum.reduce((nominal_low, follower_low, ends.min(axis=0)))
-    high = np.minimum.reduce((nominal_high, follower_high, ends.max(axis=0)))
-    if np.any(low >= high):
-        raise ValueError("leader mapping has no common executable range")
-    return low, high
+    # Same policy/teleop action box on both arms. Each physical arm applies its
+    # own measured hardware clamp afterwards at the SDK boundary.
+    return physical_bounds(NOMINAL)
+
+
+def clamp_pose(values):
+    low, high = physical_bounds(NOMINAL)
+    return np.clip(pose(values), low, high)
 
 
 class AssistedControl:
@@ -77,8 +74,8 @@ class AssistedControl:
         self.lower, self.upper = synchronized_bounds(config, leader_name, follower_name)
         self.leader = pose(leader)
         self.follower = pose(follower)
-        self.target = self.follower.copy()
-        self.leader_target = self.leader.copy()
+        self.target = clamp_pose(self.follower)
+        self.leader_target = clamp_pose(self.leader)
         self.anchor_leader = self.leader.copy()
         self.anchor_target = self.target.copy()
         self.mode = "HOLD"
@@ -93,6 +90,7 @@ class AssistedControl:
         self.leader_gain = 0.0
         self.rejected = 0
         self.reference_revision = 0
+        self._revision_reference = self.target.copy()
         self.policy_reference = self.target.copy()
         self.policy_observation_ns = None
         self.policy_valid = False
@@ -105,7 +103,7 @@ class AssistedControl:
         self.source = "hold"
 
     def mapped(self, follower):
-        return self.sign * follower + self.offset
+        return clamp_pose(self.sign * follower + self.offset)
 
     @property
     def aligned(self):
@@ -126,12 +124,12 @@ class AssistedControl:
         # Preserve the final follower reference. Capture leader's actual pose
         # when leaving gravity-only operation; ramp stiffness separately.
         if previous_mode == "HUMAN" or mode == "HOLD":
-            self.leader_target = self.leader.copy()
+            self.leader_target = clamp_pose(self.leader)
         self.correcting = self.policy_valid = False
         self._deviation_since = self._agreement_since = None
         self.source = "human" if mode == "HUMAN" else "hold"
-        self.policy_reference = (self.leader - self.offset) * self.sign
-        self._previous_leader = self.policy_reference.copy()
+        self.policy_reference = self.target.copy()
+        self._previous_leader = (self.leader - self.offset) * self.sign
         self.policy_observation_ns = None
         if mode == "HUMAN":
             self.intervention_id += 1
@@ -206,23 +204,14 @@ class AssistedControl:
                 <= self.config.policy_max_age_s
             ):
                 raise ValueError("policy observation is stale")
-            target = pose(packet.get("target"))
-            if np.any(target < self.lower - 1e-7) or np.any(target > self.upper + 1e-7):
-                raise ValueError("target outside common leader/follower bounds")
-            # Match the existing direct MIT policy path: no additional slew
-            # filter. Reject a gross tracking jump instead of changing its value.
-            if (
-                model_action
-                and np.max(np.abs(target[:6] - self.follower[:6]))
-                > self.config.max_track_error
-            ):
-                raise ValueError("policy target exceeds follower tracking envelope")
+            target = clamp_pose(packet.get("target"))
             if model_action:
                 self.policy_reference = target
                 self.policy_observation_ns = observation_ns
                 self.policy_valid = True
-                self.target = target.copy()
-                self.leader_target = self.mapped(target)
+                if not self.correcting:
+                    self.target = target.copy()
+                    self.leader_target = self.mapped(target)
             self.mode, self.armed, self.reason = "POLICY", False, "policy command"
             self.command_id = sequence
             self.last_command = now
@@ -237,37 +226,30 @@ class AssistedControl:
         if type(epoch) is not int or epoch != self.epoch:
             return False, "stale control epoch"
         if mode in ("HOLD", "HUMAN"):
-            if (
-                mode == "HUMAN"
-                and np.max(np.abs(self.follower[:6] - self.target[:6]))
-                > self.config.max_track_error
-            ):
-                self._revoke("HOLD", "tracking gap prevents handover")
-                return False, self.reason
             self._revoke(mode, "operator request")
             return True, mode
         if mode == "ALIGN" and self.mode == "HOLD":
-            if np.any(self.target < self.lower) or np.any(self.target > self.upper):
-                return False, "held follower pose lies outside synchronization bounds"
             self._revoke("HOLD", "align leader while follower holds")
             self.aligning = True
             return True, "ALIGN"
-        if mode == "POLICY" and self.mode == "HOLD" and self.aligned:
+        if mode == "POLICY" and self.mode == "HOLD":
+            # Both arms receive the shared command directly. Measured pose or
+            # gripper agreement must never gate policy startup/resume.
             self._revoke("HOLD", "waiting for fresh policy target")
             self.armed = True
             self.last_command = self.clock()
             return True, "armed"
-        return False, "POLICY requires aligned HOLD; ALIGN requires HOLD"
+        return False, "POLICY and ALIGN require HOLD"
 
     def _rebase_policy(self, leader):
         """Revoke old predictions, not execution authority or leader/follower coupling."""
         self.reference_revision += 1
         self.policy_reference = np.clip(leader, self.lower, self.upper)
         self.target = self.policy_reference.copy()
+        self._revision_reference = self.target.copy()
         self.leader_target = self.mapped(self.target)
         self.policy_valid = False
         self.policy_observation_ns = None
-        self._agreement_since = None
 
     def _coupled_tick(self, now, dt):
         c = self.config
@@ -280,7 +262,7 @@ class AssistedControl:
             self.policy_valid
             and now - self.policy_observation_ns / 1e9 > c.policy_max_age_s
         ):
-            self._rebase_policy(leader)
+            self._rebase_policy(self.target)
         entry = np.r_[
             np.full(6, c.intervention_error_rad), c.intervention_gripper_error_m
         ]
@@ -305,42 +287,65 @@ class AssistedControl:
                 if now - self._deviation_since >= c.intervention_confirm_s:
                     self.correcting = True
                     self.intervention_id += 1
-                    self._rebase_policy(leader)
+                    self.leader_gain = 0.0
+                    self._agreement_since = None
+                    self._rebase_policy(self.target)
             else:
                 self._deviation_since = None
-        else:
-            # During a correction, smaller outward manual motion can update the
-            # shared reference. Fresh model targets still drive BOTH arms right
-            # away, even while the data label remains human/transition.
-            outward = np.sign(shared_error) * delta > 1e-8
-            manual_motion = bool(np.any(outward & (np.abs(shared_error) > release)))
-            if not self.policy_valid or override or manual_motion:
-                speed = np.r_[
-                    np.full(6, c.max_reference_speed), c.gripper_reference_speed
-                ]
-                corrected = self.target + np.clip(
-                    np.clip(leader, self.lower, self.upper) - self.target,
-                    -speed * dt,
-                    speed * dt,
-                )
-                if np.any(np.abs(corrected - self.target) > 1e-9):
-                    # The RTC prefix is no longer the trajectory being executed.
-                    # Invalidate it on every manual reference edit, even if an
-                    # older inference is still in flight (it remains auditable).
-                    self._rebase_policy(corrected)
-            agrees = self.policy_valid and bool(
-                np.all(np.abs(self.policy_error) < release)
+        if self.correcting:
+            speed = np.r_[
+                np.full(6, c.human_reference_speed), c.gripper_reference_speed
+            ]
+            corrected = self.target + np.clip(
+                np.clip(leader, self.lower, self.upper) - self.target,
+                -speed * dt,
+                speed * dt,
             )
-            if agrees:
+            self.target = corrected
+            # Encoder jitter must not invalidate every background inference.
+            # While human-led there is no executed RTC prefix to preserve;
+            # rebase once motion leaves the release tolerance around its origin.
+            if np.any(np.abs(corrected - self._revision_reference) > release):
+                self._rebase_policy(corrected)
+            # Position feedback cannot identify a hand. Quiet leader motion is
+            # the explicit release proxy; never require the next policy action
+            # to equal the human pose (a moving policy would never release).
+            quiet = bool(
+                np.all(
+                    np.abs(delta)
+                    <= np.r_[
+                        np.full(6, c.intervention_release_speed_rad_s),
+                        c.intervention_gripper_release_speed_m_s,
+                    ]
+                    * dt
+                )
+            )
+            if quiet:
                 if self._agreement_since is None:
                     self._agreement_since = now
-                if now - self._agreement_since >= c.intervention_release_s:
+                if (
+                    now - self._agreement_since >= c.intervention_release_s
+                    and self.policy_valid
+                    and self.policy_observation_ns / 1e9 >= self._agreement_since
+                    and np.all(
+                        np.abs(np.clip(leader, self.lower, self.upper) - self.target)
+                        < release
+                    )
+                    and follower_healthy
+                ):
                     self.correcting = False
                     self._deviation_since = self._agreement_since = None
+                    # Predictions during manual motion were previews, never an
+                    # executed RTC prefix. Bootstrap again at the release pose.
+                    self._rebase_policy(self.target)
             else:
                 self._agreement_since = None
         self.source = (
-            ("transition" if self._agreement_since is not None else "human")
+            (
+                "transition"
+                if self._agreement_since is not None and self.policy_valid
+                else "human"
+            )
             if self.correcting
             else (
                 "transition"
@@ -398,7 +403,7 @@ class AssistedControl:
             )
         # A takeover removes position stiffness immediately. When leaving HUMAN
         # stiffness rises from zero around the captured pose, not an old target.
-        if self.mode == "HUMAN":
+        if self.mode == "HUMAN" or self.correcting:
             self.leader_gain = 0.0
         else:
             self.leader_gain = min(
@@ -423,6 +428,11 @@ class AssistedControl:
             "policy_valid": self.policy_valid,
             "policy_observation_ns": self.policy_observation_ns,
             "intervention_active": self.correcting or self.mode == "HUMAN",
+            "execution_owner": "leader"
+            if self.correcting or self.mode == "HUMAN"
+            else "policy"
+            if self.mode == "POLICY" and self.policy_valid
+            else "hold",
             "intervention_id": self.intervention_id,
             "policy_error": self.policy_error.tolist(),
             "coupling_error": self.coupling_error.tolist(),

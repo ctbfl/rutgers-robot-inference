@@ -12,6 +12,11 @@ an operator loop on the terminal:
 * Entering a new prompt resumes the way the run started. The first request
   carries no RTC prefix, and its chunk is executed from row 0 however many hold
   ticks were sent while it was being computed.
+* Entering ``home`` while paused returns all joints to zero at up to 1 rad/s,
+  preserves the gripper target and stays paused. ``q`` can pause that motion.
+* ``switch <port>`` at the paused prompt connects another checkpoint on the
+  same host. Success resumes the current task without an old RTC prefix;
+  failure retains the old connection and stays paused.
 * ``Esc`` or Ctrl-C ends the run through the usual ``controller.stop()`` path.
 """
 
@@ -24,7 +29,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,8 +43,10 @@ from ruri.client.schedulers.rtc import (
     _ActionTimeline,
     _InferenceResult,
     _RTCTrace,
+    _SelectedAction,
 )
 from ruri.client.utils.prompt_terminal import PromptTerminal
+from ruri.client.utils import inference_client
 
 
 logger = logging.getLogger(__name__)
@@ -49,7 +56,8 @@ FIRST_PROMPT_MESSAGE = (
     "Esc or Ctrl-C quits."
 )
 PAUSED_PROMPT_MESSAGE = (
-    "Paused, holding the last target. Type a new prompt and press Enter. "
+    "Paused, holding the last target. Enter a task prompt to resume, "
+    "home to return to zero at 1 rad/s, or switch <port> to change checkpoint. "
     "Esc or Ctrl-C quits."
 )
 
@@ -65,6 +73,31 @@ class _PromptToken:
     triggered_ns: int
     prompt: str
     epoch: int
+
+
+@dataclass(frozen=True)
+class _SwitchToken:
+    endpoint: str
+
+
+@dataclass(frozen=True)
+class _SwitchResult:
+    endpoint: str
+    metadata: dict[str, Any] | None = None
+    error: Exception | None = None
+
+
+def _validate_switch(current: Any, candidate: Any) -> None:
+    """Checkpoint changes must retain the client-facing model contract."""
+    before, after = current.metadata, candidate.metadata
+    if (
+        current.output_chunk_size != candidate.output_chunk_size
+        or before.get("inputs") != after.get("inputs")
+    ):
+        raise ValueError("Switch target must use the same inputs and action horizon")
+    for key in ("name", "config_name", "rtc_method"):
+        if before.get("policy", {}).get(key) != after.get("policy", {}).get(key):
+            raise ValueError(f"Switch target has a different policy {key}")
 
 
 class _PausableTimeline(_ActionTimeline):
@@ -133,12 +166,15 @@ class InteractiveRTCScheduler:
             )
 
         ready_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
-        request_queue: queue.Queue[_PromptToken | object] = queue.Queue(maxsize=1)
-        result_queue: queue.Queue[_InferenceResult] = queue.Queue(maxsize=1)
+        request_queue: queue.Queue[_PromptToken | _SwitchToken | object] = queue.Queue(maxsize=1)
+        # One request is outstanding at a time. An unbounded result queue also
+        # lets the worker finish and close a switched connection during exit.
+        result_queue: queue.Queue[_InferenceResult | _SwitchResult] = queue.Queue()
         stop_worker = threading.Event()
         stop_token = object()
 
         def inference_worker() -> None:
+            active_policy = policy
             try:
                 try:
                     output_chunk_size = int(policy.output_chunk_size)
@@ -165,6 +201,34 @@ class InteractiveRTCScheduler:
                     token = request_queue.get()
                     if token is stop_token:
                         return
+                    if stop_worker.is_set():
+                        return
+                    if isinstance(token, _SwitchToken):
+                        candidate = None
+                        try:
+                            candidate = inference_client.connect({
+                                "policy_endpoint": token.endpoint,
+                                "policy_timeout_s": get_arg(args, "policy_timeout_s", 10.0),
+                                "policy_ready_timeout_s": 5.0,
+                                "policy_ready_retry_s": 0.1,
+                            })
+                            _validate_switch(active_policy, candidate)
+                            metadata = candidate.metadata
+                        except Exception as error:
+                            if candidate is not None:
+                                candidate.close()
+                            result_queue.put(_SwitchResult(token.endpoint, error=error))
+                        else:
+                            previous = active_policy
+                            active_policy = candidate
+                            # The initial connection belongs to the caller's
+                            # context manager; later connections belong here.
+                            if previous is not policy:
+                                previous.close()
+                            delay_history.clear()
+                            delay_history.append(initial_delay_steps)
+                            result_queue.put(_SwitchResult(token.endpoint, metadata))
+                        continue
                     assert isinstance(token, _PromptToken)
                     received_ns = time.monotonic_ns()
                     try:
@@ -190,6 +254,7 @@ class InteractiveRTCScheduler:
                                 request_id=token.request_id,
                                 reason=token.reason,
                                 epoch=token.epoch,
+                                policy_endpoint=getattr(active_policy, "endpoint", None),
                                 prompt=token.prompt,
                                 trigger_step=token.trigger_step,
                                 request_last_sent_step=request_last_step,
@@ -203,7 +268,7 @@ class InteractiveRTCScheduler:
                                     else list(previous_tail.shape)
                                 ),
                             )
-                        response = policy.infer(inputs)
+                        response = active_policy.infer(inputs)
                         chunk = RTCScheduler._action_chunk(response)
                         if len(chunk) != output_chunk_size:
                             raise ValueError(
@@ -289,6 +354,8 @@ class InteractiveRTCScheduler:
                             )
                         )
             finally:
+                if active_policy is not policy:
+                    active_policy.close()
                 if trace is not None:
                     trace.record("inference_worker_stopped")
 
@@ -351,6 +418,7 @@ class InteractiveRTCScheduler:
                 control_hz=control_hz,
                 execution_horizon=execution_horizon,
                 prompt=prompt,
+                policy_endpoint=getattr(policy, "endpoint", get_arg(args, "policy_endpoint", "")),
                 trace=trace,
             )
         except BaseException as error:
@@ -381,7 +449,9 @@ class InteractiveRTCScheduler:
                         except queue.Full:
                             pass
                     if worker is not None:
-                        worker.join(timeout=1.0)
+                        worker.join(timeout=2 * max(
+                            5.0, float(get_arg(args, "policy_timeout_s", 10.0))
+                        ) + 1.0)
                     if trace is not None:
                         trace.record("run_stop", stats=self.last_run_stats)
                         trace.close()
@@ -397,6 +467,17 @@ class InteractiveRTCScheduler:
             if event.kind == "exit":
                 return None
             if event.kind == "prompt":
+                if event.text.split()[0].casefold() == "switch":
+                    terminal.request_prompt(
+                        "Enter a task first; then press q and enter switch <port>."
+                    )
+                    continue
+                if event.text.strip().casefold() == "home":
+                    terminal.request_prompt(
+                        "The arm has not started. Enter a task first; "
+                        "then press q and enter home to return to zero."
+                    )
+                    continue
                 return event.text
 
     @staticmethod
@@ -405,11 +486,12 @@ class InteractiveRTCScheduler:
         robot: Any,
         timeline: _PausableTimeline,
         terminal: Any,
-        request_queue: queue.Queue[_PromptToken | object],
-        result_queue: queue.Queue[_InferenceResult],
+        request_queue: queue.Queue[_PromptToken | _SwitchToken | object],
+        result_queue: queue.Queue[_InferenceResult | _SwitchResult],
         control_hz: float,
         execution_horizon: int,
         prompt: str,
+        policy_endpoint: str,
         trace: _RTCTrace | None,
     ) -> dict[str, int | float | str]:
         period_s = 1.0 / control_hz
@@ -418,6 +500,10 @@ class InteractiveRTCScheduler:
         # discarded when it returns.
         epoch = 0
         paused = False
+        home_actions: Iterator[np.ndarray] | None = None
+        pending_switch: _SwitchToken | None = None
+        switching = False
+        resume_after_switch = True
         needs_fresh_chunk = True
         inference_in_flight = False
         stats = InteractiveRTCScheduler._new_stats(execution_horizon)
@@ -451,6 +537,12 @@ class InteractiveRTCScheduler:
             bump("chunks_requested")
 
         def maybe_trigger() -> None:
+            nonlocal pending_switch, inference_in_flight
+            if pending_switch is not None and not inference_in_flight:
+                request_queue.put_nowait(pending_switch)
+                pending_switch = None
+                inference_in_flight = True
+                return
             if paused or inference_in_flight:
                 return
             if needs_fresh_chunk:
@@ -465,6 +557,7 @@ class InteractiveRTCScheduler:
 
         def receive(timeout_s: float) -> None:
             nonlocal inference_in_flight, needs_fresh_chunk
+            nonlocal switching, paused, policy_endpoint
             try:
                 result = (
                     result_queue.get(timeout=timeout_s)
@@ -474,9 +567,28 @@ class InteractiveRTCScheduler:
             except queue.Empty:
                 return
             inference_in_flight = False
-            if result.status == "error":
-                assert result.error is not None
-                raise result.error
+            if isinstance(result, _SwitchResult):
+                switching = False
+                if result.error is not None:
+                    bump("switches_failed")
+                    logger.warning("Switch to %s failed: %s", result.endpoint, result.error)
+                    if trace is not None:
+                        trace.record("switch_failed", endpoint=result.endpoint, error=str(result.error))
+                    terminal.request_prompt(
+                        f"Switch failed; still on {policy_endpoint}, holding. "
+                        "Enter a task to resume, home, or switch <port> to retry."
+                    )
+                else:
+                    policy_endpoint = result.endpoint
+                    bump("switches_completed")
+                    if trace is not None:
+                        trace.record("policy_switched", endpoint=policy_endpoint, metadata=result.metadata)
+                    logger.info("Switched to %s; task=%r", policy_endpoint, prompt)
+                    paused = not resume_after_switch
+                    needs_fresh_chunk = True
+                    if paused:
+                        terminal.request_prompt(PAUSED_PROMPT_MESSAGE)
+                return
             token = result.token
             if token.epoch != epoch:
                 # Requested before a pause; the operator has replaced its prompt.
@@ -489,6 +601,9 @@ class InteractiveRTCScheduler:
                         epoch=epoch,
                     )
                 return
+            if result.status == "error":
+                assert result.error is not None
+                raise result.error
             assert result.chunk is not None
             assert result.anchor_step is not None
             assert result.request_last_sent_step is not None
@@ -543,7 +658,8 @@ class InteractiveRTCScheduler:
 
         def handle_events() -> bool:
             """Apply queued keys; False once the operator asked to quit."""
-            nonlocal paused, epoch, needs_fresh_chunk, prompt
+            nonlocal paused, epoch, needs_fresh_chunk, prompt, home_actions
+            nonlocal pending_switch, switching, resume_after_switch
             while (event := terminal.poll_event(0.0)) is not None:
                 if event.kind == "exit":
                     logger.info("Quit requested")
@@ -554,7 +670,18 @@ class InteractiveRTCScheduler:
                             epoch=epoch,
                         )
                     return False
-                if event.kind == "pause" and not paused:
+                if switching:
+                    if event.kind == "pause":
+                        resume_after_switch = False
+                        logger.info("Will remain paused after the port switch completes")
+                    continue
+                if event.kind == "pause" and home_actions is not None:
+                    home_actions = None
+                    bump("homes_cancelled")
+                    if trace is not None:
+                        trace.record("home_cancelled", epoch=epoch)
+                    terminal.request_prompt(PAUSED_PROMPT_MESSAGE)
+                elif event.kind == "pause" and not paused:
                     paused = True
                     epoch += 1
                     needs_fresh_chunk = True
@@ -570,7 +697,37 @@ class InteractiveRTCScheduler:
                             inference_in_flight=inference_in_flight,
                         )
                     terminal.request_prompt(PAUSED_PROMPT_MESSAGE)
-                elif event.kind == "prompt" and paused:
+                elif event.kind == "prompt" and paused and home_actions is None:
+                    words = event.text.split()
+                    if words and words[0].casefold() == "switch":
+                        try:
+                            if len(words) != 2:
+                                raise ValueError("Use switch <port>, for example switch 5558")
+                            endpoint = inference_client.endpoint_with_port(policy_endpoint, words[1])
+                        except ValueError as error:
+                            terminal.request_prompt(str(error))
+                            continue
+                        pending_switch = _SwitchToken(endpoint)
+                        switching = True
+                        resume_after_switch = True
+                        bump("switches_requested")
+                        logger.info("Switching to %s; holding until ready. q keeps paused.", endpoint)
+                        if trace is not None:
+                            trace.record("switch_requested", endpoint=endpoint, epoch=epoch)
+                        continue
+                    if event.text.strip().casefold() == "home":
+                        home_actions = iter(
+                            robot.iter_home_actions(
+                                control_hz=control_hz, speed_rad_s=1.0
+                            )
+                        )
+                        bump("homes_started")
+                        if trace is not None:
+                            trace.record("home_started", epoch=epoch, speed_rad_s=1.0)
+                        logger.info(
+                            "Homing at up to 1 rad/s. q pauses; Esc or Ctrl-C quits."
+                        )
+                        continue
                     prompt = event.text
                     paused = False
                     bump("prompt_changes")
@@ -585,7 +742,27 @@ class InteractiveRTCScheduler:
                 receive(0.0)
             maybe_trigger()
 
-            selected = timeline.select_next()
+            selected = None
+            if home_actions is not None:
+                try:
+                    selected = _SelectedAction(
+                        timestep=timeline.latest_sent_step() + 1,
+                        value=next(home_actions),
+                        source="home",
+                        chunk_id=0,
+                        chunk_offset=-1,
+                    )
+                except StopIteration:
+                    home_actions = None
+                    bump("homes_completed")
+                    if trace is not None:
+                        trace.record("home_completed", epoch=epoch)
+                    terminal.request_prompt(
+                        "Home reached; holding. Enter a task prompt to resume, "
+                        "home to repeat, or switch <port>. Esc or Ctrl-C quits."
+                    )
+            if selected is None:
+                selected = timeline.select_next()
             if selected is None:
                 # Nothing has been commanded yet. The MIT worker holds home by
                 # itself and does not arm its command watchdog before the first
@@ -625,7 +802,10 @@ class InteractiveRTCScheduler:
                 raise
             timeline.commit(selected, target)
             bump("actions_sent")
-            bump("policy_actions_sent" if selected.source == "policy" else "hold_ticks")
+            if selected.source == "policy":
+                bump("policy_actions_sent")
+            else:
+                bump("home_ticks" if selected.source == "home" else "hold_ticks")
             if paused:
                 bump("paused_ticks")
             if trace is not None:
@@ -676,5 +856,12 @@ class InteractiveRTCScheduler:
             "max_actual_delay_steps": 0,
             "pauses": 0,
             "prompt_changes": 0,
+            "homes_started": 0,
+            "homes_completed": 0,
+            "homes_cancelled": 0,
+            "home_ticks": 0,
+            "switches_requested": 0,
+            "switches_completed": 0,
+            "switches_failed": 0,
             "execution_horizon": execution_horizon,
         }

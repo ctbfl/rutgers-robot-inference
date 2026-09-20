@@ -14,6 +14,7 @@ from ruri.client.schedulers.rtc import RTCScheduler
 class Robot:
     def __init__(self, args=None):
         self.actions = []
+        self.mode_requests = []
         self.eight = threading.Event()
         self.mode, self.epoch, self.revision = "HOLD", 0, 0
         self.last_command_id = 0
@@ -32,13 +33,15 @@ class Robot:
         return {
             "mode": self.mode,
             "epoch": self.epoch,
-            "aligned": True,
+            "aligned": False,
+            "aligning": False,
             "armed": False,
             "reference_revision": self.revision,
             "policy_reference": self.reference.copy(),
         }
 
     def request_mode(self, mode):
+        self.mode_requests.append(mode)
         self.mode = mode
         self.epoch += 1
         return self.status()
@@ -126,6 +129,7 @@ class AssistedRTCEquivalenceTests(unittest.TestCase):
                 policy.inputs[1][key], original_policy.inputs[1][key]
             )
         self.assertEqual(audits[1]["install"]["expired"], 3)
+        self.assertEqual(robot.mode_requests, ["POLICY"])
 
     def test_prefix_refusal_holds_instead_of_silent_plain_sampling(self):
         robot = Robot()

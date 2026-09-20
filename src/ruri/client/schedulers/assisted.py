@@ -1,13 +1,14 @@
 """RTC action timeline with local interruption and correction invalidation.
 
-``step(sample)`` consumes the caller's one observation snapshot. Workflow owns
-the periodic loop, recording and operator UI; this object owns only inference,
+``step(sample)`` consumes the caller's one observation snapshot. The caller owns
+the periodic loop, optional recording and operator UI; this object owns inference,
 chunk execution and control-mode requests. Inference never holds the mode lock.
 """
 
 from __future__ import annotations
 
 import math
+import logging
 import queue
 import threading
 import time
@@ -18,6 +19,9 @@ import numpy as np
 
 from ._actions import clip_target
 from .rtc import RTCScheduler, _ActionTimeline
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,7 @@ class AssistedScheduler:
         if type(initial_delay) is not int or not 0 <= initial_delay <= self.horizon:
             raise ValueError("rtc_initial_delay_steps must fit the action horizon")
         self._delay_history = deque([initial_delay], maxlen=rtc_latency_window)
+        self._initial_delay = initial_delay
         self._request_id = 0
         self._generation = 0
         self._want_policy = False
@@ -195,6 +200,8 @@ class AssistedScheduler:
                 raise ValueError("immutable policy version is required")
             self._invalidate()
             self.policy, self.policy_version = policy, version
+            self._delay_history.clear()
+            self._delay_history.append(self._initial_delay)
             if prompt is not None:
                 self.prompt = prompt
 
@@ -209,6 +216,8 @@ class AssistedScheduler:
         last_step, tail, consumed = self._timeline.request_snapshot()
         delay = min(max(self._delay_history), 0 if tail is None else len(tail))
         self._request_id += 1
+        if self._request_id == 1:
+            logger.info("Starting policy inference for task %r", self.prompt)
         token = InferenceToken(
             self._generation,
             state["epoch"],
@@ -306,6 +315,16 @@ class AssistedScheduler:
                 self._delay_history.append(
                     max(actual_delay, math.ceil(duration * self.control_hz))
                 )
+                if state.get("intervention_active") and state["mode"] == "POLICY":
+                    # Keep inference active while the physical leader owns the
+                    # reference. This is a preview, not executed RTC history.
+                    target, _ = clip_target(self.controller, chunk[0].copy())
+                    self.controller.send_action(
+                        target, reference_revision=revision,
+                        observation_ns=token.observation_ns, model_action=True,
+                    )
+                    audit["disposition"] = "human_preview"
+                    continue
                 install = self._timeline.install(
                     chunk=chunk,
                     chunk_id=token.request_id,
@@ -330,10 +349,6 @@ class AssistedScheduler:
             if observed_control.get("epoch", state["epoch"]) != state["epoch"]:
                 return self.last_step
             if state["mode"] == "HOLD" and not state["armed"]:
-                if not state["aligned"]:
-                    if not state["aligning"]:
-                        self.controller.request_mode("ALIGN")
-                    return self.last_step
                 state = {**state, **self.controller.request_mode("POLICY")}
                 self._epoch = state["epoch"]
             if state["mode"] not in ("HOLD", "POLICY"):

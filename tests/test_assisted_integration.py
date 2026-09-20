@@ -184,13 +184,16 @@ class AssistedIntegrationTests(unittest.TestCase):
         )
         # The next query uses the actual follower observation during catch-up,
         # not a fictitious exact copy of the human's leader pose.
-        self.assertGreater(states[-1][0], target[0] - 1.5)
+        self.drive(scheduler, lambda: states[-1][0] > target[0] - 1.5)
         self.drive(scheduler, lambda: self.robot.status()["source"] == "policy")
         self.assertEqual(self.robot.status()["epoch"], epoch)
         self.assertEqual(self.robot.status()["intervention_id"], 1)
         self.assertLess(np.max(np.abs(self.robot.status()["coupling_error"])), 0.02)
         # Periodic inference was issued while a previous chunk still had rows.
         self.assertGreater(len(states), 3)
+        previews = [r for r in self.inference_results if r["disposition"] == "human_preview"]
+        self.assertTrue(previews)
+        self.assertTrue(all(not r["inference"].rtc_requested for r in previews))
         obsolete = [
             r
             for r in self.inference_results

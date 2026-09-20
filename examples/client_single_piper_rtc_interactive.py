@@ -6,6 +6,16 @@ entered. While running:
 
   q        pause: drop the queued actions, hold the last target and ask for a
            new prompt. Enter resumes with it; an empty line asks again.
+  home     type home at the paused prompt and press Enter: return all joints
+           to zero at up to 1 rad/s, preserving the gripper target, then hold.
+           The fastest joint sets the duration; all joints arrive together.
+           During homing q pauses; after arrival enter a task to resume RTC.
+  switch PORT
+           at the paused prompt, connect the same host on PORT, keeping the
+           current task. Hold during connection; success resumes with a fresh
+           chunk, failure keeps the old connection and stays paused.
+           The target must have the same inputs, horizon and policy/RTC config.
+           During connection q keeps paused after success; Esc/Ctrl-C quits.
   Esc      quit, also while typing a prompt.
   Ctrl-C   quit.
 

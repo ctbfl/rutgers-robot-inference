@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import queue
 import threading
@@ -10,12 +11,40 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Any
+from urllib.parse import urlsplit
 
 import zmq
 
 from ruri.client._args import get_arg
 from ruri.common.zmq import recv as recv_message
 from ruri.common.zmq import send as send_message
+
+logger = logging.getLogger(__name__)
+
+
+def normalize_endpoint(endpoint: str) -> str:
+    """Accept host:port shorthand while validating TCP addresses before socket creation."""
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise ValueError("policy_endpoint must be a non-empty ZeroMQ address")
+    endpoint = endpoint.strip()
+    if "://" not in endpoint:
+        endpoint = f"tcp://{endpoint}"
+    if endpoint.startswith("tcp://"):
+        try:
+            parsed = urlsplit(endpoint)
+            valid = (
+                parsed.hostname
+                and parsed.port is not None
+                and parsed.port > 0
+                and parsed.username is None
+                and parsed.password is None
+                and not (parsed.path or parsed.query or parsed.fragment)
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("policy_endpoint must be tcp://host:port (or host:port)")
+    return endpoint
 
 
 @dataclass(slots=True)
@@ -36,13 +65,9 @@ class _PolicyConnection:
             if isinstance(endpoint_or_args, str)
             else get_arg(endpoint_or_args, "policy_endpoint")
         )
-        if not isinstance(endpoint, str) or not endpoint.strip():
-            raise ValueError("policy_endpoint must be a non-empty ZeroMQ address")
-        self.endpoint = endpoint.strip()
+        self.endpoint = normalize_endpoint(endpoint)
         self.request_timeout_s = float(
-            10.0
-            if self.args is None
-            else get_arg(self.args, "policy_timeout_s", 10.0)
+            10.0 if self.args is None else get_arg(self.args, "policy_timeout_s", 10.0)
         )
         self.ready_timeout_s = float(
             30.0
@@ -117,10 +142,16 @@ class _PolicyConnection:
     ) -> zmq.Socket:
         timeout_ms = max(1, round(timeout_s * 1_000))
         socket = context.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        socket.connect(endpoint)
+        try:
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+            socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            socket.connect(endpoint)
+        except BaseException:
+            # A failed connect still owns a socket. Leaving it open makes
+            # Context.term() block forever and hides the startup exception.
+            socket.close(linger=0)
+            raise
         return socket
 
     @staticmethod
@@ -165,6 +196,7 @@ class _PolicyConnection:
             ) as exc:
                 last_error = exc
                 socket.close(linger=0)
+                logger.info("Waiting for policy server %s: %s", self.endpoint, exc)
                 sleep_s = min(
                     self.ready_retry_s,
                     max(0.0, deadline - time.monotonic()),
@@ -172,6 +204,11 @@ class _PolicyConnection:
                 if sleep_s:
                     time.sleep(sleep_s)
                 continue
+            except BaseException:
+                # Invalid metadata (e.g. connecting a menu port) must release
+                # this socket too, or Context.term() can block the switch.
+                socket.close(linger=0)
+                raise
 
             self._metadata = metadata
             self._output_chunk_size = output_chunk_size
@@ -216,18 +253,30 @@ class _PolicyConnection:
                     call.done.set()
         finally:
             if not ready_reported:
-                self._ready.put(RuntimeError("Policy connection stopped during startup"))
+                self._ready.put(
+                    RuntimeError("Policy connection stopped during startup")
+                )
             if socket is not None:
                 socket.close(linger=0)
             context.term()
 
     def _connect(self) -> None:
+        logger.info(
+            "Connecting to policy server %s (ready timeout %.1fs)",
+            self.endpoint,
+            self.ready_timeout_s,
+        )
         self._thread.start()
         error = self._ready.get()
         if error is not None:
             self._closed = True
             self._thread.join()
             raise error
+        logger.info(
+            "Policy server ready: %s, action horizon %s",
+            self.endpoint,
+            self._output_chunk_size,
+        )
 
     def infer(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
@@ -266,4 +315,23 @@ def connect(endpoint_or_args: str | Any) -> _PolicyConnection:
     return policy
 
 
-__all__ = ["connect"]
+def endpoint_with_port(endpoint: str, port: str) -> str:
+    """Replace only the port of an explicit TCP policy endpoint."""
+    if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError("Use switch <port>, with a port from 1 to 65535")
+    parsed = urlsplit(endpoint)
+    if (
+        parsed.scheme != "tcp"
+        or not parsed.hostname
+        or parsed.port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Port switching requires a tcp://host:port policy endpoint")
+    return f"{endpoint.rsplit(':', 1)[0]}:{int(port)}"
+
+
+__all__ = ["connect", "endpoint_with_port", "normalize_endpoint"]

@@ -43,6 +43,74 @@ Schedulers own chunk selection, RTC/aggregation and final target clipping.
 Controllers validate that final target, convert it to hardware units and send
 it; `send_action()` does not silently alter or return the target.
 
+For interactive single-arm RTC, use `examples/client_single_piper_rtc_interactive.py`
+with the selected `--policy-endpoint` and the left arm's current `--can-interface`.
+Enter the task prompt to start. Press `q` to pause, then enter either a new task
+to resume or `home` to return all six joints to zero. Manual home preserves the
+gripper target and uses a synchronized trajectory with a maximum joint reference
+speed of **1 rad/s**, followed by a measured settling check. It stays paused at
+home until another task is entered. During homing, `q` pauses the motion and
+`Esc` / Ctrl-C exits through the usual controller recovery. Resuming after home
+requests a fresh chunk without an old RTC prefix. Startup and fault recovery
+keep their existing homing behavior.
+
+To compare checkpoints without restarting, press `q`, enter `switch 5558`, and
+press Enter. This replaces only the current endpoint's port (for example,
+`tcp://172.16.68.130:5557` becomes `tcp://172.16.68.130:5558`). The arm holds its
+last target while the previous request finishes and the new connection performs
+a metadata handshake. The target must declare the same input schema, action
+horizon and policy/RTC configuration; the checkpoint path may differ. A successful
+switch keeps the task prompt, resets RTC latency estimates, and resumes from a
+fresh observation without reusing old actions. A failed switch keeps the old
+connection and stays paused; enter a task to resume it or another `switch <port>`
+to retry. During the connection attempt, `q` suppresses automatic resumption and
+`Esc` / Ctrl-C quits. The scheduler log records port changes and checkpoint metadata.
+
+## Paired Piper interactive inference without recording
+
+```bash
+python examples/client_single_piper_assisted_rtc_interactive.py \
+  --policy-endpoint tcp://172.16.68.130:5557 \
+  --can-interface can0
+```
+
+`--can-interface` selects the left/main follower. The right/secondary leader is
+discovered by its registered USB hardware ID; optionally specify its current
+`--leader-can-interface`. Both IDs are verified before use. Stop the existing
+single-arm client before starting this example: the paired worker owns both arms.
+
+Enter the task prompt (for example `A0`). Both arms enable and home using the
+persistent teleop MIT sequence, then RTC begins directly. Policy startup and
+resume do not wait for measured arm or gripper agreement. Use
+`--no-startup-home` to start from nominal-clamped current poses instead. Every
+MIT position command passes through the nominal clamp and then that arm's
+measured hardware clamp; measured feedback is preserved. The same virtual
+reference drives both arms directly, through the existing gravity compensation
+and 100 Hz MIT worker. Move the right leader to correct the motion; automatic
+correction stays in the POLICY session, but the leader uses gravity compensation
+and drives the follower. Background inference continues as a preview and cannot
+overwrite the manual reference. Release uses 0.4 seconds of quiet leader motion
+plus fresh inference; then a new RTC segment starts at the corrected state.
+Quiet motion is a release proxy: it cannot distinguish a released hand from a
+hand holding the arm still.
+
+`q` pauses both arms; enter a task to resume. At the paused prompt, `switch PORT`
+changes checkpoint on the same host and `home` returns both arms to zero at up
+to 1 rad/s while preserving the gripper target. Home waits for both arms to
+settle and stays paused. A physical correction or `q` pauses homing. Esc / Ctrl-C
+uses the assisted worker's supported hold-and-stop path without homing on exit.
+Runtime aborts use the persistent teleop recovery: hold both measured poses for
+10 seconds, then home with MIT at 0.2 rad/s. The client waits for recovery to
+finish. If feedback or CAN/MIT state cannot support recovery, the worker stops.
+Policy targets are clamped and sent directly; their distance from measured
+positions does not itself trigger an abort.
+Ordinary single-arm startup/recovery behavior is unchanged.
+
+This example composes `SinglePiperAssistedController`, `AssistedScheduler` and
+the existing terminal interface. It does not create episodes, datasets, videos,
+effort logs or uploads, and does not depend on robot-learning-workflows. Diagnostic
+status is printed to the terminal; observations and control traces stay in memory.
+
 ## Piper installation
 
 The official Agilex SDK is pinned as a Git submodule. It and the Piper-only

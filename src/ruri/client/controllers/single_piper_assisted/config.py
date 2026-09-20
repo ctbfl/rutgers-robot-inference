@@ -10,6 +10,7 @@ from ruri.client.controllers.single_piper_leader_follower_teleop.config import (
 
 @dataclass(frozen=True, slots=True)
 class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
+    startup_home: bool = False
     leader_policy_kp: float = 3.0
     leader_policy_kd: float = 0.5
     gain_transition_s: float = 0.3
@@ -24,6 +25,8 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
     intervention_gripper_release_m: float = 0.001
     intervention_confirm_s: float = 0.04
     intervention_release_s: float = 0.4
+    intervention_release_speed_rad_s: float = 0.03
+    intervention_gripper_release_speed_m_s: float = 0.002
     policy_max_age_s: float = 1.0
     leader_sign: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     leader_offset_rad: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -60,6 +63,8 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
             ("intervention_gripper_release_m", 0.0001, 0.01),
             ("intervention_confirm_s", 0.01, 0.5),
             ("intervention_release_s", 0.1, 2.0),
+            ("intervention_release_speed_rad_s", 0.001, 0.2),
+            ("intervention_gripper_release_speed_m_s", 0.0001, 0.02),
             ("policy_max_age_s", 0.1, 5.0),
         ):
             value = getattr(self, name)

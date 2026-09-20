@@ -26,7 +26,11 @@ class AssistedIO:
         self.client_session = uuid.uuid4().hex
         self._receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         endpoint = parse_udp_endpoint(config.telemetry_address)
-        self._receiver.bind((endpoint.host, endpoint.port))
+        try:
+            self._receiver.bind((endpoint.host, endpoint.port))
+        except OSError:
+            self._receiver.close()
+            raise
         self._receiver.setblocking(False)
         self._sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sender.setblocking(False)
@@ -150,4 +154,3 @@ class AssistedIO:
         self._thread.join(timeout=1.)
         self._receiver.close()
         self._sender.close()
-

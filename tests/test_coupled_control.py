@@ -50,7 +50,7 @@ class CoupledControlTests(unittest.TestCase):
     def intervene(self, joint=0, delta=0.09):
         leader = self.q.copy()
         leader[joint] += delta
-        for _ in range(8):
+        for _ in range(30):
             self.tick(leader)
         self.assertTrue(self.control.correcting)
         return leader
@@ -79,6 +79,17 @@ class CoupledControlTests(unittest.TestCase):
     ):
         epoch = self.control.epoch
         leader = self.intervene()
+        # A fresh policy may want to move away from the corrected pose. It is
+        # only a preview until the leader has stayed quiet for the release time.
+        next_target = leader.copy()
+        next_target[0] += 0.08
+        for _ in range(60):
+            if not self.control.correcting:
+                break
+            self.assertTrue(self.send("target", target=next_target.tolist()))
+            self.tick(leader)
+            np.testing.assert_allclose(self.control.target, leader)
+        self.assertFalse(self.control.correcting)
         for _ in range(60):
             model_target = leader.copy()
             model_target[0] += 0.002
@@ -177,7 +188,7 @@ class CoupledControlTests(unittest.TestCase):
             np.testing.assert_allclose(self.control.leader_target, target)
         self.assertEqual(self.control.intervention_id, 0)
 
-    def test_corrected_virtual_reference_is_shared_and_policy_can_move_it_immediately(
+    def test_corrected_virtual_reference_is_shared_and_policy_is_only_a_preview(
         self,
     ):
         leader = self.intervene()
@@ -185,10 +196,65 @@ class CoupledControlTests(unittest.TestCase):
         target = leader.copy()
         target[0] += 0.08
         self.assertTrue(self.send("target", target=target.tolist()))
-        np.testing.assert_allclose(self.control.target, target)
-        np.testing.assert_allclose(self.control.leader_target, target)
-        # A still-human data label is not an authority gate for a fresh policy.
+        np.testing.assert_allclose(self.control.target, leader)
+        np.testing.assert_allclose(self.control.leader_target, leader)
+        np.testing.assert_allclose(self.control.policy_reference, target)
         self.assertTrue(self.control.correcting)
+
+    def test_continued_leader_motion_retains_control_despite_fresh_policy(self):
+        leader = self.intervene()
+        for _ in range(70):
+            leader[0] += 0.001
+            proposal = leader.copy()
+            proposal[0] -= 0.05
+            self.assertTrue(self.send("target", target=proposal.tolist()))
+            before = self.control.target.copy()
+            self.tick(leader)
+            self.assertTrue(self.control.correcting)
+            self.assertEqual(self.control.leader_gain, 0.0)
+            self.assertGreater(self.control.target[0], before[0])
+            self.assertLessEqual(self.control.target[0] - before[0], 0.005001)
+
+    def test_encoder_jitter_does_not_starve_preview_or_release(self):
+        leader = self.intervene()
+        revision = self.control.reference_revision
+        preview = leader.copy()
+        preview[0] += 0.06
+        for i in range(80):
+            self.send("target", target=preview.tolist())
+            noisy = leader.copy()
+            noisy[0] += 0.00005 if i % 2 else -0.00005
+            self.tick(noisy)
+            if not self.control.correcting:
+                break
+        self.assertFalse(self.control.correcting)
+        # The only additional revision is the fresh segment at release.
+        self.assertEqual(self.control.reference_revision, revision + 1)
+        self.assertFalse(self.control.policy_valid)
+        self.assertFalse(
+            self.send("target", target=preview.tolist(), reference_revision=revision)
+        )
+
+    def test_release_uses_clamped_leader_reference_at_nominal_boundary(self):
+        self.q[1] = 0.0
+        self.control = AssistedControl(
+            SinglePiperAssistedConfig(), self.q, self.q, clock=lambda: self.now
+        )
+        self.send("mode", mode="POLICY", request_id="boundary")
+        self.send("target", target=self.q.tolist())
+        leader = self.q.copy()
+        leader[1] = -0.037
+        for _ in range(8):
+            self.tick(leader)
+        self.assertTrue(self.control.correcting)
+        for _ in range(60):
+            self.send("target", target=self.q.tolist())
+            self.tick(leader)
+            if not self.control.correcting:
+                break
+        self.assertFalse(self.control.correcting)
+        self.assertEqual(self.control.target[1], 0.0)
+        self.assertEqual(self.control.leader[1], -0.037)
 
 
 if __name__ == "__main__":
