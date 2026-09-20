@@ -66,6 +66,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import math
+import re
 import signal
 import time
 from typing import Optional, Sequence
@@ -402,6 +403,23 @@ class HardwareLimitedArm:
         return self._arm.move_mit(joint_index=joint_index, p_des=p_des, **kwargs)
 
 
+def require_v189_firmware(info, label: str) -> dict[str, str]:
+    """Validate identification before any enable/mode/motion command is sent."""
+    if not isinstance(info, dict):
+        raise TeleopAbort(f"{label}: could not read firmware; refusing MIT")
+    info = {key: str(value).strip("\x00 ") for key, value in info.items()}
+    version = info.get("software_version", "")
+    match = re.fullmatch(r"S-V(\d+)\.(\d+)-(\d+)", version)
+    if match is None:
+        raise TeleopAbort(f"{label}: unrecognised firmware {version!r}; refusing MIT")
+    if tuple(int(part) for part in match.groups()) < (1, 8, 9):
+        raise TeleopAbort(
+            f"{label}: firmware {version} does not match PiperFW.V189 "
+            "(requires S-V1.8-9 or newer); refusing MIT"
+        )
+    return info
+
+
 def build_arm(channel: str):
     try:
         from pyAgxArm import (
@@ -415,27 +433,47 @@ def build_arm(channel: str):
             "Piper controllers require the pyAgxArm submodule and the RURI "
             "piper extra; see the Piper installation instructions"
         ) from exc
-    config = create_agx_arm_config(
-        robot=ArmModel.PIPER,
-        firmeware_version=PiperFW.DEFAULT,
-        channel=channel,
-    )
-    arm = AgxArmFactory.create_arm(config)
-    arm.connect()
-    time.sleep(0.5)
-
     from ..calibration_ranges import arm_name_for_hardware_id, measured_for_arm
     from ..discovery import read_can_hardware_id
 
-    # The CAN interface only tells us which arm this cable leads to today; from
-    # here on the arm is referred to by name, and its limits are its own.
     hardware_id = read_can_hardware_id(channel)
     arm_name = arm_name_for_hardware_id(hardware_id)
     measured = measured_for_arm(arm_name)
+    config = create_agx_arm_config(
+        robot=ArmModel.PIPER,
+        firmeware_version=PiperFW.V189,
+        channel=channel,
+    )
+    arm = AgxArmFactory.create_arm(config)
+    try:
+        arm.connect()
+        time.sleep(0.5)
+        info = None
+        for _ in range(3):
+            info = arm.get_firmware(timeout=1.0)
+            if info is not None:
+                break
+            time.sleep(0.1)
+        info = require_v189_firmware(info, arm_name)
+    except BaseException:
+        try:
+            arm.disconnect()
+        except Exception:
+            pass  # Preserve the preflight/connect error.
+        raise
+
+    # The CAN interface only tells us which arm this cable leads to today; from
+    # here on the arm is referred to by name, and its limits are its own.
     lower = np.radians([measured[f"joint{i}"][0] / 1000.0 for i in JOINTS])
     upper = np.radians([measured[f"joint{i}"][1] / 1000.0 for i in JOINTS])
-    print(f"  {channel} -> {arm_name}  (adapter {hardware_id})")
-    return HardwareLimitedArm(arm, lower, upper, arm_name)
+    print(
+        f"  {channel} -> {arm_name}  (adapter {hardware_id}); "
+        f"firmware={info['software_version']} driver={PiperFW.V189}"
+    )
+    limited = HardwareLimitedArm(arm, lower, upper, arm_name)
+    limited.firmware_info = info
+    limited.firmware_driver = PiperFW.V189
+    return limited
 
 
 def read_sample(arm, label: str) -> ArmSample:
@@ -466,6 +504,59 @@ def arm_status_text(arm) -> tuple[str, str, str]:
         return "?", "?", "?"
     msg = status.msg
     return str(msg.ctrl_mode), str(msg.mode_feedback), str(msg.arm_status)
+
+
+class MITStartupConfirmation:
+    """Require fresh CAN/MIT feedback before and after disabling auto mode TX.
+
+    Observe only after sending support to every enabled arm. Three advancing
+    status samples after the mode frames stop must still report CAN/MIT/NORMAL.
+    Cached feedback from a previous controller cannot complete this handshake.
+    """
+
+    def __init__(self, *arms):
+        self.arms = arms
+        self.stamps = [self._stamp(arm.get_arm_status()) for arm in arms]
+        self.auto_mode_disabled = False
+        self.confirmations = 0
+
+    @staticmethod
+    def _stamp(status):
+        if status is None:
+            return None
+        stamp = float(status.timestamp)
+        return stamp if math.isfinite(stamp) else None
+
+    def observe(self) -> bool:
+        statuses = [arm.get_arm_status() for arm in self.arms]
+        enabled = [arm.get_joints_enable_status_list() for arm in self.arms]
+        healthy = all(
+            flags and len(flags) == N_JOINTS and all(flags)
+            and status is not None
+            and "CAN" in str(status.msg.ctrl_mode)
+            and "MIT" in str(status.msg.mode_feedback)
+            and "NORMAL" in str(status.msg.arm_status)
+            and status.msg.err_code == 0
+            for status, flags in zip(statuses, enabled)
+        )
+        if not healthy:
+            if self.auto_mode_disabled:
+                raise TeleopAbort("lost healthy CAN/MIT feedback during startup verification")
+            return False
+        stamps = [self._stamp(status) for status in statuses]
+        if any(
+            new is None or (old is not None and new <= old)
+            for new, old in zip(stamps, self.stamps)
+        ):
+            return False
+        self.stamps = stamps
+        if not self.auto_mode_disabled:
+            for arm in self.arms:
+                arm.set_auto_set_motion_mode_enabled(False)
+            self.auto_mode_disabled = True
+            return False
+        self.confirmations += 1
+        return self.confirmations >= 3
 
 
 def reject_teaching_mode(arm, label: str) -> None:
@@ -575,8 +666,9 @@ def enable_both_with_safe_commands(
     """Enable and enter MIT while immediately supporting every enabled arm.
 
     ``move_mit`` normally sends a mode-control frame before every joint frame.
-    Once both controllers report CAN/MIT, automatic mode setting is disabled so
-    the steady-state loop sends only the six MIT joint frames per arm and tick.
+    Once both controllers report fresh CAN/MIT, automatic mode setting is
+    disabled. Keep streaming support until three more fresh healthy status
+    samples confirm that both arms stayed in MIT without repeated mode frames.
 
     Assisted control supplies held poses and a feedback callback so it can use
     this same handshake with position support on both arms and per-stream
@@ -585,10 +677,14 @@ def enable_both_with_safe_commands(
     deadline = time.perf_counter() + timeout
     last_leader: Optional[ArmSample] = None
     last_follower: Optional[ArmSample] = None
+    confirmation = MITStartupConfirmation(leader, follower)
 
     while time.perf_counter() < deadline:
         if should_stop is not None and should_stop():
             raise TeleopAbort("startup cancelled")
+        if confirmation.auto_mode_disabled:
+            require_can_mit_enabled(leader, "leader startup")
+            require_can_mit_enabled(follower, "follower startup")
         leader_enabled = leader.get_joints_enable_status_list()
         follower_enabled = follower.get_joints_enable_status_list()
         if before_enable is not None:
@@ -631,15 +727,8 @@ def enable_both_with_safe_commands(
                 max_reference_speed,
             )
 
-        if (leader_enabled and all(leader_enabled)
-                and follower_enabled and all(follower_enabled)):
-            leader_ctrl, leader_mode, _ = arm_status_text(leader)
-            follower_ctrl, follower_mode, _ = arm_status_text(follower)
-            if ("CAN" in leader_ctrl and "MIT" in leader_mode
-                    and "CAN" in follower_ctrl and "MIT" in follower_mode):
-                leader.set_auto_set_motion_mode_enabled(False)
-                follower.set_auto_set_motion_mode_enabled(False)
-                return last_leader, last_follower
+        if confirmation.observe():
+            return last_leader, last_follower
         time.sleep(1.0 / rate_hz)
 
     raise TeleopAbort(
@@ -647,7 +736,8 @@ def enable_both_with_safe_commands(
         f"leader={leader.get_joints_enable_status_list()} "
         f"follower={follower.get_joints_enable_status_list()} "
         f"leader_mode={arm_status_text(leader)[:2]} "
-        f"follower_mode={arm_status_text(follower)[:2]}"
+        f"follower_mode={arm_status_text(follower)[:2]}; "
+        "healthy, advancing status timestamps required"
     )
 
 
@@ -1300,7 +1390,7 @@ def run(args: argparse.Namespace) -> int:
                 leader_gripper = follower_gripper = None
 
         if not args.execute:
-            print("\nREAD-ONLY CHECK COMPLETE: nothing enabled and no command was sent.")
+            print("\nREAD-ONLY CHECK COMPLETE: firmware queried; no enable or motion command sent.")
             print("The reported initial gap is allowed: --execute homes both arms first.")
             print("Add --execute only with both arms supported and the E-stop in hand.")
             return 0

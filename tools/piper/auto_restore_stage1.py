@@ -38,7 +38,8 @@ Sequence
 
 Control is the package's MIT position-impedance stream with follower gravity
 feed-forward on quintic joint-space segments: the same path
-``leader_gravity_id_collect.py`` uses to drive one arm autonomously. Two speeds
+the archived ``leader_gravity_id_collect_v182_deprecated.py`` used to drive one arm
+autonomously. Two speeds
 are kept, and a segment earns ``--fast-speed`` only once it has been watched
 on the hardware at ``--transit-speed``. The whole routine has now been run, so
 everything is fast except the last 12.5 deg onto the peg and back off it --

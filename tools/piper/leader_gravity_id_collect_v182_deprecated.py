@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Collect leader-arm gravity identification data by autonomous MIT replay.
+"""DEPRECATED: v1.8.2 leader-arm gravity identification data collector.
+
+Archived for reference only. This script retains the DEFAULT / 8-bit protocol
+assumptions and is incompatible with the current shared V189 arm builder.
+Future gravity identification on new firmware needs a new collector.
 
     *** WITH --execute THE LEADER (right/secondary) ARM MOVES ON ITS OWN. ***
 
@@ -33,10 +37,6 @@ Every 100 Hz tick of every segment is written to ``<out>/segments/*.npz``;
 ``manifest.jsonl`` indexes them, ``static_summary.csv`` holds the per-pose
 averages and ``metadata.json`` the run configuration.
 
-    python tools/piper/leader_gravity_id_collect.py                   # dry run
-    python tools/piper/leader_gravity_id_collect.py --execute         # static only
-    python tools/piper/leader_gravity_id_collect.py --execute --no-static --episodes 1
-    python tools/piper/leader_gravity_id_collect.py --execute --episodes 50
 """
 
 from __future__ import annotations

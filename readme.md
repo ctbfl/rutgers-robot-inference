@@ -125,6 +125,59 @@ Base RURI imports without the submodule or Piper extra. LeRobot is intentionally
 not part of the `piper` extra: install and configure the appropriate LeRobot,
 PyTorch/CUDA and RealSense stack yourself.
 
+Piper MIT workers use `PiperFW.V189` and query the actual firmware before enabling
+an arm. Missing identification, an unrecognised version, or firmware older than
+`S-V1.8-9` stops startup. Both registered arms reported `S-V1.9-1` on 2026-09-20.
+The SDK remains pinned to `799b841`; its existing torque units and packaged
+gravity calibrations are retained. Updating to the newer SDK
+torque coefficients is a separate calibration migration.
+
+The old gravity identification collector is archived as
+[`leader_gravity_id_collect_v182_deprecated.py`](tools/piper/leader_gravity_id_collect_v182_deprecated.py).
+It retains the v1.8.2 DEFAULT / 8-bit assumptions and is incompatible with the
+current V189 controller. A new collector will be written when recalibration is
+needed; the existing calibration files remain in use.
+
+The [right-leader gravity audit](docs/notes/2026-09-20-piper-gravity-fw191.md)
+checks that pairing against the original current/effort recordings. The separate
+`python -m ruri.client.controllers.single_piper.mit.leader_gravity_check` entry
+is entirely offline by default. Its operator-supported `--execute --seconds 30`
+trial binds the right arm by USB identity, uses `calibration_leader.json`, and
+smoothly releases position hold into the existing gravity-plus-damping law.
+The trial starts from the current stationary pose within the arm's measured
+limits. `./tools/piper/leader_gravity_test` selects the workstation environment
+and waits for Enter before starting a 60-second trial; its timer begins only
+after gravity-only mode is active. Ctrl+C ends the trial early. It records the
+full trial and attempts a fresh position hold on exit;
+there is no automatic home, gripper command, camera access, or torque disable.
+
+For the first single-arm MIT check, `policy_controller --hold-only` holds the
+measured startup joint positions. It skips homing, opens no policy command
+receiver, and sends no gripper commands. It still applies the existing measured
+hardware limits, torque ceilings, speed/tracking checks, and feedback watchdog.
+Startup requires advancing CAN/MIT/NORMAL status before and after automatic
+mode frames are disabled.
+
+Resolve the left/main interface by its registered USB-CAN serial first; the
+interface name can change. With the workspace inspected and the arm supported,
+the live check can be launched using that interface:
+
+```bash
+python -m ruri.client.controllers.single_piper.mit.policy_controller \
+  --follower-can <left-arm-interface> --execute --hold-only \
+  --diagnostic-log logs/piper-v189-hold.jsonl
+```
+
+Omit `--execute` for identification and feedback checks only (a firmware read
+request is sent). In hold-only mode, `--seconds N` counts from HOLD ready rather
+than waiting for a policy command. The default runs until interrupted. Exiting
+does **not** disable joint torque or establish a persistent background hold;
+it disconnects after the existing final hold stream. The diagnostic log saves
+the last five seconds on exit or failure, including firmware, desired/measured
+joints, feed-forward torque, measured effort, and motor current. The default
+calibration is for the left/follower arm; a right-arm test must explicitly use
+`--follower-calibration` with `calibration_leader.json`.
+
 ## Piper leader/follower collection
 
 The standard no-force-feedback MIT path is self-contained in RURI. In the
