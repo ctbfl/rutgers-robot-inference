@@ -85,14 +85,17 @@ resume do not wait for measured arm or gripper agreement. Use
 `--no-startup-home` to start from nominal-clamped current poses instead. Every
 MIT position command passes through the nominal clamp and then that arm's
 measured hardware clamp; measured feedback is preserved. The same virtual
-reference drives both arms directly, through the existing gravity compensation
-and 100 Hz MIT worker. Move the right leader to correct the motion; automatic
-correction stays in the POLICY session, but the leader uses gravity compensation
-and drives the follower. Background inference continues as a preview and cannot
-overwrite the manual reference. Release uses 0.4 seconds of quiet leader motion
-plus fresh inference; then a new RTC segment starts at the corrected state.
-Quiet motion is a release proxy: it cannot distinguish a released hand from a
-hand holding the arm still.
+reference drives both arms through a continuous velocity integrator, existing
+gravity compensation and the 100 Hz MIT worker. Human spring displacement and
+fresh policy proposals blend through a timed weight alpha; MIT gains stay
+fixed. A 50 ms filtered joint deflection must stay above 5 degrees for 0.5 seconds
+before takeover starts. With continuing interaction, alpha then rises to 1 in
+another 0.5 seconds, giving the human exclusive reference control. Missing
+interaction evidence pauses the rise. It holds the current weight for 0.5 seconds
+and fades to zero by 1 second; renewed interaction during recovery must confirm again.
+Inference continues during automatic intervention. Authority phase changes invalidate old chunks and in-flight results. The first shared-reference
+version queries without RTC prefixes because blended references differ from
+policy proposals. See [the control model and right-leader-only circle sample](docs/piper-shared-reference.md).
 
 `q` pauses both arms; enter a task to resume. At the paused prompt, `switch PORT`
 changes checkpoint on the same host and `home` returns both arms to zero at up
@@ -102,14 +105,32 @@ uses the assisted worker's supported hold-and-stop path without homing on exit.
 Runtime aborts use the persistent teleop recovery: hold both measured poses for
 10 seconds, then home with MIT at 0.2 rad/s. The client waits for recovery to
 finish. If feedback or CAN/MIT state cannot support recovery, the worker stops.
-Policy targets are clamped and sent directly; their distance from measured
-positions does not itself trigger an abort.
+Policy proposals are clamped and integrated at a bounded reference velocity.
+The tracking watchdog compares measured position to the applied reference.
 Ordinary single-arm startup/recovery behavior is unchanged.
 
 This example composes `SinglePiperAssistedController`, `AssistedScheduler` and
 the existing terminal interface. It does not create episodes, datasets, videos,
 effort logs or uploads, and does not depend on robot-learning-workflows. Diagnostic
 status is printed to the terminal; observations and control traces stay in memory.
+
+## Right leader shared-reference circle demo
+
+```bash
+# Offline FK/IK audit (requires SciPy, provided by the piper-circle extra).
+python examples/client_single_piper_shared_circle.py
+# Worker + local policy simulation, with automatic artificial intervention.
+python examples/client_single_piper_shared_circle.py --simulate --simulate-intervention --seconds 35
+# Right arm only: enable, home, circle policy; drag to intervene, release to resume.
+python examples/client_single_piper_shared_circle.py --execute
+```
+
+Default circle: home TCP +5 cm forward / +15 cm up, radius 10 cm, circle angular speed 0.5 rad/s
+(12.57 seconds per lap), policy joint velocity limit 0.5 rad/s, and blended
+reference limit 4 rad/s, with relaxed pitching orientation. Human reference damping
+defaults to B=0.1 (`--admittance-damping`) for faster following during a drag.
+No left CAN or cameras are opened.
+Ctrl-C requests HOLD. See [parameters, logging and validation](docs/piper-shared-reference.md).
 
 ## Piper installation
 

@@ -10,23 +10,28 @@ from ruri.client.controllers.single_piper_leader_follower_teleop.config import (
 
 @dataclass(frozen=True, slots=True)
 class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
+    leader_only: bool = False
+    camera_enabled: bool = True
     startup_home: bool = False
     leader_policy_kp: float = 3.0
     leader_policy_kd: float = 0.5
-    gain_transition_s: float = 0.3
     alignment_speed: float = 0.2
     alignment_tolerance: float = 0.04
-    human_reference_speed: float = 0.5
     gripper_reference_speed: float = 0.04
     heartbeat_timeout_s: float = 0.5
-    intervention_error_rad: float = 0.035
-    intervention_release_rad: float = 0.012
-    intervention_gripper_error_m: float = 0.003
-    intervention_gripper_release_m: float = 0.001
-    intervention_confirm_s: float = 0.04
-    intervention_release_s: float = 0.4
-    intervention_release_speed_rad_s: float = 0.03
-    intervention_gripper_release_speed_m_s: float = 0.002
+    reference_speed: float = 0.15
+    policy_reference_speed: float = 0.15
+    policy_reference_gain: float = 2.0
+    interaction_deadzone: tuple[float, ...] = (0.08,) * 6
+    interaction_bias: tuple[float, ...] = (0.0,) * 6
+    admittance_damping: tuple[float, ...] = (2.0,) * 6
+    human_trigger_angle_deg: float = 5.0
+    human_confirm_s: float = 0.5
+    interaction_filter_s: float = 0.05
+    human_takeover_s: float = 0.5
+    human_release_delay_s: float = 0.5
+    human_release_s: float = 1.0
+    interaction_release: float = 0.02
     policy_max_age_s: float = 1.0
     leader_sign: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     leader_offset_rad: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -51,32 +56,45 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
         for name, low, high in (
             ("leader_policy_kp", 0.1, 10.0),
             ("leader_policy_kd", 0.01, 2.0),
-            ("gain_transition_s", 0.05, 3.0),
             ("alignment_speed", 0.01, 0.5),
             ("alignment_tolerance", 0.005, 0.1),
-            ("human_reference_speed", 0.01, 2.0),
+            ("reference_speed", 0.01, 4.0),
+            ("policy_reference_speed", 0.01, 4.0),
+            ("policy_reference_gain", 0.01, 20.0),
+            ("human_trigger_angle_deg", 0.1, 15.0),
+            ("human_confirm_s", 0.05, 5.0),
+            ("interaction_filter_s", 0.001, 0.5),
+            ("human_takeover_s", 0.05, 5.0),
+            ("human_release_delay_s", 0.05, 5.0),
+            ("human_release_s", 0.1, 5.0),
+            ("interaction_release", 0.0, 10.0),
             ("gripper_reference_speed", 0.001, 0.1),
             ("heartbeat_timeout_s", 0.1, 2.0),
-            ("intervention_error_rad", 0.005, 0.2),
-            ("intervention_release_rad", 0.001, 0.1),
-            ("intervention_gripper_error_m", 0.001, 0.02),
-            ("intervention_gripper_release_m", 0.0001, 0.01),
-            ("intervention_confirm_s", 0.01, 0.5),
-            ("intervention_release_s", 0.1, 2.0),
-            ("intervention_release_speed_rad_s", 0.001, 0.2),
-            ("intervention_gripper_release_speed_m_s", 0.0001, 0.02),
             ("policy_max_age_s", 0.1, 5.0),
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or not low <= value <= high:
                 raise ValueError(f"{name} must be finite in [{low}, {high}]")
-        if (
-            self.intervention_release_rad >= self.intervention_error_rad
-            or self.intervention_gripper_release_m >= self.intervention_gripper_error_m
-        ):
-            raise ValueError(
-                "intervention release thresholds must be below entry thresholds"
-            )
+        if self.human_release_delay_s >= self.human_release_s:
+            raise ValueError("require release delay < release duration")
+        if self.reference_speed > self.max_reference_speed:
+            raise ValueError("reference_speed exceeds max_reference_speed")
+        if self.policy_reference_speed > self.reference_speed:
+            raise ValueError("policy_reference_speed exceeds reference_speed")
+        for name in ("interaction_deadzone", "interaction_bias", "admittance_damping"):
+            values = getattr(self, name)
+            if len(values) != 6 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                for v in values
+            ):
+                raise ValueError(f"{name} must contain six finite numbers")
+            if name == "interaction_deadzone" and any(v < 0 for v in values):
+                raise ValueError("interaction deadzone cannot be negative")
+            if name == "admittance_damping" and any(v <= 0 for v in values):
+                raise ValueError("admittance damping must be positive")
+        trigger = self.leader_policy_kp * math.radians(self.human_trigger_angle_deg)
+        if any(d + self.interaction_release >= trigger for d in self.interaction_deadzone):
+            raise ValueError("interaction release threshold must be below the angular trigger")
         if len(self.leader_sign) != 6 or any(
             v not in (-1.0, 1.0) for v in self.leader_sign
         ):
@@ -89,6 +107,8 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
             raise ValueError(
                 "assisted seven-dimensional control requires grippers and limits"
             )
+        if self.leader_only and (tuple(self.leader_sign) != (1.,)*6 or tuple(self.leader_offset_rad) != (0.,)*6):
+            raise ValueError("leader-only control uses the physical leader joint coordinates")
         if type(self.simulate) is not bool:
             raise ValueError("simulate must be a boolean")
         if type(self.trace_queue_size) is not int or self.trace_queue_size < 100:

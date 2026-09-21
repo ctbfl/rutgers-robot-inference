@@ -54,7 +54,7 @@ def hardware_owner():
     # writers that do not participate in that lock; never terminate them here.
     with Path(f"/tmp/astra-piper-{os.getuid()}.hardware.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        markers = ("single_piper.mit.policy_controller", "single_piper.mit.leader_follower",
+        markers = ("single_piper.mit.assisted", "single_piper.mit.policy_controller", "single_piper.mit.leader_follower",
                    "single_piper.mit.leader_gravity_check", "leader_gravity_id_collect.py",
                    "leader_gravity_id_collect_v182_deprecated.py",
                    "client_single_piper", "single_piper_leader_follower_teleop.py",

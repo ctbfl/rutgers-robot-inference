@@ -40,11 +40,12 @@ class AssistedControlTests(unittest.TestCase):
         self.assertTrue(self.mode("HUMAN"))
         before = self.control.target.copy()
         self.tick(leader)
-        np.testing.assert_allclose(self.control.target, before)
-        self.assertEqual(self.control.leader_gain, 0.)
+        self.assertLess(self.control.target[0], before[0])
+        self.assertLessEqual(np.max(np.abs(self.control.target-before)), .00150001)
+        self.assertEqual(self.control.leader_gain, 1.)
         self.assertFalse(self.control.receive(self.packet("target", target=self.q.tolist(), epoch=old_epoch)))
         self.assertFalse(self.control.receive(self.packet("target", target=self.q.tolist())))
-        leader[0] += .1
+        leader[0] += .2
         self.tick(leader)
         self.assertGreater(self.control.target[0], before[0])
         self.assertLessEqual(self.control.target[0] - before[0], .0050001)
@@ -63,7 +64,9 @@ class AssistedControlTests(unittest.TestCase):
         self.assertTrue(self.control.receive(self.packet("target", target=held.tolist())))
         self.assertEqual(self.control.mode, "POLICY")
         np.testing.assert_allclose(self.control.target, held)
-        np.testing.assert_allclose(self.control.leader_target, self.control.mapped(held))
+        self.tick(self.control.leader)
+        np.testing.assert_allclose(self.control.leader_target, self.control.mapped(self.control.target))
+        self.assertLessEqual(np.max(np.abs(self.control.target-held)), .00150001)
 
     def test_homed_arms_with_different_grippers_start_policy_directly(self):
         # Passive CAN sample from the real run that was stuck waiting for ALIGN.
@@ -74,8 +77,12 @@ class AssistedControlTests(unittest.TestCase):
         self.assertFalse(self.control.aligned)
         self.assertTrue(self.mode("POLICY"))
         self.assertTrue(self.control.receive(self.packet("target", target=self.q.tolist())))
-        np.testing.assert_allclose(self.control.target, self.q)
-        np.testing.assert_allclose(self.control.leader_target, self.q)
+        np.testing.assert_allclose(self.control.policy_reference, self.q)
+        initial = self.control.target.copy()
+        self.now += .01
+        self.control.tick(leader, follower)
+        self.assertLessEqual(np.max(np.abs(self.control.target[:6]-initial[:6])), .00150001)
+        np.testing.assert_allclose(self.control.leader_target, self.control.target)
         np.testing.assert_allclose(self.control.leader, leader)
         np.testing.assert_allclose(self.control.follower, follower)
 
@@ -114,7 +121,8 @@ class AssistedControlTests(unittest.TestCase):
         target = self.q.copy()
         target[5] = 100.
         self.assertTrue(self.control.receive(self.packet("target", target=target.tolist())))
-        self.assertAlmostEqual(self.control.target[5], self.control.upper[5])
+        self.assertAlmostEqual(self.control.policy_reference[5], self.control.upper[5])
+        self.assertEqual(self.control.target[5], 0.)
         self.assertFalse(self.control.receive(self.packet("target", target=self.q.tolist(), worker_session="old")))
         self.assertFalse(self.control.receive(self.packet("target", target=self.q.tolist(), monotonic_ns=0)))
         self.assertFalse(self.control.receive(self.packet("target", target=self.q.tolist(), client_session="intruder")))

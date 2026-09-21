@@ -59,10 +59,10 @@ class ManagedAssistedProcess(ManagedMITProcess):
             command += [
                 "--leader-can",
                 self.leader_can,
-                "--follower-can",
-                self.can_interface,
                 "--execute",
             ]
+        if not self.config.simulate and not self.config.leader_only:
+            command += ["--follower-can", self.can_interface]
         self.process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -124,9 +124,17 @@ class SinglePiperAssistedController(RobotSetupController):
         try:
             if not self.config.simulate:
                 self._discovery = SinglePiperLeaderFollowerTeleopController(self.config)
-                self._discovery.connect()
-                self._camera_owner = SinglePiperController(self.config)
-                self._camera_owner.connect_cameras()
+                if self.config.leader_only:
+                    c = self.config
+                    self._discovery._leader_can = self._discovery._discover_registered_arm(
+                        interface=c.leader_can_interface, hardware_id=c.leader_can_hardware_id,
+                        side=c.leader_side, role=c.leader_role,
+                    )
+                else:
+                    self._discovery.connect()
+                if self.config.camera_enabled:
+                    self._camera_owner = SinglePiperController(self.config)
+                    self._camera_owner.connect_cameras()
             self._connected = True
         except BaseException:
             self.disconnect()
@@ -237,7 +245,7 @@ class SinglePiperAssistedController(RobotSetupController):
             )
 
         yield from home_actions(
-            self._io.snapshot,
+            lambda: self._controlled_packet(self._io.snapshot()),
             control_hz=control_hz,
             speed_rad_s=speed_rad_s,
             extra_settled=leader_settled,
@@ -245,6 +253,8 @@ class SinglePiperAssistedController(RobotSetupController):
 
     def _images(self):
         images, times = {}, {}
+        if not self.config.camera_enabled:
+            return images, times
         for name in ("top", "wrist"):
             if self.config.simulate:
                 # Changing RGB buffers exercise real image storage/encoding.
@@ -282,6 +292,17 @@ class SinglePiperAssistedController(RobotSetupController):
             }
         return images, times
 
+    def _controlled_packet(self, packet):
+        if not self.config.leader_only:
+            return packet
+        # Adapt the legacy observation/home helpers locally. Wire telemetry
+        # leaves the absent follower null; the real observation is the leader.
+        return {**packet, "follower": {
+            **packet["leader"],
+            "joint_effort": packet["control"]["leader_joint_effort"],
+            "gripper_force": packet["control"]["leader_gripper_force"],
+        }}
+
     def get_sample(self):
         if self._io is None:
             raise RuntimeError("worker is not started")
@@ -292,7 +313,7 @@ class SinglePiperAssistedController(RobotSetupController):
             raise RuntimeError(
                 f"worker phase={packet['phase']}: {packet.get('reason')}"
             )
-        observation = {**recording_observation(packet), **images}
+        observation = {**recording_observation(self._controlled_packet(packet)), **images}
         for value in observation.values():
             value.setflags(write=False)
         return {

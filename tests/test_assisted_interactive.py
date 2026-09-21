@@ -120,7 +120,8 @@ class AssistedInteractiveTests(unittest.TestCase):
             corrected = robot.get_observation()["observation.state"].copy()
             corrected[0] += 4
             calls = len(policy.inputs)
-            robot.simulate_leader(corrected, duration_s=0.7)
+            # Keep pulling through the new confirmation delay and authority rise.
+            robot.simulate_leader(corrected, duration_s=1.7)
             wait_until(lambda: robot.status()["intervention_active"])
             self.assertEqual(robot.status()["mode"], "POLICY")
             wait_until(lambda: len(policy.inputs) >= calls + 2)
@@ -128,7 +129,7 @@ class AssistedInteractiveTests(unittest.TestCase):
             epochs.append(robot.status()["epoch"])
             self.assertEqual(epochs[0], epochs[1])
             self.assertGreater(
-                policy.inputs[-1]["observation.state"][0], corrected[0] - 1.5
+                policy.inputs[-1]["observation.state"][0], corrected[0] - 3.5
             )
             self.terminal.push("pause")
             wait_until(lambda: len(self.terminal.prompt_requests) == 2)
@@ -183,9 +184,7 @@ class AssistedInteractiveTests(unittest.TestCase):
         self.assertTrue(candidate.closed)
         self.assertEqual(candidate.inputs[0]["prompt"], "A0")
         self.assertNotIn("context.rtc.prev_chunk_left_over", candidate.inputs[0])
-        self.assertEqual(
-            candidate.inputs[1]["context.rtc.estimated_inference_delay_steps"], 4
-        )
+        self.assertNotIn("context.rtc.estimated_inference_delay_steps", candidate.inputs[1])
 
     def test_exit_before_prompt_does_not_start_arms(self):
         self.terminal = FakeTerminal([TerminalEvent("exit")])

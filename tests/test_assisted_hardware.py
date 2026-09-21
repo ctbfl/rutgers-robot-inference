@@ -18,7 +18,7 @@ from ruri.client.controllers.single_piper_assisted.control import (
 )
 
 
-class AssistedHardwareTests(unittest.TestCase):
+class MockPiperRigTestCase(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -66,8 +66,11 @@ class AssistedHardwareTests(unittest.TestCase):
         self.stack.enter_context(
             patch.object(assisted.time, "perf_counter", side_effect=lambda: self.now)
         )
-        self.rig = assisted.PiperRig(SinglePiperAssistedConfig(), "canL", "canF")
+        self.rig = self.make_rig()
         self.addCleanup(self.rig.close)
+
+    def make_rig(self):
+        return assisted.PiperRig(SinglePiperAssistedConfig(), "canL", "canF")
 
     def advance(self, seconds):
         self.now += seconds
@@ -104,6 +107,7 @@ class AssistedHardwareTests(unittest.TestCase):
         )
         return arm
 
+class AssistedHardwareTests(MockPiperRigTestCase):
     def test_enable_holds_both_arms_then_policy_and_human_commands(self):
         self.rig.enable()
         self.assertTrue(self.rig.enabled)
@@ -142,7 +146,7 @@ class AssistedHardwareTests(unittest.TestCase):
         self.rig.send(control, 0.01)
         self.assertTrue(
             all(
-                call.kwargs["kp"] == 0
+                call.kwargs["kp"] == 3
                 for call in self.arms[0].move_mit.call_args_list[-6:]
             )
         )
@@ -210,14 +214,14 @@ class AssistedHardwareTests(unittest.TestCase):
             arm.enable.assert_not_called()
             arm.move_mit.assert_not_called()
 
-    def test_distant_policy_target_is_sent_to_both_arms_without_gap_rejection(self):
+    def test_distant_policy_proposal_moves_shared_reference_at_bounded_speed(self):
         self.rig.enable()
         leader, follower = self.rig.read()
         control = AssistedControl(
             self.rig.config, leader, follower, clock=lambda: self.now
         )
         target = np.r_[self.q.copy(), 0.04]
-        target[0] += 0.8  # Valid nominal target, beyond the former 0.35-rad gate.
+        target[0] += 0.8  # A distant proposal must not jump the motor reference.
         control._mode("POLICY", control.epoch)
         self.assertTrue(
             control.receive(
@@ -233,10 +237,14 @@ class AssistedHardwareTests(unittest.TestCase):
                 }
             )
         )
+        self.advance(.01)
+        control.tick(leader, follower)
         self.rig.send(control, 0.01)
         for arm in self.arms:
             sent = [call.kwargs["p_des"] for call in arm.move_mit.call_args_list[-6:]]
-            np.testing.assert_allclose(sent, target[:6])
+            np.testing.assert_allclose(sent, control.target[:6])
+            self.assertGreater(sent[0], 0.)
+            self.assertLessEqual(sent[0], .00150001)
             arm.electronic_emergency_stop.assert_not_called()
 
     def test_nonfinite_feedback_and_invalid_config_are_rejected(self):
@@ -488,7 +496,7 @@ class AssistedHardwareTests(unittest.TestCase):
             arm.enable.assert_not_called()
             arm.reset.assert_not_called()
 
-    def test_automatic_correction_uses_gravity_only_leader_and_supported_follower(self):
+    def test_automatic_correction_retains_fixed_impedance_on_both_arms(self):
         self.rig.enable()
         control = AssistedControl(
             self.rig.config, *self.rig.read(), clock=lambda: self.now
@@ -497,11 +505,97 @@ class AssistedHardwareTests(unittest.TestCase):
         control.correcting = True
         self.rig.send(control, 0.01)
         self.assertTrue(
-            all(c.kwargs["kp"] == 0 for c in self.arms[0].move_mit.call_args_list[-6:])
+            all(c.kwargs["kp"] == 3 for c in self.arms[0].move_mit.call_args_list[-6:])
         )
         self.assertTrue(
             all(c.kwargs["kp"] == 10 for c in self.arms[1].move_mit.call_args_list[-6:])
         )
+
+
+class LeaderOnlyHardwareTests(MockPiperRigTestCase):
+    def make_rig(self):
+        return assisted.LeaderRig(SinglePiperAssistedConfig(leader_only=True), "canL")
+
+    def test_four_rad_reference_reaches_sdk_without_old_three_rad_clip(self):
+        self.rig.config = replace(self.rig.config, reference_speed=4.,
+                                  policy_reference_speed=.5, max_reference_speed=4.)
+        self.rig.enable()
+        control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
+        control.reference_velocity = np.array([4., -4., 3.5, -3.5, .5, 0.])
+        self.rig.send(control, .01)
+        calls = self.arms[0].move_mit.call_args_list[-6:]
+        np.testing.assert_allclose([call.kwargs['v_des'] for call in calls], control.reference_velocity)
+        self.assertEqual(self.arms[1].mock_calls, [])
+
+    def test_single_driver_and_fixed_mit_for_every_authority(self):
+        assisted.mit.build_arm.assert_called_once_with("canL")
+        self.rig.enable()
+        self.assertIsNone(self.rig.follower)
+        self.arms[1].assert_not_called()
+        self.assertEqual(self.arms[1].mock_calls, [])
+        for mode, correcting in (("HOLD", False), ("POLICY", False), ("POLICY", True), ("HUMAN", False)):
+            control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
+            control.mode, control.correcting = mode, correcting
+            control.reference_velocity = np.array([.03, -.04, .02, .01, -.01, .0])
+            self.rig.leader_gravity.torque = lambda q: np.arange(6)*.1
+            self.rig.send(control, .01)
+            calls = self.arms[0].move_mit.call_args_list[-6:]
+            np.testing.assert_allclose([c.kwargs["v_des"] for c in calls], control.reference_velocity)
+            np.testing.assert_allclose([c.kwargs["t_ff"] for c in calls], np.arange(6)*.1)
+            self.assertTrue(all(c.kwargs["kp"] == 3. and c.kwargs["kd"] == .5 for c in calls))
+        self.assertNotIn("follower_q", self.rig.telemetry())
+        self.rig.emergency_stop()
+        self.rig.close()
+        self.arms[0].electronic_emergency_stop.assert_called_once()
+        self.assertEqual(self.arms[1].mock_calls, [])
+
+    def test_single_home_reaches_zero_and_preserves_fixed_gains(self):
+        self.rig.enable()
+        self.arms[0].move_mit.side_effect = lambda **kw: self.q.__setitem__(kw["joint_index"]-1, kw["p_des"])
+        self.rig.home()
+        np.testing.assert_allclose(self.q, 0., atol=1e-8)
+        np.testing.assert_allclose(self.rig.initial_hold[0][:6], 0.)
+        self.assertTrue(all(c.kwargs["kp"] == 3. and c.kwargs["kd"] == .5 for c in self.arms[0].move_mit.call_args_list))
+        self.assertEqual(self.arms[1].mock_calls, [])
+
+    def test_single_cancel_and_cached_status_cannot_enable_ready(self):
+        with self.assertRaisesRegex(assisted.mit.TeleopAbort, "cancelled"):
+            self.rig.enable(should_stop=lambda: True)
+        self.arms[0].enable.assert_not_called()
+        status = self.arms[0].get_arm_status.return_value
+        self.arms[0].get_arm_status.side_effect = lambda: SimpleNamespace(msg=status.msg, timestamp=1.)
+        with self.assertRaisesRegex(assisted.mit.TeleopAbort, "advancing healthy"):
+            self.rig.enable()
+        self.assertFalse(self.rig.enabled)
+        self.assertEqual(self.arms[1].mock_calls, [])
+
+    def test_single_track_error_and_stale_status_stop_motion(self):
+        self.rig.enable()
+        control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
+        control.leader_target[0] += .36
+        before = self.arms[0].move_mit.call_count
+        with self.assertRaisesRegex(assisted.mit.TeleopAbort, "tracking error"):
+            self.rig.send(control, .01)
+        self.assertEqual(self.arms[0].move_mit.call_count, before)
+        control.leader_target[0] -= .36
+        self.rig.send(control, .01)
+        self.advance(.3)
+        with self.assertRaisesRegex(assisted.mit.TeleopAbort, "timestamps"):
+            self.rig.send(control, .01)
+
+    def test_controller_connect_discovers_only_right_and_opens_no_camera(self):
+        from ruri.client.controllers.single_piper_assisted import controller as boundary
+        robot = boundary.SinglePiperAssistedController({"leader_only": True, "camera_enabled": False})
+        with patch.object(boundary, "SinglePiperLeaderFollowerTeleopController") as discovery, patch.object(boundary, "SinglePiperController") as camera:
+            robot.connect()
+            self.assertTrue(robot.is_connected)
+            d = discovery.return_value
+            d.connect.assert_not_called()
+            d._discover_registered_arm.assert_called_once()
+            self.assertEqual(d._discover_registered_arm.call_args.kwargs["side"], "right")
+            camera.assert_not_called()
+            self.assertEqual(robot._images(), ({}, {}))
+            robot.disconnect()
 
 
 class AssistedRecoveryLifecycleTests(unittest.TestCase):

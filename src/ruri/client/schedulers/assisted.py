@@ -214,6 +214,11 @@ class AssistedScheduler:
         ):
             return
         last_step, tail, consumed = self._timeline.request_snapshot()
+        if state.get("control_schema") == "ruri_shared_reference_v1":
+            # The timeline contains policy proposals, not the applied reference.
+            # V1 replans without RTC conditioning rather than presenting a
+            # blended/velocity-limited proposal as an executed physical prefix.
+            tail, consumed = None, 0
         delay = min(max(self._delay_history), 0 if tail is None else len(tail))
         self._request_id += 1
         if self._request_id == 1:
@@ -316,19 +321,21 @@ class AssistedScheduler:
                     max(actual_delay, math.ceil(duration * self.control_hz))
                 )
                 if state.get("intervention_active") and state["mode"] == "POLICY":
-                    # Keep inference active while the physical leader owns the
-                    # reference. This is a preview, not executed RTC history.
+                    # Fresh short proposals continue affecting the blend while
+                    # the human interacts; no old chunk is resumed on release.
                     target, _ = clip_target(self.controller, chunk[0].copy())
                     self.controller.send_action(
                         target, reference_revision=revision,
                         observation_ns=token.observation_ns, model_action=True,
                     )
-                    audit["disposition"] = "human_preview"
+                    audit["disposition"] = "blended_proposal"
                     continue
                 install = self._timeline.install(
                     chunk=chunk,
                     chunk_id=token.request_id,
-                    anchor_step=token.anchor_step,
+                    anchor_step=(self._timeline.latest_sent_step()+1
+                                 if state.get("control_schema") == "ruri_shared_reference_v1"
+                                 else token.anchor_step),
                 )
                 audit["install"] = install
                 if install["installed"]:

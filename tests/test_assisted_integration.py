@@ -75,7 +75,7 @@ class AssistedIntegrationTests(unittest.TestCase):
         self.assertEqual(self.robot.status()["mode"], "HUMAN")
         q = self.robot.get_sample()["observation"]["observation.state"].copy()
         q[0] += 5.0
-        self.robot.simulate_leader(q)
+        self.robot.simulate_leader(q, duration_s=2.0)
         self.drive(scheduler, lambda: self.robot.status()["target"][0] > 3.0)
         scheduler.pause()
         scheduler.replace_policy(Policy(), "v1")
@@ -174,7 +174,7 @@ class AssistedIntegrationTests(unittest.TestCase):
         epoch = self.robot.status()["epoch"]
         target = states[-1].copy()
         target[0] += 4.0
-        self.robot.simulate_leader(target, duration_s=0.5)
+        self.robot.simulate_leader(target, duration_s=2.0)
         self.drive(scheduler, lambda: self.robot.status()["intervention_active"])
         self.assertEqual(self.robot.status()["mode"], "POLICY")
         self.assertEqual(self.robot.status()["epoch"], epoch)
@@ -184,14 +184,14 @@ class AssistedIntegrationTests(unittest.TestCase):
         )
         # The next query uses the actual follower observation during catch-up,
         # not a fictitious exact copy of the human's leader pose.
-        self.drive(scheduler, lambda: states[-1][0] > target[0] - 1.5)
+        self.drive(scheduler, lambda: states[-1][0] > 0.8)
         self.drive(scheduler, lambda: self.robot.status()["source"] == "policy")
         self.assertEqual(self.robot.status()["epoch"], epoch)
         self.assertEqual(self.robot.status()["intervention_id"], 1)
         self.assertLess(np.max(np.abs(self.robot.status()["coupling_error"])), 0.02)
         # Periodic inference was issued while a previous chunk still had rows.
         self.assertGreater(len(states), 3)
-        previews = [r for r in self.inference_results if r["disposition"] == "human_preview"]
+        previews = [r for r in self.inference_results if r["disposition"] == "blended_proposal"]
         self.assertTrue(previews)
         self.assertTrue(all(not r["inference"].rtc_requested for r in previews))
         obsolete = [

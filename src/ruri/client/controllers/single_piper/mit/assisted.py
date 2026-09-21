@@ -1,8 +1,8 @@
 """Persistent assisted MIT worker; --simulate exercises the same protocol/core.
 
-Startup enables into HOLD and optionally homes both arms before READY.
+Startup enables into HOLD and optionally homes the connected arms before READY.
 Timeout and normal exit hold; runtime aborts use teleop's MIT hold/home recovery.
-Only this process opens the two CAN devices. The optional simulation path opens
+Only this process opens CAN; leader_only opens only the registered right arm. The optional simulation path opens
 neither CAN nor cameras and is suitable for client/server integration tests.
 """
 
@@ -36,13 +36,15 @@ class SimulatedRig:
         self.leader_name, self.follower_name = "right_arm", "left_arm"
         self.leader = np.asarray([0.0, 0.4, -0.4, 0.0, 0.0, 0.0, 0.04])
         self.follower = self.leader.copy()
+        if config.leader_only:
+            self.follower_name = "right_arm"
         self.previous = self.leader.copy(), self.follower.copy()
         self.samples = None
         self.enabled = False
         self.human_until = 0.0
 
     def read(self):
-        return self.leader.copy(), self.follower.copy()
+        return self.leader.copy(), (self.leader if self.config.leader_only else self.follower).copy()
 
     def enable(self, should_stop=lambda: False):
         self.enabled = not should_stop()
@@ -54,7 +56,7 @@ class SimulatedRig:
         )
         began = time.monotonic()
         print(
-            f"STARTUP HOME: simulated paired MIT home over {duration:.1f}s", flush=True
+            f"STARTUP HOME: simulated MIT home over {duration:.1f}s", flush=True
         )
         while True:
             if should_stop():
@@ -66,20 +68,20 @@ class SimulatedRig:
                 break
             time.sleep(1.0 / self.config.mit_rate_hz)
         self.initial_hold = self.read()
-        print("STARTUP HOME COMPLETE: both simulated arms home", flush=True)
+        print("STARTUP HOME COMPLETE: right simulated leader home" if self.config.leader_only
+              else "STARTUP HOME COMPLETE: both simulated arms home", flush=True)
 
     def emergency_stop(self):
         self.enabled = False
 
     def send(self, control, dt):
         self.previous = self.leader.copy(), self.follower.copy()
-        if (
-            control.mode != "HUMAN"
-            and not control.correcting
-            and time.monotonic() >= self.human_until
-        ):
+        # Pose injection models an external constraint only for its duration;
+        # the motion servo remains active in every authority state.
+        if time.monotonic() >= self.human_until:
             self.leader += np.clip(control.leader_target - self.leader, -dt, dt)
-        self.follower += np.clip(control.target - self.follower, -dt, dt)
+        if not self.config.leader_only:
+            self.follower += np.clip(control.target - self.follower, -dt, dt)
 
     def human(self, target, duration_s=0.0):
         if not np.isfinite(duration_s) or not 0 <= duration_s <= 10.0:
@@ -91,13 +93,16 @@ class SimulatedRig:
         return {
             "leader_q": self.leader[:6],
             "leader_qd": np.zeros(6),
-            "follower_q": self.follower[:6],
-            "follower_qd": np.zeros(6),
-            "follower_joint_effort": np.zeros(6),
+            "follower_q": None if self.config.leader_only else self.follower[:6],
+            "follower_qd": None if self.config.leader_only else np.zeros(6),
+            "follower_joint_effort": None if self.config.leader_only else np.zeros(6),
             "leader_gripper_width": self.leader[6],
-            "follower_gripper_width": self.follower[6],
-            "follower_gripper_force": 0.0,
+            "follower_gripper_width": None if self.config.leader_only else self.follower[6],
+            "follower_gripper_force": None if self.config.leader_only else 0.0,
         }
+
+    def control_telemetry(self):
+        return {"leader_joint_effort": [0.] * 6, "leader_gripper_force": 0.}
 
     def close(self):
         pass
@@ -190,16 +195,13 @@ class PiperRig:
             raise
 
     def read(self, *, check_speed=True):
-        self.samples = (
-            mit.read_sample(self.leader, "leader"),
-            mit.read_sample(self.follower, "follower"),
-        )
-        self.grips = (
-            mit.read_gripper(self.leader_gripper),
-            mit.read_gripper(self.follower_gripper),
-        )
+        devices = [(self.leader, self.leader_gripper, "leader")]
+        if self.follower is not None:
+            devices.append((self.follower, self.follower_gripper, "follower"))
+        self.samples = tuple(mit.read_sample(arm, label) for arm, _, label in devices)
+        self.grips = tuple(mit.read_gripper(grip) for _, grip, _ in devices)
         if any(g is None for g in self.grips):
-            raise mit.TeleopAbort("both gripper feedback streams are required")
+            raise mit.TeleopAbort("all connected gripper feedback streams are required")
         now = time.perf_counter()
         for label, sample, grip, watches in zip(
             ("leader", "follower"), self.samples, self.grips, self.fresh
@@ -236,7 +238,10 @@ class PiperRig:
                     f"{label} J{joint + 1} measured speed {sample.qd[joint]:.3f} rad/s "
                     f"exceeded {self.config.max_joint_speed:.3f} rad/s limit"
                 )
-        return tuple(np.r_[s.q, g.width] for s, g in zip(self.samples, self.grips))
+        values = tuple(np.r_[s.q, g.width] for s, g in zip(self.samples, self.grips))
+        # Core accepts leader and controlled observations; single-arm uses the
+        # same measurement, with no second driver or second set of commands.
+        return values if len(values) == 2 else (values[0], values[0].copy())
 
     def enable(self, should_stop=lambda: False):
         if should_stop():
@@ -400,31 +405,29 @@ class PiperRig:
     def send(self, control, dt):
         del dt
         c = self.config
-        # A policy target is a desired position, not evidence of failed
-        # tracking before it is sent. Both arms accept it through their clamps;
-        # physical leader deviation belongs to the correction state machine.
+        # Watch the applied, rate-limited reference, not the distant proposal.
+        for sample, target, label in ((self.samples[0], control.leader_target, "leader"),
+                                      (self.samples[1], control.target, "follower")):
+            error = float(np.max(np.abs(sample.q-target[:6])))
+            if error > c.max_track_error:
+                raise mit.TeleopAbort(f"{label} reference tracking error {error:.3f} rad")
         start_ns = time.monotonic_ns()
-        if control.mode == "HUMAN" or control.correcting:
-            mit.send_leader(
-                self.leader, self.samples[0], self.leader_gravity, c.leader_kd
-            )
-        else:
-            mit.send_position_impedance(
-                self.leader,
-                self.samples[0],
-                control.leader_target[:6],
-                np.zeros(6),
-                self.leader_gravity,
-                c.leader_policy_kp * control.leader_gain,
-                c.leader_policy_kd,
-                c.max_reference_speed,
-                "leader",
-            )
+        mit.send_position_impedance(
+            self.leader,
+            self.samples[0],
+            control.leader_target[:6],
+            np.asarray(c.leader_sign) * control.reference_velocity,
+            self.leader_gravity,
+            c.leader_policy_kp,
+            c.leader_policy_kd,
+            c.max_reference_speed,
+            "leader",
+        )
         mit.send_position_impedance(
             self.follower,
             self.samples[1],
             control.target[:6],
-            np.zeros(6),
+            control.reference_velocity,
             self.follower_gravity,
             c.follower_kp,
             c.follower_kd,
@@ -482,6 +485,10 @@ class PiperRig:
         nominal = np.clip(width, mit.GRIPPER_LIMIT_LOWER, mit.GRIPPER_LIMIT_UPPER)
         gripper.move_gripper_m(float(np.clip(nominal, low[6], high[6])), force)
 
+    def control_telemetry(self):
+        return {"leader_joint_effort": self.samples[0].joint_effort.tolist(),
+                "leader_gripper_force": float(self.grips[0].force)}
+
     def telemetry(self):
         a, b = self.samples
         ga, gb = self.grips
@@ -517,6 +524,155 @@ class PiperRig:
                     print(f"Electronic stop delivery failed: {exc}", flush=True)
 
 
+class LeaderRig(PiperRig):
+    """One real right arm, using the shared-reference core and V189 MIT path."""
+
+    def __init__(self, config, leader_can):
+        self.config = config
+        self.leader = self.follower = None
+        self.leader_gripper = self.follower_gripper = None
+        self.samples = self.grips = None
+        self.energized = self.enabled = False
+        self.startup_phase = "opening right leader feedback"
+        try:
+            actual = find_arm_by_hardware_id(read_can_hardware_id(leader_can))
+            expected = find_arm_registration(config.leader_side, config.leader_role)
+            if actual != expected or actual.name != "right_arm":
+                raise ValueError(f"{leader_can} must resolve to the registered right leader")
+            self.leader_name = self.follower_name = actual.name
+            self.leader = NominalLimitedArm(mit.build_arm(leader_can))
+            mit.reject_teaching_mode(self.leader, "right leader")
+            self.leader_gravity = mit.GravityCompensator(mit.ASSET_ROOT / "calibration_leader.json")
+            self.leader_gripper = LimitedGripper(self.leader.init_effector("agx_gripper"), actual.name)
+            self.fresh = [[mit.FeedbackWatchdog(config.feedback_timeout_s) for _ in range(8)]]
+            self.status_fresh = mit.FeedbackWatchdog(config.feedback_timeout_s)
+            self.last_status = 0.0
+            time.sleep(0.5)
+        except BaseException:
+            self.close()
+            raise
+
+    def enable(self, should_stop=lambda: False):
+        if should_stop():
+            raise mit.TeleopAbort("startup cancelled")
+        if "EMERGENCY_STOP" in mit.arm_status_text(self.leader)[2]:
+            raise mit.TeleopAbort("right leader has a latched electronic stop")
+        self.startup_phase = "right leader CAN/MIT enable"
+        self.leader.set_follower_mode()
+        time.sleep(0.3)
+        self.initial_hold = tuple(clamp_pose(v) for v in self.read())
+        hold = AssistedControl(self.config, *self.initial_hold)
+        confirmation = mit.MITStartupConfirmation(self.leader)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if should_stop():
+                raise mit.TeleopAbort("startup cancelled")
+            self.read()
+            if confirmation.auto_mode_disabled:
+                mit.require_can_mit_enabled(self.leader, "right leader startup")
+            flags = self.leader.get_joints_enable_status_list()
+            if not flags or len(flags) != 6 or not all(flags):
+                self.energized = True
+                self.leader.enable()
+            flags = self.leader.get_joints_enable_status_list()
+            if flags and len(flags) == 6 and all(flags):
+                self.energized = True
+                self.send(hold, 1.0/self.config.mit_rate_hz)
+                if confirmation.observe():
+                    self.enabled = True
+                    self.startup_phase = "supported right hold verification"
+                    verify_until = time.monotonic()+self.config.feedback_timeout_s
+                    while time.monotonic() < verify_until:
+                        if should_stop():
+                            raise mit.TeleopAbort("startup cancelled")
+                        self.read()
+                        self.send(hold, 1.0/self.config.mit_rate_hz)
+                        time.sleep(1.0/self.config.mit_rate_hz)
+                    self.startup_phase = "running"
+                    return
+            time.sleep(1.0/self.config.mit_rate_hz)
+        raise mit.TeleopAbort("right leader startup lacked advancing healthy CAN/MIT feedback")
+
+    def send(self, control, dt):
+        del dt
+        c = self.config
+        error = np.max(np.abs(self.samples[0].q-control.leader_target[:6]))
+        if error > c.max_track_error:
+            raise mit.TeleopAbort(f"right leader reference tracking error {error:.3f} rad")
+        start = time.monotonic_ns()
+        mit.send_position_impedance(
+            self.leader, self.samples[0], control.leader_target[:6],
+            control.reference_velocity, self.leader_gravity,
+            c.leader_policy_kp, c.leader_policy_kd, c.max_reference_speed, "right leader",
+        )
+        self._send_gripper(self.leader_gripper, self.leader_name, control.leader_target[6], c.grip_base)
+        self.send_span_ns = time.monotonic_ns()-start
+        if self.enabled:
+            now = time.perf_counter()
+            status = self.leader.get_arm_status()
+            stamp = float(status.timestamp) if status is not None else float("nan")
+            if not np.isfinite(stamp):
+                raise mit.TeleopAbort("right leader status timestamp is non-finite")
+            self.status_fresh.observe((stamp,), now)
+            if now-self.last_status >= 0.1:
+                mit.require_can_mit_enabled(self.leader, "right leader")
+                if status.msg.err_code != 0:
+                    raise mit.TeleopAbort(f"right leader error code {status.msg.err_code}")
+                self.last_status = now
+
+    def _home(self, should_stop, on_progress, hold_seconds, speed):
+        self.startup_phase = "right leader MIT home"
+        c = self.config
+        mit.require_can_mit_enabled(self.leader, "right leader before home")
+        leader, observed = self.read(check_speed=False)
+        control = AssistedControl(c, leader, observed)
+        began = time.monotonic()
+        while time.monotonic()-began < hold_seconds:
+            if should_stop():
+                return False
+            self.read(check_speed=time.monotonic()-began > 1.0)
+            self.send(control, 1.0/c.mit_rate_hz)
+            on_progress()
+            time.sleep(1.0/c.mit_rate_hz)
+        start = clamp_pose(self.read()[0])
+        duration = mit.recovery_home_duration(start[:6], start[:6], speed)
+        print(f"RIGHT LEADER HOME: {duration:.1f}s, reference <= {speed:.2f} rad/s", flush=True)
+        began = time.monotonic()
+        settled_since = None
+        while True:
+            if should_stop():
+                return False
+            elapsed = time.monotonic()-began
+            self.read()
+            q, velocity = mit.home_reference(start[:6], elapsed, duration)
+            control.leader_target = np.r_[q, start[6]]
+            control.reference_velocity = velocity
+            self.send(control, 1.0/c.mit_rate_hz)
+            on_progress()
+            if elapsed >= duration:
+                settled = np.max(np.abs(self.samples[0].q)) <= .05 and np.max(np.abs(self.samples[0].qd)) <= .05
+                settled_since = (settled_since or time.monotonic()) if settled else None
+                if settled_since is not None and time.monotonic()-settled_since >= .3:
+                    break
+                if elapsed > duration+5.:
+                    raise mit.TeleopAbort("right leader did not settle at home")
+            time.sleep(1.0/c.mit_rate_hz)
+        self.initial_hold = (np.r_[np.zeros(6), start[6]], np.r_[np.zeros(6), start[6]])
+        self.startup_phase = "running"
+        return True
+
+    def home(self, should_stop=lambda: False):
+        if not self._home(should_stop, lambda: None, 0., self.config.start_home_speed):
+            raise mit.TeleopAbort("startup home cancelled")
+
+    def recover_home_after_abort(self, *, should_stop, on_progress):
+        return self._home(should_stop, on_progress, self.config.abort_hold_seconds, self.config.abort_home_speed)
+
+    def telemetry(self):
+        return {"leader_q": self.samples[0].q, "leader_qd": self.samples[0].qd,
+                "leader_gripper_width": self.grips[0].width}
+
+
 def run(
     config,
     worker_session,
@@ -549,6 +705,7 @@ def run(
         rig = (
             SimulatedRig(config)
             if config.simulate
+            else LeaderRig(config, leader_can) if config.leader_only
             else PiperRig(config, leader_can, follower_can)
         )
         rig.enable(should_stop=lambda: stopped)
@@ -598,21 +755,19 @@ def run(
             control.tick(leader, follower)
             rig.send(control, dt)
             if not ready_reported:
-                print(
-                    "ASSISTED READY: both arms homed; ready for policy"
-                    if config.startup_home
-                    else "ASSISTED READY: HOLD at nominal-clamped current poses; startup home disabled",
-                    flush=True,
-                )
+                subject = "right leader" if config.leader_only else "both arms"
+                location = "homed" if config.startup_home else "holding nominal-clamped current poses"
+                print(f"ASSISTED READY: {subject} {location}; ready for policy", flush=True)
                 ready_reported = True
             telemetry.publish(
                 phase="engaged",
                 **rig.telemetry(),
                 follower_target_q=control.target[:6],
-                follower_target_qd=np.zeros(6),
+                follower_target_qd=control.reference_velocity,
                 follower_gripper_target=control.target[6],
                 control={
                     **control.status(),
+                    **rig.control_telemetry(),
                     "send_span_ns": getattr(rig, "send_span_ns", 0),
                     "leader_target": control.leader_target.tolist(),
                 },
@@ -627,6 +782,8 @@ def run(
             print(f"ASSISTED failure phase: {rig.startup_phase}", flush=True)
             # Record controller state before recovery or emergency stop.
             for arm, label in ((rig.leader, "leader"), (rig.follower, "follower")):
+                if arm is None:
+                    continue
                 try:
                     print(
                         f"{label} before recovery: {mit.arm_status_text(arm)}; "

@@ -28,6 +28,9 @@ piper = [
     "typing-extensions>=3.7.4.3",
 ]
 
+piper-circle = [
+    "scipy>=1.10",
+]
 
 [project.scripts]
 ruri-server = "ruri.server.__main__:main"
