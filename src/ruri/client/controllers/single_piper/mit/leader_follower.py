@@ -837,6 +837,10 @@ def home_both_with_mit(
     command_label = phase_label.lower()
     leader_label = f"leader {command_label}"
     follower_label = f"follower {command_label}"
+    # Assisted gravity handoff keeps the validated right-arm gains throughout
+    # enable, home and operation; legacy teleop retains its existing defaults.
+    leader_kp = getattr(args, "leader_home_kp", args.follower_kp)
+    leader_kd = getattr(args, "leader_home_kd", args.follower_kd)
     def running():
         return _running if should_stop is None else not should_stop()
 
@@ -873,8 +877,8 @@ def home_both_with_mit(
             leader_hold,
             np.zeros(N_JOINTS),
             leader_gravity,
-            args.follower_kp,
-            args.follower_kd,
+            leader_kp,
+            leader_kd,
             args.max_reference_speed,
             leader_label,
         )
@@ -950,8 +954,8 @@ def home_both_with_mit(
             leader_des,
             leader_vel,
             leader_gravity,
-            args.follower_kp,
-            args.follower_kd,
+            leader_kp,
+            leader_kd,
             args.max_reference_speed,
             leader_label,
         )
@@ -1017,8 +1021,8 @@ def home_both_with_mit(
             np.zeros(N_JOINTS),
             np.zeros(N_JOINTS),
             leader_gravity,
-            args.follower_kp,
-            args.follower_kd,
+            leader_kp,
+            leader_kd,
             args.max_reference_speed,
             leader_label,
         )

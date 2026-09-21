@@ -58,10 +58,10 @@ class SharedLeaderIntegrationTests(unittest.TestCase):
         q = np.array(packet['leader']['q']); q[0] += .2
         robot.simulate_leader(normalize_pose(q, packet['leader']['gripper_width']), duration_s=2.)
         before = len(inputs_seen)
-        drive(.3)
+        drive(.05)
         self.assertEqual(robot.status()['human_weight'], 0.)
         self.assertFalse(robot.status()['intervention_active'])
-        drive(.9)
+        drive(.7)
         self.assertTrue(robot.status()['human_exclusive'])
         self.assertEqual(robot.status()['human_weight'], 1.)
         np.testing.assert_allclose(robot.status()['applied_policy_velocity'], 0.)
@@ -71,8 +71,9 @@ class SharedLeaderIntegrationTests(unittest.TestCase):
         self.assertFalse(robot.status()['intervention_active'])
         self.assertEqual(robot.status()['mode'], 'POLICY')
         self.assertEqual(robot.status()['epoch'], epoch)
-        # Initial blend, exclusive takeover, exclusive release, end of blend.
-        self.assertEqual(robot.status()['reference_revision'], 4)
+        # Initial blend, gravity-only entry, and fresh recovery. Finishing the
+        # gain ramp preserves the fresh proposal instead of braking it again.
+        self.assertEqual(robot.status()['reference_revision'], 3)
         exclusive = [p for p in records if p['control']['human_exclusive']]
         self.assertTrue(exclusive)
         for packet in exclusive:

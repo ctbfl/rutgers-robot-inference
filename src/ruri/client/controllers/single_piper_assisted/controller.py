@@ -167,7 +167,8 @@ class SinglePiperAssistedController(RobotSetupController):
                     packet = self._io.snapshot(wait_s=0.1)
                     if packet["phase"] == "engaged":
                         break
-                    raise RuntimeError(f"worker startup failed: {packet.get('reason')}")
+                    details = "\n".join(list(self._worker.logs)[-20:])
+                    raise RuntimeError(f"worker startup failed: {packet.get('reason')}\n{details}")
                 except TimeoutError:
                     if time.monotonic() >= deadline:
                         raise TimeoutError(

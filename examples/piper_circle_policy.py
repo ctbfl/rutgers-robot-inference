@@ -25,15 +25,21 @@ DEFAULT_PERIOD = 2 * math.pi / .5  # Circle phase advances at 0.5 rad/s.
 DEFAULT_TCP_SPEED = .10  # Allows catching a circle point moving at 0.05 m/s.
 DEFAULT_REFERENCE_SPEED = 4.
 DEFAULT_POLICY_SPEED = .5
+RUNTIME_IK_TOLERANCE_M = .0005  # 0.5 mm for the moving demo; audit remains 0.05 mm.
+
+
+class IKConvergenceError(ValueError):
+    """No sufficiently accurate solution found for this requested TCP step."""
 
 
 class PiperTCP:
-    def __init__(self, tcp_offset=(0., 0., .1358)):
+    def __init__(self, tcp_offset=(0., 0., .1358), *, config=None):
         self.chain = PiperGravity()
         self.offset = np.asarray(tcp_offset, dtype=float)
         if self.offset.shape != (3,) or not np.isfinite(self.offset).all():
             raise ValueError("TCP offset must contain three finite metres")
-        self.low, self.high = (v[:6] for v in synchronized_bounds(SinglePiperAssistedConfig(leader_only=True)))
+        self.config = config or SinglePiperAssistedConfig(leader_only=True)
+        self.low, self.high = (v[:6] for v in synchronized_bounds(self.config))
         self.origins_R = [rpy_to_R(*rpy) for rpy in self.chain.joint_rpy]
 
     def frames(self, q):
@@ -53,11 +59,13 @@ class PiperTCP:
         p, R, _, _ = self.frames(q)
         return p, R
 
-    def ik(self, xyz, seed, tool_axis=None):
+    def ik(self, xyz, seed, tool_axis=None, *, position_tolerance=5e-5):
         xyz = np.asarray(xyz, dtype=float)
         seed = np.asarray(seed, dtype=float)
         if xyz.shape != (3,) or seed.shape != (6,) or not np.isfinite(np.r_[xyz, seed]).all():
             raise ValueError("IK requires finite xyz and six-joint seed")
+        if not math.isfinite(position_tolerance) or position_tolerance <= 0:
+            raise ValueError("IK position tolerance must be positive and finite")
         seed = np.clip(seed, self.low+1e-9, self.high-1e-9)
         axis = self.fk(seed)[1][:, 2] if tool_axis is None else np.asarray(tool_axis, dtype=float)
         if axis.shape != (3,) or not np.isfinite(axis).all() or np.linalg.norm(axis) < 1e-9:
@@ -83,9 +91,11 @@ class PiperTCP:
 
         result = least_squares(residual, seed, jac=jacobian, bounds=(self.low, self.high),
                                max_nfev=100, ftol=1e-8, xtol=1e-8, gtol=1e-8)
+        if not np.isfinite(result.x).all():
+            raise IKConvergenceError("IK produced a non-finite solution")
         error = float(np.linalg.norm(self.fk(result.x)[0]-xyz))
-        if error > 5e-5 or not np.isfinite(result.x).all():
-            raise ValueError(f"IK did not reach TCP target; position error {error*1000:.3f} mm")
+        if error > position_tolerance:
+            raise IKConvergenceError(f"IK did not reach TCP target; position error {error*1000:.3f} mm")
         return result.x.copy()
 
 
@@ -93,11 +103,14 @@ class CirclePolicy(PolicyWrapper):
     POLICY_METADATA = {"inputs": {"observation.state": {"type": "state"}}}
 
     def __init__(self, *, radius=DEFAULT_RADIUS, period=DEFAULT_PERIOD, tcp_speed=DEFAULT_TCP_SPEED, lookahead=.5,
-                 center_offset=(.05, 0., .15), tcp_offset=(0., 0., .1358), clock=time.monotonic):
+                 center_offset=(.05, 0., .15), tcp_offset=(0., 0., .1358), clock=time.monotonic,
+                 config=None):
         for name, value in (("radius", radius), ("period", period), ("tcp_speed", tcp_speed), ("lookahead", lookahead)):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive and finite")
-        self.kin = PiperTCP(tcp_offset)
+        self.kin = PiperTCP(tcp_offset, config=config)
+        if tuple(self.kin.config.leader_sign) != (1.,)*6 or tuple(self.kin.config.leader_offset_rad) != (0.,)*6:
+            raise ValueError("circle demo expects identical left/right joint coordinates")
         offset = np.asarray(center_offset, dtype=float)
         if offset.shape != (3,) or not np.isfinite(offset).all():
             raise ValueError("center offset must contain three finite metres")
@@ -134,14 +147,34 @@ class CirclePolicy(PolicyWrapper):
         measured = low+(np.r_[(state[:6]+100.)/200., state[6]/100.])*(high-low)
         q, width = measured[:6], float(np.clip(measured[6], 0., .08))
         elapsed = self.clock()-self.started
-        goal, axis = self.goal(elapsed)
+        goal, _ = self.goal(elapsed)
         current = self.kin.fk(q)[0]
         delta = goal-current
         # Recompute the straight approach from the latest measured TCP every call.
-        next_xyz = current + delta*min(1., self.tcp_speed*self.lookahead/max(np.linalg.norm(delta), 1e-12))
-        next_q = self.kin.ik(next_xyz, q, self.preferred_axis(next_xyz, elapsed))
+        step = delta*min(1., self.tcp_speed*self.lookahead/max(np.linalg.norm(delta), 1e-12))
+        failure = None
+        for scale in (1., .5, .25, .125):
+            next_xyz = current+scale*step
+            try:
+                next_q = self.kin.ik(next_xyz, q, self.preferred_axis(next_xyz, elapsed),
+                                     position_tolerance=RUNTIME_IK_TOLERANCE_M)
+                status = "ok" if scale == 1. else "reduced_step"
+                error_mm = 1000*float(np.linalg.norm(self.kin.fk(next_q)[0]-next_xyz))
+                break
+            except IKConvergenceError as exc:
+                failure = str(exc)
+        else:
+            # A dragged pose can have no feasible straight-line Cartesian step.
+            # Propose the latest bounded measured pose, never an old trajectory.
+            # This is a normal policy result: it cannot request worker HOLD or
+            # terminate gravity dragging. The next query tries the moving goal again.
+            next_q = np.clip(q, self.kin.low, self.kin.high)
+            next_xyz = self.kin.fk(next_q)[0]
+            status, scale, error_mm = "waiting_ik", 0., None
         self.last = {"phase_time_s": elapsed, "goal_tcp": goal.tolist(),
-                     "observed_tcp": current.tolist(), "proposed_tcp": next_xyz.tolist()}
+                     "observed_tcp": current.tolist(), "proposed_tcp": next_xyz.tolist(),
+                     "ik_status": status, "ik_step_scale": scale,
+                     "ik_error_mm": error_mm, "ik_failure": failure}
         return {"action_chunk": normalize_pose(next_q, width)[None, :], "circle": self.last}
 
     def validate_path(self, samples=120, *, policy_speed=DEFAULT_POLICY_SPEED):
@@ -175,7 +208,8 @@ class CirclePolicy(PolicyWrapper):
         if np.max(loop_speed) > policy_speed:
             raise ValueError(f"circle joint speed exceeds {policy_speed:g} rad/s; increase --period")
         peak_torque = {}
-        for arm in ("leader",):
+        gravity_arms = ("leader",) if self.kin.config.leader_only else ("leader", "follower")
+        for arm in gravity_arms:
             gravity = mit.GravityCompensator(mit.ASSET_ROOT/f"calibration_{arm}.json")
             torques = np.array([mit.bounded_torque(gravity.torque(q), arm) for q in path])
             peak_torque[arm] = np.max(np.abs(torques), axis=0).tolist()
@@ -189,4 +223,5 @@ class CirclePolicy(PolicyWrapper):
                 "loop_peak_joint_speed_rad_s": loop_speed.tolist(),
                 "loop_joint_closure_rad": float(np.abs(loop[-1]-loop[0]).max()),
                 "peak_gravity_legacy": peak_torque,
+                "follower_gravity_compensation": not self.kin.config.leader_only,
                 "collision_checked": False}

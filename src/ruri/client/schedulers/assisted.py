@@ -19,9 +19,16 @@ import numpy as np
 
 from ._actions import clip_target
 from .rtc import RTCScheduler, _ActionTimeline
+from ruri.client._args import get_arg
 
 
 logger = logging.getLogger(__name__)
+
+
+def policy_version(policy):
+    metadata = policy.metadata
+    return str(metadata.get("policy_version")
+               or metadata.get("policy", {}).get("checkpoint_path") or policy.endpoint)
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,7 @@ class AssistedScheduler:
         rtc_latency_window=10,
         rtc_initial_delay_steps=None,
         max_observation_age_s=1.0,
+        rtc_during_policy=False,
     ):
         if not policy_version or not prompt:
             raise ValueError("policy_version and prompt are required")
@@ -69,6 +77,10 @@ class AssistedScheduler:
         self.policy_version, self.prompt = policy_version, prompt
         self.control_hz, self.timeout = control_hz, inference_timeout_s
         self.max_observation_age_s = max_observation_age_s
+        if type(rtc_during_policy) is not bool:
+            raise ValueError("rtc_during_policy must be a boolean")
+        self.rtc_during_policy = rtc_during_policy
+        self._rtc_segment = None
         self._reference_revision = None
         self.horizon = int(policy.output_chunk_size)
         self.execute = (
@@ -164,6 +176,7 @@ class AssistedScheduler:
         self._reference_revision = None
         # Keep the in-flight request known until it returns: at most one GPU
         # call is ever active and obsolete results cannot create request floods.
+        self._rtc_segment = None
 
     def pause(self):
         with self._lock:
@@ -205,6 +218,18 @@ class AssistedScheduler:
             if prompt is not None:
                 self.prompt = prompt
 
+    def _rtc_allowed(self, state):
+        schema = state.get("control_schema")
+        if schema not in ("ruri_shared_reference_v1", "ruri_gravity_handoff_v1"):
+            return True
+        # RTC conditions the next chunk on targets that will still be submitted
+        # during inference, as in the ordinary RTC client. That assumption is
+        # valid only in autonomous tracking, not unloading, dragging or recovery.
+        return (self.rtc_during_policy and schema == "ruri_gravity_handoff_v1"
+                and state.get("authority_phase") == "policy"
+                and not state.get("intervention_active", False)
+                and state.get("human_weight", 0.) == 0.)
+
     def _request(self, sample, state):
         if self._pending is not None:
             return
@@ -214,10 +239,7 @@ class AssistedScheduler:
         ):
             return
         last_step, tail, consumed = self._timeline.request_snapshot()
-        if state.get("control_schema") == "ruri_shared_reference_v1":
-            # The timeline contains policy proposals, not the applied reference.
-            # V1 replans without RTC conditioning rather than presenting a
-            # blended/velocity-limited proposal as an executed physical prefix.
+        if not self._rtc_allowed(state):
             tail, consumed = None, 0
         delay = min(max(self._delay_history), 0 if tail is None else len(tail))
         self._request_id += 1
@@ -268,13 +290,16 @@ class AssistedScheduler:
                 self._want_policy = False
                 self._invalidate()
             revision = state["reference_revision"]
-            if self._want_policy and revision != self._reference_revision:
+            rtc_segment = self._rtc_allowed(state)
+            if self._want_policy and (revision != self._reference_revision or (
+                    self._rtc_segment is not None and rtc_segment != self._rtc_segment)):
                 # A physical correction starts a fresh RTC segment, never a
                 # control-mode change. Nothing from the previous prefix survives.
                 self._generation += 1
                 self._timeline = _ActionTimeline()
                 self._chunk_token = None
                 self._reference_revision = revision
+            self._rtc_segment = rtc_segment
             while True:
                 try:
                     token, chunk, error, completed_ns, returned_step, rtc = (
@@ -321,8 +346,8 @@ class AssistedScheduler:
                     max(actual_delay, math.ceil(duration * self.control_hz))
                 )
                 if state.get("intervention_active") and state["mode"] == "POLICY":
-                    # Fresh short proposals continue affecting the blend while
-                    # the human interacts; no old chunk is resumed on release.
+                    # Continue querying during intervention. The worker ignores
+                    # proposals in gravity mode and uses fresh ones in recovery.
                     target, _ = clip_target(self.controller, chunk[0].copy())
                     self.controller.send_action(
                         target, reference_revision=revision,
@@ -333,9 +358,8 @@ class AssistedScheduler:
                 install = self._timeline.install(
                     chunk=chunk,
                     chunk_id=token.request_id,
-                    anchor_step=(self._timeline.latest_sent_step()+1
-                                 if state.get("control_schema") == "ruri_shared_reference_v1"
-                                 else token.anchor_step),
+                    anchor_step=(token.anchor_step if self._rtc_allowed(state)
+                                 else self._timeline.latest_sent_step()+1),
                 )
                 audit["install"] = install
                 if install["installed"]:
@@ -417,8 +441,70 @@ class AssistedScheduler:
         with self._lock:
             if self._closed.is_set():
                 return
+            self._want_policy = False
+            self._invalidate()
             try:
-                self.pause()
+                state = self.controller.status()
+                # Recovery owns the arm until disconnect waits for it to finish.
+                # That worker no longer acknowledges normal mode requests.
+                if (state.get("phase", "engaged") == "engaged"
+                        and state.get("mode") not in ("FAULT", "STOPPED")):
+                    self.controller.request_mode("HOLD")
+            except (RuntimeError, TimeoutError, OSError) as exc:
+                # Recovery can also begin between the status read and HOLD.
+                # Cleanup must not replace the fault that caused this shutdown.
+                logger.warning("Scheduler cleanup could not confirm HOLD: %s", exc)
             finally:
                 self._closed.set()
         self._thread.join(timeout=0.2)
+
+
+def run_assisted_rtc(*, controller, policy, args):
+    """Continuous remote RTC execution without dataset or trace writers."""
+    seconds = float(get_arg(args, "seconds", 0.))
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("seconds must be finite and nonnegative")
+    hz = float(get_arg(args, "control_hz", 30.))
+    robot, scheduler = controller(args), None
+    stats = {"steps": 0, "inference_results": 0, "rtc_results": 0}
+    try:
+        scheduler = AssistedScheduler(
+            robot, policy, policy_version=policy_version(policy),
+            prompt=get_arg(args, "prompt"), control_hz=hz,
+            execution_horizon=get_arg(args, "execution_horizon", 5),
+            rtc_latency_window=get_arg(args, "rtc_latency_window", 10),
+            rtc_initial_delay_steps=get_arg(args, "rtc_initial_delay_steps", 4),
+            inference_timeout_s=get_arg(args, "policy_timeout_s", 5.),
+            rtc_during_policy=True,
+        )
+        robot.start()
+        scheduler.resume()
+        logger.info("Dual Piper RTC running: right leader intervention, left follower observation; no recording")
+        began = next_tick = time.monotonic()
+        previous_phase = None
+        while not seconds or time.monotonic()-began < seconds:
+            sample = robot.get_sample()
+            if "observation.joint_effort" not in policy.metadata.get("inputs", {}):
+                sample["observation"].pop("observation.joint_effort", None)
+            step = scheduler.step(sample)
+            stats["steps"] += 1
+            for result in step["inference_results"]:
+                stats["inference_results"] += 1
+                stats["rtc_results"] += int(result["rtc"].get("rtc.applied") is True)
+            state = robot.status()
+            if state["mode"] == "HOLD" and not state["armed"]:
+                raise RuntimeError(f"worker entered HOLD: {state.get('reason')}")
+            phase = state["authority_phase"]
+            if phase != previous_phase:
+                logger.info("Authority: %s; alpha=%.2f", phase, state["human_weight"])
+                previous_phase = phase
+            next_tick += 1./hz
+            time.sleep(max(0., next_tick-time.monotonic()))
+            next_tick = max(next_tick, time.monotonic())
+        return stats
+    finally:
+        try:
+            if scheduler is not None:
+                scheduler.close()
+        finally:
+            robot.stop()

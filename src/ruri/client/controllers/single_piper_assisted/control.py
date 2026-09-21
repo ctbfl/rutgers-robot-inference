@@ -1,7 +1,7 @@
-"""Worker admission/lifecycle with continuous shared-reference control.
+"""Worker admission/lifecycle for dual shared reference or right gravity handoff.
 
-Policy proposals and human spring displacement update one reference. Both arms
-retain fixed impedance gains. No episode, dataset, model or reward logic.
+No episode, dataset, model or reward logic. The worker owns authority, actuator
+references and freshness; the scheduler only supplies policy proposals.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from ruri.client.controllers.single_piper.normalization import normalize_pose
 
 from .config import SinglePiperAssistedConfig
 from .reference import SharedReference
+from .gravity_handoff import GravityHandoff
+from .follower_handoff import FollowerHandoff
 
 PROTOCOL = "ruri_assisted_control_v4"
 
@@ -104,9 +106,13 @@ class AssistedControl:
         self.policy_error = np.zeros(7)
         self.coupling_error = np.zeros(7)
         self.source = "hold"
-        self.reference = SharedReference(config, self.target[:6], self.lower[:6], self.upper[:6])
+        reference_type = GravityHandoff if config.uses_gravity_handoff else SharedReference
+        self.reference = reference_type(config, self.target[:6], self.lower[:6], self.upper[:6])
         self.target[:6] = self.reference.r
         self.reference_velocity = np.zeros(6)
+        self.follower_velocity = np.zeros(6)
+        self.follower_handoff = (FollowerHandoff(config, self.target[:6], self.lower[:6], self.upper[:6])
+                                 if config.uses_gravity_handoff and not config.leader_only else None)
 
     def mapped(self, follower):
         return clamp_pose(self.sign * follower + self.offset)
@@ -139,6 +145,9 @@ class AssistedControl:
         self.policy_observation_ns = None
         self.reference.hold(self.target[:6])
         self.reference_velocity[:] = 0
+        self.follower_velocity[:] = 0
+        if self.follower_handoff is not None:
+            self.follower_handoff.sync(self.target[:6], self.follower_velocity)
         if mode == "HUMAN":
             self.intervention_id += 1
             self.anchor_leader = self.leader.copy()
@@ -263,15 +272,32 @@ class AssistedControl:
         candidate = self.policy_reference[:6] if self.policy_valid else None
         previous_phase = self.reference.phase
         was_intervening = self.reference.intervening
-        self.target[:6], self.reference_velocity = self.reference.step(
-            leader[:6], candidate, dt, manual=self.mode == "HUMAN"
+        handoff = self.follower_handoff
+        recovery = {} if handoff is None else {
+            "recovery_ready": handoff.ready(leader[:6]),
+            "recovery_reference": self.target[:6].copy(),
+        }
+        reference, self.reference_velocity = self.reference.step(
+            leader[:6], candidate, dt, manual=self.mode == "HUMAN", **recovery
         )
+        if handoff is not None and self.reference.phase == "human":
+            self.target[:6], self.follower_velocity = handoff.follow(leader[:6], dt)
+        else:
+            self.target[:6] = reference
+            self.follower_velocity = self.reference_velocity.copy()
+            if handoff is not None:
+                handoff.sync(reference, self.reference_velocity)
         if self.mode == "POLICY":
             self.correcting = self.reference.intervening
             if self.correcting and not was_intervening:
                 self.intervention_id += 1
             if self.reference.phase != previous_phase:
-                self._rebase_policy()
+                # Recovery already starts from current q and a fresh revision.
+                # Finishing its gain ramp must not interrupt that fresh motion.
+                finishing_handoff = (c.uses_gravity_handoff and previous_phase == "recover"
+                                     and self.reference.phase == "policy")
+                if not finishing_handoff:
+                    self._rebase_policy()
         # Grippers have a separate position/force channel, outside the torque norm.
         if self.mode == "HUMAN" or self.correcting:
             self.target[6] = np.clip(leader[6], self.lower[6], self.upper[6])
@@ -281,6 +307,8 @@ class AssistedControl:
                 -c.gripper_reference_speed*dt, c.gripper_reference_speed*dt
             ))
         self.leader_target = self.mapped(self.target)
+        if handoff is not None and self.reference.phase == "human":
+            self.leader_target[:6] = self.mapped(np.r_[reference, self.target[6]])[:6]
         self.source = (
             "human" if self.mode == "HUMAN" or self.reference.human_latched else "shared" if self.correcting
             else "policy" if self.policy_valid else "hold"
@@ -315,7 +343,8 @@ class AssistedControl:
             )
         if self.mode not in ("POLICY", "HUMAN"):
             self.reference_velocity[:] = 0
-        self.leader_gain = 1.0  # Diagnostic compatibility; never authority-dependent.
+            self.follower_velocity[:] = 0
+        self.leader_gain = 1.-self.reference.alpha if self.config.uses_gravity_handoff else 1.
         return self.target.copy(), self.leader_target.copy()
 
     def status(self):
@@ -324,10 +353,11 @@ class AssistedControl:
             "epoch": self.epoch,
             "mode": self.mode,
             "source": self.source,
-            "control_schema": "ruri_shared_reference_v1",
+            "control_schema": "ruri_gravity_handoff_v1" if self.config.uses_gravity_handoff else "ruri_shared_reference_v1",
             "leader_only": self.config.leader_only,
             "controlled_arm": "right_arm" if self.config.leader_only else "left_arm",
             "follower_present": not self.config.leader_only,
+            "follower_gravity_compensation": not self.config.leader_only,
             "virtual_reference": normalize_pose(
                 self.target[:6], self.target[6]
             ).tolist(),
@@ -348,11 +378,22 @@ class AssistedControl:
             "intervention_trigger_active": self.reference.trigger_active,
             "filtered_interaction_error_rad": self.reference.filtered_error.tolist(),
             "human_quiet_s": self.reference.quiet_elapsed,
-            "applied_policy_velocity": ((1-self.reference.alpha)*self.reference.policy_velocity).tolist(),
+            "human_motion_range_deg": (np.degrees(self.reference.motion_range).tolist()
+                                       if self.config.uses_gravity_handoff else None),
+            "leader_impedance_scale": 1.-self.reference.alpha if self.config.uses_gravity_handoff else 1.,
+            "reference_active": not (self.config.uses_gravity_handoff and self.reference.alpha == 1.),
+            "applied_policy_velocity": (self.reference.velocity
+                if self.config.uses_gravity_handoff and self.reference.phase in ("policy", "recover")
+                else np.zeros(6) if self.config.uses_gravity_handoff
+                else (1-self.reference.alpha)*self.reference.policy_velocity).tolist(),
             "interaction_estimate": self.reference.interaction.tolist(),
             "interaction_effective": self.reference.effective.tolist(),
             "reference_q": self.reference.r.tolist(),
             "reference_qd": self.reference_velocity.tolist(),
+            "follower_reference_q": self.target[:6].tolist(),
+            "follower_reference_qd": self.follower_velocity.tolist(),
+            "follower_handoff_progress": self.follower_handoff.progress if self.follower_handoff else None,
+            "follower_handoff_limited": self.follower_handoff.limited if self.follower_handoff else False,
             "policy_reference_velocity": self.reference.policy_velocity.tolist(),
             "human_reference_velocity": self.reference.human_velocity.tolist(),
             "intervention_id": self.intervention_id,

@@ -76,10 +76,12 @@ class SimulatedRig:
 
     def send(self, control, dt):
         self.previous = self.leader.copy(), self.follower.copy()
-        # Pose injection models an external constraint only for its duration;
-        # the motion servo remains active in every authority state.
+        # Kinematic simulation only: zero leader stiffness must not secretly
+        # keep a position servo running during the gravity-only phase.
         if time.monotonic() >= self.human_until:
-            self.leader += np.clip(control.leader_target - self.leader, -dt, dt)
+            scale = 1.-control.reference.alpha if self.config.uses_gravity_handoff else 1.
+            self.leader[:6] += np.clip(control.leader_target[:6]-self.leader[:6], -dt*scale, dt*scale)
+            self.leader[6] += np.clip(control.leader_target[6]-self.leader[6], -dt, dt)
         if not self.config.leader_only:
             self.follower += np.clip(control.target - self.follower, -dt, dt)
 
@@ -243,17 +245,49 @@ class PiperRig:
         # same measurement, with no second driver or second set of commands.
         return values if len(values) == 2 else (values[0], values[0].copy())
 
+    def _prepare_stops(self, should_stop):
+        """Reset only latched stops, once, when this startup explicitly requests it."""
+        for arm, label in ((self.leader, "right leader"), (self.follower, "left follower")):
+            if arm is None:
+                continue
+            if should_stop():
+                raise mit.TeleopAbort("startup cancelled")
+            status = mit.arm_status_text(arm)[2]
+            if "EMERGENCY_STOP" not in status:
+                continue
+            if not self.config.reset_latched_stop:
+                raise mit.TeleopAbort(
+                    f"{label} has a latched electronic stop: {status}; "
+                    "explicit --reset-stop is required to reset it before enable/home"
+                )
+            stamp = float(arm.get_arm_status().timestamp)
+            if not np.isfinite(stamp):
+                raise mit.TeleopAbort(f"{label} stop status timestamp is non-finite")
+            print(f"Explicit startup reset: {label} electronic stop", flush=True)
+            self.energized = True  # A failed reset must still leave the arm stopped.
+            arm.reset()
+            deadline = time.monotonic()+2.
+            while time.monotonic() < deadline:
+                if should_stop():
+                    raise mit.TeleopAbort("startup cancelled during stop reset")
+                feedback = arm.get_arm_status()
+                if feedback is not None:
+                    current_stamp = float(feedback.timestamp)
+                    if (np.isfinite(current_stamp) and current_stamp > stamp
+                            and "NORMAL" in str(feedback.msg.arm_status)
+                            and feedback.msg.err_code == 0):
+                        break
+                time.sleep(.01)
+            else:
+                raise mit.TeleopAbort(f"{label} stop reset lacked fresh NORMAL feedback")
+
     def enable(self, should_stop=lambda: False):
         if should_stop():
             raise mit.TeleopAbort("startup cancelled")
         # Use the same role/enable/move_mit sequence as persistent teleop.
-        # Do not reset stops or insert explicit set_motion_mode frames here.
-        for arm, label in ((self.leader, "leader"), (self.follower, "follower")):
-            status = mit.arm_status_text(arm)[2]
-            if "EMERGENCY_STOP" in status:
-                raise mit.TeleopAbort(
-                    f"{label} has a latched electronic stop: {status}"
-                )
+        # Ordinary startup never clears a latched stop. A manual --reset-stop
+        # applies only here, never to runtime faults or a background retry.
+        self._prepare_stops(should_stop)
         self.startup_phase = "role setup"
         self.leader.set_follower_mode()
         self.follower.set_follower_mode()
@@ -338,6 +372,8 @@ class PiperRig:
             feedback_timeout=c.feedback_timeout_s,
             follower_kp=c.follower_kp,
             follower_kd=c.follower_kd,
+            leader_home_kp=c.leader_policy_kp if c.uses_gravity_handoff else c.follower_kp,
+            leader_home_kd=c.leader_policy_kd if c.uses_gravity_handoff else c.follower_kd,
             max_reference_speed=c.max_reference_speed,
             max_track_error=c.max_track_error,
             max_joint_speed=c.max_joint_speed,
@@ -402,32 +438,61 @@ class PiperRig:
             should_stop=should_stop,
         )
 
+    def _send_leader_handoff(self, control):
+        """The same validated gravity endpoint for one- and two-arm handoff."""
+        c = self.config
+        alpha = control.reference.alpha if control.mode in ("POLICY", "HUMAN") else 0.
+        if not np.isfinite(alpha) or not 0. <= alpha <= 1.:
+            raise mit.TeleopAbort("right leader invalid handoff weight")
+        velocity = np.asarray(c.leader_sign)*control.reference_velocity
+        if alpha == 1.:
+            mit.send_leader(self.leader, self.samples[0], self.leader_gravity, c.leader_kd)
+        elif alpha == 0.:
+            mit.send_position_impedance(
+                self.leader, self.samples[0], control.leader_target[:6],
+                velocity, self.leader_gravity,
+                c.leader_policy_kp, c.leader_policy_kd, c.max_reference_speed, "right leader",
+            )
+        else:
+            torque = mit.bounded_torque(
+                self.leader_gravity.torque(self.samples[0].q)-alpha*c.leader_kd*self.samples[0].qd,
+                "right leader handoff",
+            )
+            target = mit.joint_vector(control.leader_target[:6], "right leader target")
+            velocity = np.clip(mit.joint_vector(velocity, "right leader velocity"),
+                               -c.max_reference_speed, c.max_reference_speed)
+            for i, joint in enumerate(mit.JOINTS):
+                self.leader.move_mit(joint_index=joint, p_des=float(target[i]), v_des=float(velocity[i]),
+                                     kp=(1.-alpha)*c.leader_policy_kp,
+                                     kd=(1.-alpha)*c.leader_policy_kd, t_ff=float(torque[i]))
+
     def send(self, control, dt):
         del dt
         c = self.config
-        # Watch the applied, rate-limited reference, not the distant proposal.
-        for sample, target, label in ((self.samples[0], control.leader_target, "leader"),
-                                      (self.samples[1], control.target, "follower")):
-            error = float(np.max(np.abs(sample.q-target[:6])))
-            if error > c.max_track_error:
-                raise mit.TeleopAbort(f"{label} reference tracking error {error:.3f} rad")
+        # The legacy shared-reference mode retains its existing check. Gravity
+        # handoff permits intentional pose gaps; do not reintroduce its removed
+        # raw-error abort. Feedback, speed and feed-forward checks remain active.
+        if not c.uses_gravity_handoff:
+            for sample, target, label in ((self.samples[0], control.leader_target, "leader"),
+                                          (self.samples[1], control.target, "follower")):
+                error = float(np.max(np.abs(sample.q-target[:6])))
+                if error > c.max_track_error:
+                    raise mit.TeleopAbort(f"{label} reference tracking error {error:.3f} rad")
         start_ns = time.monotonic_ns()
-        mit.send_position_impedance(
-            self.leader,
-            self.samples[0],
-            control.leader_target[:6],
-            np.asarray(c.leader_sign) * control.reference_velocity,
-            self.leader_gravity,
-            c.leader_policy_kp,
-            c.leader_policy_kd,
-            c.max_reference_speed,
-            "leader",
-        )
+        if c.uses_gravity_handoff:
+            self._send_leader_handoff(control)
+        else:
+            mit.send_position_impedance(
+                self.leader, self.samples[0], control.leader_target[:6],
+                np.asarray(c.leader_sign)*control.reference_velocity,
+                self.leader_gravity, c.leader_policy_kp, c.leader_policy_kd,
+                c.max_reference_speed, "leader",
+            )
         mit.send_position_impedance(
             self.follower,
             self.samples[1],
             control.target[:6],
-            control.reference_velocity,
+            control.follower_velocity if c.uses_gravity_handoff else control.reference_velocity,
             self.follower_gravity,
             c.follower_kp,
             c.follower_kd,
@@ -555,8 +620,7 @@ class LeaderRig(PiperRig):
     def enable(self, should_stop=lambda: False):
         if should_stop():
             raise mit.TeleopAbort("startup cancelled")
-        if "EMERGENCY_STOP" in mit.arm_status_text(self.leader)[2]:
-            raise mit.TeleopAbort("right leader has a latched electronic stop")
+        self._prepare_stops(should_stop)
         self.startup_phase = "right leader CAN/MIT enable"
         self.leader.set_follower_mode()
         time.sleep(0.3)
@@ -596,15 +660,8 @@ class LeaderRig(PiperRig):
     def send(self, control, dt):
         del dt
         c = self.config
-        error = np.max(np.abs(self.samples[0].q-control.leader_target[:6]))
-        if error > c.max_track_error:
-            raise mit.TeleopAbort(f"right leader reference tracking error {error:.3f} rad")
         start = time.monotonic_ns()
-        mit.send_position_impedance(
-            self.leader, self.samples[0], control.leader_target[:6],
-            control.reference_velocity, self.leader_gravity,
-            c.leader_policy_kp, c.leader_policy_kd, c.max_reference_speed, "right leader",
-        )
+        self._send_leader_handoff(control)
         self._send_gripper(self.leader_gripper, self.leader_name, control.leader_target[6], c.grip_base)
         self.send_span_ns = time.monotonic_ns()-start
         if self.enabled:
@@ -763,7 +820,7 @@ def run(
                 phase="engaged",
                 **rig.telemetry(),
                 follower_target_q=control.target[:6],
-                follower_target_qd=control.reference_velocity,
+                follower_target_qd=control.follower_velocity,
                 follower_gripper_target=control.target[6],
                 control={
                     **control.status(),

@@ -12,7 +12,7 @@ from ruri.client.controllers.single_piper.calibration_ranges import NOMINAL, mea
 
 class SharedReferenceTests(unittest.TestCase):
     def reference(self, **kwargs):
-        c = replace(SinglePiperAssistedConfig(leader_only=True), **kwargs)
+        c = replace(SinglePiperAssistedConfig(leader_only=True, human_confirm_s=.5), **kwargs)
         return SharedReference(c, np.zeros(6), np.full(6, -1.), np.ones(6))
 
     def test_exact_one_step_equations_and_old_reference_estimator(self):

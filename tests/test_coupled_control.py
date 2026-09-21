@@ -10,7 +10,7 @@ class CoupledControlTests(unittest.TestCase):
     def setUp(self):
         self.now, self.sequence = 10., 0
         self.q = np.array([0., .4, -.4, 0., 0., 0., .04])
-        self.control = AssistedControl(SinglePiperAssistedConfig(), self.q, self.q, clock=lambda: self.now)
+        self.control = AssistedControl(SinglePiperAssistedConfig(human_confirm_s=.5), self.q, self.q, clock=lambda: self.now)
         self.send("mode", mode="POLICY", request_id="start")
         self.send("target", target=self.q.tolist())
 

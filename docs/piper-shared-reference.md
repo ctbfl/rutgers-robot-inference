@@ -1,153 +1,219 @@
-# 固定 MIT + Policy + Human Intervention：第一版
+# 圆圈：Policy、右臂纯重力交接与左臂跟随
 
-当前验收对象只有右臂 leader。新入口 `examples/client_single_piper_shared_circle.py` 设置
-`leader_only=True, camera_enabled=False`，按注册 USB ID 连接右臂；不连接左臂、不打开相机。
-普通 teleop、单臂 policy 和数据收集仍使用各自原有入口。
+单臂版本已经过用户真机体验确认。入口 `examples/client_single_piper_shared_circle.py` 使用
+`leader_only=True, camera_enabled=False`，按注册 USB ID 连接右臂，不连接左臂、不打开相机。
+进入时启用 MIT 并回 home。普通 teleop、单臂 policy、数据收集和双臂 assisted 使用各自原有路径。
 
-## 逻辑放在哪里
+旧版固定阻抗、通过导纳推动共享 reference 的圆圈实现已存档于 commit `b73950b`。
+新双臂入口 `examples/client_dual_piper_shared_circle.py` 设置 `gravity_handoff=True`，复用同一个
+右臂交接机制并增加左臂插值。左臂复用原 single Piper 的固定 MIT 增益和重力前馈。
+未开启重力交接选项的双臂 assisted 继续使用 `SharedReference`。
 
-- `single_piper_assisted/reference.py`：纯 NumPy 数学状态，维护六维 reference、velocity 和 α，无 SDK、相机或 policy 依赖。
-- `single_piper_assisted/control.py`：在 MIT 周期调用它，负责会话、模式、action 新鲜度和 reference revision。
-- `single_piper/mit/assisted.py`：硬件读取和发送。`LeaderRig` 只创建一个右臂 driver，使用 V189 握手和右臂重力标定。
-- `schedulers/assisted.py`：异步推理和丢弃旧 chunk，不计算 torque 或 α。
-- `examples/piper_circle_policy.py`：普通 `PolicyWrapper`，只消费最新实测关节状态并输出位置 proposal。SciPy FK/IK 只属于示例。
+## 代码边界
 
-已有 assisted 双臂适配器复用这个 reference 核心；本轮没有做双臂真机验收。
+- `single_piper_assisted/gravity_handoff.py`：纯数值的进入确认、权重过渡、静止窗口和 reference 状态。
+  复用 `SharedReference` 的状态/状态报告接口，不调用它的导纳更新逻辑。
+- `single_piper_assisted/control.py`：在 MIT 周期调用数值控制器，管理会话、watchdog、action 新鲜度与 revision。
+- `single_piper_assisted/follower_handoff.py`：左臂从共享目标接到实时右臂读数的插值与限速。
+- `single_piper/mit/assisted.py`：`LeaderRig` 打开一个右臂 driver，使用 V189 握手、右臂重力标定及 MIT 发送。
+- `schedulers/assisted.py`：异步推理与旧 chunk 丢弃，不计算 alpha 或电机力矩。
+- `examples/piper_circle_policy.py`：使用最新实测关节状态的普通 policy。SciPy FK/IK 只属于示例。
 
-## 每个周期
+## 电机控制律
 
-默认 100 Hz，在物理关节坐标（rad）下计算：
-
-```text
-interaction = Kp_L * (q_L - r) - bias
-effective   = sign(interaction) * max(abs(interaction) - deadzone, 0)
-v_h         = effective / B
-alpha       = timed_authority(interaction, dt)  # 独立滤波、持续确认和时间曲线见下文
-v_p         = clip(K_r * (policy_proposal - r), -v_policy_max, v_policy_max)
-v           = clip((1 - alpha) * v_p + alpha * v_h, -v_max, v_max)
-r_next      = clip(r + dt * v, joint_lower, joint_upper)
-v_applied   = (r_next - r) / dt
-```
-
-interaction 使用上一周期已发送的 r。时间抖动时积分 dt 上限为两个 MIT 周期；关节边界投影后重新计算
-`v_applied`，避免到边界后仍发送朝边界外运动的速度。
-
-底层每次发送 `p_des=r_next, v_des=v_applied, kp=3, kd=0.5, t_ff=gravity(q)`。
-不根据 α 改 Kp/Kd，不再额外叠加软件 `-d*qdot`。SDK 固件接口仍是已适配的 V189；扭矩相关参数沿用
-当前 pinned SDK 与现有 calibration 的 legacy 单位，不能当作独立力传感器测量。
-
-通用 controller 默认每关节 deadzone=0.08、bias=0、B=2，K_r=2/s，
-v_max=v_policy_max=0.15 rad/s。当前右臂圆圈示例使用 v_max=4 rad/s、v_policy_max=0.5 rad/s、B=0.1。
-
-### 人工权重的时间曲线
-
-对去除 bias 的关节偏差 `interaction / Kp_L` 做时间常数 **50 ms** 的低通滤波，
-只用于 authority 判断，不在快速 admittance 支路加入这个滤波延迟。
-
-1. **确认**：任一关节的滤波偏差绝对值连续超过 **5° 达 0.5 秒**。
-   确认期间保持 **policy**、α=0，不丢弃 policy chunk；条件中断立即清空确认计时。
-   判断每个关节的最大值，不把多个小偏差的向量范数当成 5°。
-2. **blend**：确认后，从当前 α 连续线性上升，累计 **0.5 秒有效介入证据**才到 1。
-   维持条件低于进入门槛；信号消退后暂停上升，不能继续自动升满。
-3. **human**：α 严格等于 1，policy 对 reference 的贡献严格为零，推理仍在后台继续。
-4. 没有有效介入证据后，前 **0.5 秒**保持当时的权重；随后进入 **recover**，
-   再用 **0.5 秒**从该权重连续降到零。未升满时也从实际权重下降，不能跳到 1。
-5. **recover** 期间重新介入也需要通过 5° / 0.5 秒确认，确认后从当时权重重新上升。
-
-配置为 `human_trigger_angle_deg=5`、`interaction_filter_s=0.05`、`human_confirm_s=0.5`、
-`human_takeover_s=0.5`、`human_release_delay_s=0.5`、`human_release_s=1.0`。
-从滤波信号超过进入门槛到完全接管，连续有效证据下约需 1 秒；滤波还会引入短暂检测延迟。
-
-例如完成接管后，若人工静止时间为 s：
+MIT 始终运行在同一个模式。重力前馈不退出；alpha 改变 leader 阻抗和拖动阻尼：
 
 ```text
-s <= 0.5 s:        alpha = 1
-0.5 < s < 1.0 s:   alpha = (1.0 - s) / 0.5
-s >= 1.0 s:        alpha = 0
+tau = gravity(q)
+    + (1-alpha) * [Kp * (r-q) + Kd * (v_ref-qd)]
+    - alpha * D_h * qd
 ```
 
-interaction 使用弹簧形变估计，不是手部接触传感器。维持判断为滤波后的 interaction 经过原有
-deadzone 后，范数超过 `interaction_release=0.02`。5° 不改变跟手死区 0.08 或 B=0.1。
-机械臂自身运动不再作为维持接管的证据。若拖动过轻、reference 已追上手而形变低于维持门槛，
-同样会开始释放计时；仅凭编码器不能完全区分轻触、松手与模型残差，手感仍需右臂实测。
-这组进入门槛在原 22 秒无人日志上没有触发；日志回放不能替代修改后的无人真机验收。
+默认 `Kp=3, Kd=0.5, D_h=leader_kd=0.2`。
 
-夹爪单独处理，不把米和关节 torque proxy 混入同一个 norm。圆圈 policy 保持最新实测夹爪开度；
-本示例不是夹爪干预/力反馈验收。
+- alpha=0：原来的 policy 位置/速度跟踪。
+- 0<alpha<1：MIT `kp=(1-alpha)*Kp, kd=(1-alpha)*Kd`，
+  `t_ff=gravity(q)-alpha*D_h*qd`；前馈经过原有扭矩边界检查。
+- alpha=1：直接调用已验证的 `leader_follower.send_leader`，SDK `kp=kd=0`、
+  `v_des=0`，只输出重力补偿和软件阻尼。没有位置弹簧、导纳死区或 B 参数。
 
-## Policy 始终使用最新状态
+SDK 中的 p_des 字段仍存在，但零刚度时不产生位置恢复力。此时内部 r 只记录实测 q，
+`reference_active=false`；shadow reference 的变化不是位置伺服命令，`reference_qd=0`。
+反馈速度上限仍然有效。SDK 与 calibration 继续使用 legacy 扭矩单位，不是独立力传感器测量。
 
-自动干预不会退出 POLICY，也不会停推理。权重阶段变化时 reference revision 增加，未执行旧 chunk、
-旧 revision 的在途结果失效；恢复阶段重新从最新状态查询，不执行人工独占期间保留的旧 proposal。
-人工独占时 policy 贡献为零，上升和下降期间新 proposal 按 1−α 参与混合。policy observation 最长有效期默认 1 秒。
-等待新推理的 keepalive 只维持通信，不刷新旧 action 的有效期。
+## 进入和退出
 
-第一版不向模型发送 RTC 已执行前缀：policy proposal 经过限速和人类混合后不等于实际执行 reference，
-不能把 proposal chunk 冒充已执行轨迹。新返回的无前缀 chunk 从下一个可用调度时刻执行，避免短 chunk
-因推理延迟在返回时已经过期。普通 RTC scheduler 不受这个 assisted 模式分支影响。
+默认控制周期 100 Hz。权重过渡使用 `smoothstep(u)=3u²-2u³`，首尾变化率为零。
 
-## 圆圈示例
+1. **policy / 进入确认**：对去 bias 的 `q-r` 做 50 ms 低通滤波。任一关节偏差连续
+   超过 5° 达 0.1 秒才开始交接；中断则清空确认计时。确认期间 policy 正常运行，alpha=0。
+   判断每关节绝对偏差的最大值，不把多个小偏差相加，也不把 policy 自己的运动当介入。
+2. **blend / 卸掉阻抗**：用 0.5 秒把 alpha 从当前值平滑升到 1。原 reference 速度
+   同时平滑减至零，不再追逐新的 policy 目标。确认完成后不再用逐渐消失的弹簧力判断是否继续卸载。
+3. **human / 纯重力**：alpha=1，policy 继续推理但不控制电机。每个关节在最近 0.5 秒内的
+   `max(q)-min(q)` 均不超过其小阈值，才确认静止。默认阈值均为 0.1°。
+   统计从进入纯重力阶段开始，不把此前卸载阶段算成静止。缓慢持续运动也会累积到窗口范围中。
+   手握着不动或颤动低于门槛，同样计入恢复；这不是手部接触检测。
+4. **recover / 恢复**：刚开始时 alpha 仍为 1，将 r 对齐当前实测 q、reference velocity 清零，
+   使旧 revision 和旧 action 失效。随后用 0.5 秒把 alpha 降到 0，policy 基于当前状态重新推理，
+   reference 按 policy 速度限制向新目标移动。恢复结束保留这条新轨迹，不再额外清空它。
+5. **恢复途中重新介入**：重新走 5° / 0.1 秒的偏差确认，然后从当前 alpha 开始卸载。
+   此时不使用关节运动窗口维持人工控制，避免 policy 的运动打断自身恢复。
 
-基座坐标 +X 向前、+Z 向上。TCP 暂用 URDF 的夹爪中点，即 link6 局部 +Z 的 135.8 mm 处；
-这是几何模型值，安装额外工具时用 `--tcp-offset X Y Z` 改为实际工具变换。
+显式操作员 HUMAN 请求跳过进入确认，但仍使用 0.5 秒卸载过程；显式 HUMAN 不自动恢复。
+HOLD、home 和故障处理仍沿用已有生命周期，不被自动交接覆盖。
 
-默认 home TCP 约 `[0.19143, 0, 0.22502] m`，圆心约 `[0.24143, 0, 0.37502] m`。
-画基座 YZ 平面内半径 10 cm 的竖直圆，圆周角速度 0.5 rad/s（约 12.57 秒一圈）。
-示例通过 `--reference-speed` 将融合后的关节 reference 速度上限设为 4 rad/s；
-`--policy-speed` 独立限制 policy 支路为 0.5 rad/s。MIT 发送层的速度裁剪同步设为 4 rad/s。姿态是软约束：上方仰起、下方略向下看；
-朝向的 yaw 根据本次 TCP 近端目标计算，避免 home 腕部奇异位置出现不必要的绕腕解。
-IK 从当前实测 q 开始，并保留很小的关节连续性正则项。
+主要配置：`human_trigger_angle_deg=5`、`human_confirm_s=0.1`、`interaction_filter_s=0.05`、
+`human_takeover_s=0.5`、`human_release_delay_s=0.5`、`human_release_s=1.0`、
+`human_quiet_range_deg=(0.1,)*6`。最后一个字段支持逐关节阈值；示例 `--quiet-angle` 同时设置六个值。
+0.1° 是初始静止判据，历史重力试验中存在关节反馈完全不变的窗口；它尚未经过新版本多姿态实测验收。
+配置中的 `admittance_damping`、`interaction_deadzone`、`interaction_release` 留给双臂旧控制器，
+重力交接路径不使用它们。
 
-圆周目标的相位按单调时钟持续前进。每次推理从最新实测 TCP 沿直线朝当时的圆周目标迈一小步，
-再解 IK。默认 proposal 的 TCP 步长不超过 50 mm（0.10 m/s × 0.5 s lookahead）。这个速度是
-policy 参数；最终电机跟随的是关节空间限速/融合后的 r，实际 TCP 路径不保证严格直线。
+## 双臂交接的细节
 
-先检查从 home 到圆的接近路径、整圈 FK/IK 误差、相邻关节解、圆周关节速度与右臂 gravity 前馈上限。
-检查不涉及碰撞几何；这条新路径仍需真机观察。程序运行中不会停下看图。
+单一 policy 从左臂最新实测状态推理，100 Hz worker 生成 reference；两臂在同一个 worker 周期
+发送各自的 MIT 命令。SDK 写入顺序执行，并非硬件时钟级同步。
+两臂使用相同 joint coordinates，各自在自己的基座坐标系中画同一个圆；不是两个 TCP 追逐
+世界坐标中的同一个点。圆圈示例仅支持 identity joint mapping。
 
-## 运行
+| 阶段 | 右臂 leader | 左臂 follower |
+| --- | --- | --- |
+| policy / 进入确认 | 跟踪共同 r | 跟踪共同 r |
+| blend：0.5 s 卸载 | r 速度平滑刹停，阻抗随 alpha 下降 | 同一 r 与速度，保留固定阻抗 |
+| human 前 0.5 s | 原 teleop 的纯重力补偿与阻尼 | 从最后已发送的共同 r 插值到实时 qL |
+| human 后续 | 纯重力补偿与阻尼 | 每周期跟随实时 qL，受关节范围及 4 rad/s 限制 |
+| recover：0.5 s | 阻抗平滑恢复，跟随共同 r | 固定阻抗，跟随共同 r |
 
-使用已安装 Piper 依赖的环境；额外安装 `pip install -e '.[piper-circle]'` 提供示例的 SciPy。
-在 repo 根目录运行：
+左臂始终使用原 single Piper 的 `follower_kp=10, follower_kd=0.8`、
+`calibration_follower.json` 与同一个 `send_position_impedance`：
+
+```text
+tauF = gravityF(qF) + KpF*(rF-qF) + KdF*(vF-qdF)
+```
+
+启用、home、运行、HOLD 和故障回 home 均保留这个前馈。左臂不会进入右臂那样的零刚度
+手拖模式；“保留重力前馈”和“卸掉刚度进入纯重力模式”是两个不同的概念。
+此前直接把左臂 t_ff 清零会让位置误差承担重力支撑，已撤销这个偏离原控制器的改动。
+两臂收到相同目标不代表实测关节位置完全一致，仍存在正常跟踪误差。
+
+记进入 human 的时刻为 t0，**上一周期发给左臂的目标**为 r0。第一帧仍发送 r0。
+接下来令 `u=clip((t-t0)/0.5, 0, 1)`，采用五次平滑函数：
+
+```text
+s(u) = 10u^3 - 15u^4 + 6u^5
+rF_des(t) = (1-s(u))*r0 + s(u)*clip(qL(t), common_bounds)
+rF(k+1) = rF(k) + clip(rF_des-rF(k), -vmax*dt, vmax*dt)
+vF(k+1) = (rF(k+1)-rF(k))/dt
+```
+
+插值终点每周期更新，不冻结 t0 时的右臂读数。五次函数首尾一阶、二阶导数为零；
+配合此前共享 r 的刹停，平滑进入跟随。左臂 MIT 同时收到实际插值位置与对应速度，
+不会错误地使用右臂纯重力阶段的零 reference velocity。
+0.5 秒是插值时长，不是实测左臂必须精确到位的保证。若限速生效，继续有界追赶，
+不跳目标也不因 gap 本身 abort；到达时间相应延长。日志 `follower_handoff_limited` 会标记限速。
+
+**恢复同样处理 gap**：右臂静止 0.5 秒后，还需插值完成、左臂已发 reference 与右臂有界目标
+逐关节相差不超过静止门槛（默认 0.1°）。满足后把共同 r 设为左臂最后已发 reference，
+此刻右臂 alpha 仍为 1，故不会突然产生位置恢复力；左臂目标也没有跳变。
+随后丢弃旧 revision，从当前实测位置重新 query policy，两臂重新收到共同 r、共同速度，
+右臂在 0.5 秒内恢复阻抗。若左臂尚在限速追赶，右臂继续纯重力，等待跟上后再恢复。
+判据针对命令的连续性，不要求左右实测 q 完全一致；MIT 的正常跟踪误差可以存在。
+
+恢复中再次介入仍使用 5° / 0.1 秒确认；下一次左臂插值重新从当时已发送目标开始。
+圆周虚拟点和 policy 推理在所有阶段持续运行。夹爪沿用原双臂同步与力反馈通道，不参与六关节插值。
 
 ```bash
-# 离线几何检查：默认模式，不创建 controller，不连接 CAN。
+# 默认只检查双方关节范围、IK 路径及双方重力标定。
+PYTHONPATH=src:vendor/pyAgxArm python examples/client_dual_piper_shared_circle.py
+# 不连接硬件，演练完整进程与交接。
+PYTHONPATH=src:vendor/pyAgxArm python examples/client_dual_piper_shared_circle.py \
+  --simulate --simulate-intervention --seconds 9
+# 按注册 USB 身份连接左右臂、上电、双臂回 home，再开始永续圆圈。
+PYTHONPATH=src:vendor/pyAgxArm python examples/client_dual_piper_shared_circle.py --execute
+```
+
+如果上一次故障留下 `EMERGENCY_STOP(0x1)`，普通启动在 enable 前报错，不会自动复位。
+需要复位后重新启动时，显式运行 `--execute --reset-stop`：只对当前报告急停锁存的臂调用
+一次 SDK `reset()`，等待时间戳前进且状态 NORMAL、err_code=0，再按原流程启用、回 home。
+它不重试运行故障、不复位健康臂；复位未获健康反馈则停止启动。启动错误附带 worker 日志，
+示例同时把异常写入 JSONL 的 `failure` 行，避免只剩 setup 而丢失首次失败原因。
+
+双臂日志为 `logs/dual_shared_circle_时间.jsonl`。新增 `follower_reference_q`、
+`follower_reference_qd`、`follower_handoff_progress`、`follower_handoff_limited`；
+human 时 `reference_q` 是右臂 shadow pose，左臂命令必须查看 `follower_reference_q`。
+`reference_active=false` 在此仅表示右臂位置弹簧卸载，左臂仍在执行跟随。
+终端 `left_blend` 显示插值进度，`limited` 显示是否触发 reference 限速。
+
+## Policy 与 reference
+
+自动交接不退出外层 POLICY 会话，不停止推理。进入 blend、human、recover 时 revision 改变，
+旧 chunk 和在途结果失效。人工阶段的 policy proposal 不执行；恢复阶段重新从最新实测位置推理。
+policy observation 最长有效期默认 1 秒，keepalive 不会刷新旧 action 的有效期。
+
+圆圈入口使用 `ruri_gravity_handoff_v1`，保持不带 RTC prefix 的单步重规划。
+新的远程入口在正常 policy 阶段使用原 RTC chunk 衔接，在介入及恢复阶段清空 prefix，
+见 [远程 RTC 接入说明](piper-assisted-rtc.md)。双臂旧 `ruri_shared_reference_v1` 路径保持原调度方式。
+夹爪是独立的位置/力通道；本轮不是夹爪力反馈验收。
+
+## 圆圈与运行
+
+圆心为 home TCP 向前 5 cm、向上 15 cm，约 `[0.24143, 0, 0.37502] m`；
+基座 YZ 平面半径 10 cm，角速度 0.5 rad/s（约 12.57 秒一圈）。TCP 暂用 URDF 夹爪中点，
+沿 link6 +Z 偏移 135.8 mm，可用 `--tcp-offset` 修改。姿态为软约束，上方抬头、下方低头。
+
+圆周目标的相位始终前进。policy 从当前实测 TCP 沿直线朝当时目标迈出一小步再解 IK，
+默认 TCP lookahead 速度 0.10 m/s、步长不超过 50 mm。policy 关节 reference 速度上限 0.5 rad/s，
+发送层 reference 上限保持 4 rad/s；纯重力拖动不靠 reference 速度限制跟手，实测关节速度检查仍为 4 rad/s。
+关节空间执行不保证 TCP 走精确直线。离线 IK 审查不等同碰撞检查。
+
+离线 IK 审查保持 0.05 mm 的位置残差门槛；运行时允许 0.5 mm。人工拖到其他姿态后，
+若当前直线步长的 IK 不收敛，圆圈 policy 依次用 1、1/2、1/4、1/8 步长重试。
+都无解时返回当前实测姿态对应的有界 proposal，标记 `ik_status=waiting_ik`；这是本次不再前进的
+普通 policy 结果，不请求 worker HOLD，不打断纯重力拖动。下一次 query 继续从最新状态尝试，
+圆周相位仍持续前进。它不保证从所有姿态都能找到绕开不可达区域的路径。
+非有限观测、意外程序异常和硬件故障仍沿用原有故障处理。
+
+```bash
+# 默认只离线审查 FK/IK，不创建 controller，不连接 CAN。
 PYTHONPATH=src:vendor/pyAgxArm python examples/client_single_piper_shared_circle.py
 
-# 仿真完整进程/UDP/推理链路；第 3 秒约束右臂 J1 两秒，随后释放。
+# 完整进程/UDP/推理仿真；第 3 秒将 J1 偏移 0.2 rad 并约束 2 秒。
+# 约束期间不移动也会触发静止恢复，符合“握着不动也算静止”的定义。
 PYTHONPATH=src:vendor/pyAgxArm python examples/client_single_piper_shared_circle.py \
-  --simulate --simulate-intervention --seconds 35
+  --simulate --simulate-intervention --seconds 9
 
-# 真机：右臂上电，MIT 回 home，然后永续执行，Ctrl-C 请求 HOLD 并退出。
+# 右臂上电、MIT 回 home、永续圆圈，Ctrl-C 请求 HOLD 并退出。
 PYTHONPATH=src:vendor/pyAgxArm python examples/client_single_piper_shared_circle.py --execute
 ```
 
-`--seconds 60` 可限制 policy 测试时长（从 home 完成后计时）；默认 0 表示永续。
-`--radius` 单位米、`--period` 单位秒，`--reference-speed` 是融合后的关节 reference 速度上限（rad/s），`--policy-speed` 是 policy 支路上限。默认不绑定某个 canN；指定 `--leader-can-interface` 时仍校验右臂身份。
-真机入口复用工作站 writer lock 并检查其他已知控制进程，避免与现有 teleop 同时发送。
+当前环境 Python 为 `/home/omen/miniforge3/envs/lerobot-061/bin/python`，额外依赖 SciPy 在
+`piper-circle` extra 中。`--seconds 60` 可限制 home 后的运行时间，默认 0 为永续。
+`--quiet-angle 0.1` 设置静止窗口范围，单位度。修改后需重启脚本。
 
-正常结束持有当前位置并退出进程，不关闭扭矩；退出后不再持续重算主机重力前馈。运行中硬件故障沿用
-MIT recovery：有健康反馈时先 HOLD、再低速 home；无法恢复时发送 electronic stop，不自动重启。
-保留每路反馈、状态、速度、reference tracking error（0.35 rad）和扭矩上限。策略异常先请求 HOLD。
+入口持有现有硬件 writer lock，并按 USB 身份校验右臂。保留每路反馈、状态、速度与前馈扭矩检查；
+右臂 `LeaderRig` 不再因 q 与 reference 偏差超过 0.35 rad 而 abort，也没有替换成加权门槛。
+双臂重力交接也不使用该 raw-error abort；未开启重力交接的双臂原有控制器仍保留原检查。
+运行故障沿用 MIT hold/home recovery，不能健康恢复时发送 electronic stop；不自动重启。
+正常退出持有当前位置再断开，不关闭扭矩；退出后没有持续运行的主机重力循环。
+调度器关闭时若 worker 已在故障恢复，不再发送 HOLD；恢复状态切换造成的清理超时只记录提示，
+保留原始故障，随后由 controller.disconnect 等待恢复完成。
 
-JSONL 默认写到 `logs/right_shared_circle_时间.jsonl`，包含配置、几何检查、q、r、rdot、α、interaction、
-policy 时间/圆周目标、推理结果采纳/丢弃原因及 MIT telemetry。
-终端显示 `authority` 阶段、α、进入确认计时 `confirm`、上升计时 `rise` 和静止计时 `quiet`；
-日志增加 `filtered_interaction_error_rad`、`intervention_trigger_active`、`human_rise_s`，另有 `human_exclusive`
-与加权后、最终限速前的 `applied_policy_velocity`，人工独占时这个向量严格为零。右臂实测状态来自 `leader`；`follower.q`
-保持 null，并有 `leader_only=true, follower_present=false` 标记。action 记录实际应用 reference，而非未执行 proposal。
+## 日志与验证
 
-## 首版离线验证（3 cm、0.15 rad/s 配置）
+JSONL 保存到 `logs/right_shared_circle_时间.jsonl`，包含配置、FK/IK 审查、q、r、alpha、
+policy 圆周目标、推理结果及 MIT telemetry。`follower.q=null`，`leader_only=true`。
+终端每 0.1 秒显示 authority、alpha、confirm、rise、quiet、kp_scale 和窗口最大 motion。
+同时显示 `ik=ok/reduced_step/waiting_ik`；JSONL 的 circle 中记录求解残差、步长比例与失败原因。
+日志中的 `human_motion_range_deg` 是逐关节窗口范围，`leader_impedance_scale=1-alpha`，
+`reference_active` 区分伺服目标和纯重力阶段的 shadow reference。
+`applied_policy_velocity` 在卸载及纯重力阶段为零；卸载时 reference 的平滑刹停记录在 `reference_qd`。
 
-完整测试覆盖数学公式、固定 MIT 参数、右臂单 driver、启动/回 home、通信与反馈故障、action 失效、
-短 chunk 的持续更新，以及圆圈 FK/IK。35 秒仿真中注入两秒干预，α 最高约 0.96，释放后回到 0；
-reference 速度不超过 0.15 rad/s，旧 revision 结果被丢弃。接近圆后模拟 TCP 对移动目标的误差约 4.3 mm。
-这里的仿真 rig 是简化运动模型，不验证电机动力学、实际重力精度或接触稳定性；还需右臂真机调试。
-
-当前默认已调整为半径 10 cm、融合后的关节 reference 上限 4 rad/s、policy 支路上限 0.5 rad/s、圆周角速度 0.5 rad/s；
-新路径已通过离线 IK 检查，圆周所需最大关节速度约 0.207 rad/s。上面的 35 秒仿真统计属于初版参数。
-
-右臂示例的 `--admittance-damping` 默认现为 0.1，相比 B=2，同样有效 interaction 产生的
-人支路速度提高 20 倍。充分人工接管时，0.16 rad（约 9.2°）单关节形变即可给出 4 rad/s；
-接近手的位置后自然减速至 deadzone，4 rad/s 是上限，不是强制最低速度。Kp/Kd 保持固定；α 使用上述时间曲线。
-这是 reference 数学响应的调整，实际拖动手感仍以真机体验为准。修改后重启示例生效。
+离线测试验证持续进入确认、微动/慢速拖动和静止窗口、权重连续性、零刚度时重置 reference、
+旧 chunk 失效、恢复结束不打断新轨迹，以及 MIT 三项控制律和纯重力端点与原 teleop 路径一致。
+单 driver、启动、home、通信与状态故障以及现有双臂行为保留回归测试。
+双臂新增离线检查覆盖：卸载阶段目标一致、实时移动终点、交接首帧无跳变、限速追赶、
+恢复与再次介入、左右独立速度发送、左臂固定阻抗与重力前馈（含启用、home、HOLD），
+与右臂纯重力端点。另用相同 reference 和反馈逐字段比较左臂 MIT 命令与原 single Piper 发送器。
+完整双臂脚本仿真已走通 policy → blend → human → recover → policy。
+仿真 rig 是简化运动模型，不验证真实接触动力学或拖动手感；新增双臂交接尚待真机验收。

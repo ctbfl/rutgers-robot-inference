@@ -11,6 +11,9 @@ from ruri.client.controllers.single_piper_leader_follower_teleop.config import (
 @dataclass(frozen=True, slots=True)
 class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
     leader_only: bool = False
+    gravity_handoff: bool = False
+    follower_handoff_s: float = 0.5
+    reset_latched_stop: bool = False
     camera_enabled: bool = True
     startup_home: bool = False
     leader_policy_kp: float = 3.0
@@ -26,17 +29,22 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
     interaction_bias: tuple[float, ...] = (0.0,) * 6
     admittance_damping: tuple[float, ...] = (2.0,) * 6
     human_trigger_angle_deg: float = 5.0
-    human_confirm_s: float = 0.5
+    human_confirm_s: float = 0.1
     interaction_filter_s: float = 0.05
     human_takeover_s: float = 0.5
     human_release_delay_s: float = 0.5
     human_release_s: float = 1.0
+    human_quiet_range_deg: tuple[float, ...] = (0.1,) * 6
     interaction_release: float = 0.02
     policy_max_age_s: float = 1.0
     leader_sign: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     leader_offset_rad: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     trace_queue_size: int = 4096
     simulate: bool = False
+
+    @property
+    def uses_gravity_handoff(self):
+        return self.leader_only or self.gravity_handoff
 
     def __post_init__(self):
         for item in fields(self):
@@ -65,6 +73,7 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
             ("human_confirm_s", 0.05, 5.0),
             ("interaction_filter_s", 0.001, 0.5),
             ("human_takeover_s", 0.05, 5.0),
+            ("follower_handoff_s", 0.05, 5.0),
             ("human_release_delay_s", 0.05, 5.0),
             ("human_release_s", 0.1, 5.0),
             ("interaction_release", 0.0, 10.0),
@@ -77,6 +86,12 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
                 raise ValueError(f"{name} must be finite in [{low}, {high}]")
         if self.human_release_delay_s >= self.human_release_s:
             raise ValueError("require release delay < release duration")
+        if len(self.human_quiet_range_deg) != 6 or any(
+            isinstance(v, bool) or not isinstance(v, (int, float))
+            or not math.isfinite(v) or not 0.001 <= v <= 1.
+            for v in self.human_quiet_range_deg
+        ):
+            raise ValueError("human_quiet_range_deg requires six values in [0.001, 1] degrees")
         if self.reference_speed > self.max_reference_speed:
             raise ValueError("reference_speed exceeds max_reference_speed")
         if self.policy_reference_speed > self.reference_speed:

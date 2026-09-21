@@ -14,7 +14,12 @@
 
 新 shared-reference 实现向 MIT 提交积分后实际应用的 reference velocity；固定增益、重力前馈、位置跟踪和阻尼共同作用。图中公式用于说明控制组成，实际执行保留扭矩、关节范围、跟踪误差和通信看门狗约束。共享参考不等于两臂实测位置逐点相同。
 
-图保留了早期 RTC 示例；新版本的连续融合、无 RTC 前缀的推理及右臂单独测试入口见 [实现说明](piper-shared-reference.md)。
+图保留了原双臂共享参考和早期 RTC 示例。圆圈入口现在使用平滑重力交接：确认介入后卸掉右臂
+阻抗，纯重力阶段按关节运动窗口判断静止，再恢复 policy。新双臂圆圈入口复用此交接机制，
+在右臂完全进入重力模式后，左臂用 0.5 秒从共享 reference 插值到右臂实时读数；恢复时从
+左臂最后已发目标重新建立共同 reference。左臂保留原 single Piper 的固定 Kp/Kd 和重力前馈，
+右臂可卸载阻抗进入纯重力拖动。
+调度器只负责推理，交接和插值由 MIT worker 执行。控制公式与入口见 [实现说明](piper-shared-reference.md)。
 
 实现参考：[共享参考](../src/ruri/client/controllers/single_piper_assisted/control.py)、[双臂 MIT 循环](../src/ruri/client/controllers/single_piper/mit/assisted.py)、[重力模型](../src/ruri/client/controllers/single_piper/mit/gravity.py)、[RTC 调度](../src/ruri/client/schedulers/assisted.py)。
 

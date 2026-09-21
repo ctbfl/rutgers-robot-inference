@@ -2,9 +2,10 @@
 """Paired Piper RTC with automatic human correction, without dataset recording.
 
 Enter a task prompt to enable both arms. The right/secondary Piper is the
-compliant leader; left/main is the task follower. Both receive a shared virtual
-reference directly. Drag the right arm to correct it; background RTC inference
-continues, and fresh predictions continue from the corrected state on release.
+leader; left/main is the task follower. Both track the same virtual reference.
+Drag the right arm to enter gravity control; the left blends to its readings
+over 0.5s. Background inference continues and RTC restarts from current state
+on release. Remote observation/action formats are unchanged.
 
   q             pause both arms; enter another task prompt to resume.
   home          at the paused prompt: paired home at up to 1 rad/s, then hold.
@@ -20,15 +21,18 @@ from __future__ import annotations
 
 import argparse
 import logging
+from contextlib import nullcontext
 
 from ruri.client.controllers.single_piper_assisted import SinglePiperAssistedController
 from ruri.client.schedulers.assisted_interactive import InteractiveAssistedRTC
 from ruri.client.utils import inference_client
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, *, interactive=True):
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        description=(__doc__ if interactive else
+                     "Remote RTC with dual Piper gravity handoff. Enable/home both arms, run until Ctrl-C; no recording."),
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         "--policy-endpoint",
@@ -56,30 +60,41 @@ def parse_args(argv=None):
     parser.add_argument("--rtc-initial-delay-steps", type=int, default=4)
     parser.add_argument("--policy-timeout-s", type=float, default=5.0)
     parser.add_argument("--policy-ready-timeout-s", type=float, default=30.0)
+    parser.add_argument("--simulate", action="store_true", help="no CAN or cameras; connect to policy as usual")
+    if not interactive:
+        parser.add_argument("--prompt", default=(
+            "pick and place the object E into the first hole on the manipulation-net board."))
+        parser.add_argument("--seconds", type=float, default=0., help="0 runs until Ctrl-C; duration starts after home")
     parser.add_argument(
         "--startup-home", action=argparse.BooleanOptionalAction, default=True,
         help="home both arms with MIT before policy (default: enabled)",
     )
-    parser.add_argument("--start-home-speed", type=float, default=0.2,
+    parser.add_argument("--start-home-speed", type=float, default=0.15,
                         help="startup home peak reference speed in rad/s")
     parser.add_argument(
         "--configure-can", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--log-level", default="INFO")
+    # The same local controller settings accepted in the dual circle trial.
+    parser.set_defaults(leader_only=False, gravity_handoff=True, rtc_during_policy=True,
+                        reference_speed=4., max_reference_speed=4., policy_reference_speed=.5,
+                        camera_enabled=True, record_effort=False, reset_latched_stop=False)
     return parser.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     logging.basicConfig(
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
         with inference_client.connect(args) as policy:
-            InteractiveAssistedRTC().run(
-                controller=SinglePiperAssistedController, policy=policy, args=args
-            )
+            from ruri.client.controllers.single_piper.mit.leader_gravity_check import hardware_owner
+            with (nullcontext() if args.simulate else hardware_owner()):
+                InteractiveAssistedRTC().run(
+                    controller=SinglePiperAssistedController, policy=policy, args=args
+                )
     except KeyboardInterrupt:
         logging.getLogger(__name__).info("Stopped by user")
 

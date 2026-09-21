@@ -85,17 +85,16 @@ resume do not wait for measured arm or gripper agreement. Use
 `--no-startup-home` to start from nominal-clamped current poses instead. Every
 MIT position command passes through the nominal clamp and then that arm's
 measured hardware clamp; measured feedback is preserved. The same virtual
-reference drives both arms through a continuous velocity integrator, existing
-gravity compensation and the 100 Hz MIT worker. Human spring displacement and
-fresh policy proposals blend through a timed weight alpha; MIT gains stay
-fixed. A 50 ms filtered joint deflection must stay above 5 degrees for 0.5 seconds
-before takeover starts. With continuing interaction, alpha then rises to 1 in
-another 0.5 seconds, giving the human exclusive reference control. Missing
-interaction evidence pauses the rise. It holds the current weight for 0.5 seconds
-and fades to zero by 1 second; renewed interaction during recovery must confirm again.
-Inference continues during automatic intervention. Authority phase changes invalidate old chunks and in-flight results. The first shared-reference
-version queries without RTC prefixes because blended references differ from
-policy proposals. See [the control model and right-leader-only circle sample](docs/piper-shared-reference.md).
+reference drives both arms through the validated 100 Hz MIT worker. A 50 ms
+filtered joint deflection above 5 degrees for 0.1 seconds starts the 0.5-second
+right-arm impedance fade. Once the right arm reaches pure gravity control, the
+left blends to its live readings over 0.5 seconds. Quiet right-arm motion for
+0.5 seconds starts recovery once the follower reference catches up; impedance
+returns over 0.5 seconds. Inference continues throughout intervention.
+During autonomous policy tracking the original RTC prefix and latency alignment
+remain active. Intervention discards old chunks and in-flight results; recovery
+uses fresh observations without a stale prefix, then starts a fresh RTC segment.
+See [the local control model](docs/piper-shared-reference.md).
 
 `q` pauses both arms; enter a task to resume. At the paused prompt, `switch PORT`
 changes checkpoint on the same host and `home` returns both arms to zero at up
@@ -106,7 +105,7 @@ Runtime aborts use the persistent teleop recovery: hold both measured poses for
 10 seconds, then home with MIT at 0.2 rad/s. The client waits for recovery to
 finish. If feedback or CAN/MIT state cannot support recovery, the worker stops.
 Policy proposals are clamped and integrated at a bounded reference velocity.
-The tracking watchdog compares measured position to the applied reference.
+The gravity-handoff path retains feedback, status, speed and feed-forward checks.
 Ordinary single-arm startup/recovery behavior is unchanged.
 
 This example composes `SinglePiperAssistedController`, `AssistedScheduler` and
@@ -114,23 +113,73 @@ the existing terminal interface. It does not create episodes, datasets, videos,
 effort logs or uploads, and does not depend on robot-learning-workflows. Diagnostic
 status is printed to the terminal; observations and control traces stay in memory.
 
-## Right leader shared-reference circle demo
+## Interactive dual-arm remote RTC
+
+```bash
+python examples/client_dual_piper_rtc.py \
+  --policy-endpoint tcp://172.16.68.130:5557
+```
+
+Use the same endpoint and exact task prompt as the existing single-arm RTC client.
+The existing `server_pi05_rtc.py` or training-time RTC server needs no changes.
+Enter the task prompt in the terminal to enable/home both arms and start RTC.
+Press `q` to pause, then enter another task, `home`, or `switch PORT`.
+Esc / Ctrl-C requests HOLD and exits.
+It uses the accepted circle controller with the remote policy in place of the
+circle policy: right human intervention and left handover stay local. The server
+still receives the left arm's 7D state, top/wrist images and the ordinary optional
+RTC context, and returns `(H, 7)` actions. There are no intervention/dataset/video
+or effort files. `--simulate` uses the same server connection with simulated
+arms/images and no hardware. This is a short alias of the interactive entry above.
+See [communication and RTC handoff details](docs/piper-assisted-rtc.md).
+
+## Right leader circle demo with gravity handoff
 
 ```bash
 # Offline FK/IK audit (requires SciPy, provided by the piper-circle extra).
 python examples/client_single_piper_shared_circle.py
 # Worker + local policy simulation, with automatic artificial intervention.
 python examples/client_single_piper_shared_circle.py --simulate --simulate-intervention --seconds 35
-# Right arm only: enable, home, circle policy; drag to intervene, release to resume.
+# Right arm only: enable, home, circle policy; drag to intervene, stay still to resume.
 python examples/client_single_piper_shared_circle.py --execute
 ```
 
 Default circle: home TCP +5 cm forward / +15 cm up, radius 10 cm, circle angular speed 0.5 rad/s
-(12.57 seconds per lap), policy joint velocity limit 0.5 rad/s, and blended
-reference limit 4 rad/s, with relaxed pitching orientation. Human reference damping
-defaults to B=0.1 (`--admittance-damping`) for faster following during a drag.
-No left CAN or cameras are opened.
+(12.57 seconds per lap), policy joint velocity limit 0.5 rad/s, and reference
+ceiling 4 rad/s, with relaxed pitching orientation. After a filtered joint error
+exceeds 5 degrees for 0.1 seconds, leader impedance smoothly fades out over
+0.5 seconds. Full human control uses the original gravity-plus-damping teleop
+command with motor kp=kd=0. No admittance or position spring resists dragging.
+When every joint moves at most 0.1 degrees over 0.5 seconds (`--quiet-angle`),
+the reference rebases to the measured pose and impedance returns over 0.5 seconds.
+Holding the arm still counts toward recovery. Terminal status prints at 10 Hz.
+This entry uses `leader_only=True`; no left CAN or cameras are opened.
 Ctrl-C requests HOLD. See [parameters, logging and validation](docs/piper-shared-reference.md).
+
+## Dual-arm circle with right gravity handoff
+
+```bash
+python examples/client_dual_piper_shared_circle.py  # offline audit for both arms
+python examples/client_dual_piper_shared_circle.py --simulate --simulate-intervention --seconds 9
+python examples/client_dual_piper_shared_circle.py --execute  # enable and home both, then run
+```
+
+One circle policy feeds both arms the same joint reference during policy tracking
+and right-arm stiffness unloading. Once the right arm reaches pure gravity mode,
+the left arm blends from its last sent reference to the **live** right joint readings
+over 0.5 seconds, using a quintic curve and its own reference velocity. The left arm
+keeps the original single-Piper tracking gains (Kp=10, Kd=0.8) and calibrated
+gravity feed-forward, including startup and home. On release, the shared
+reference resumes from the last left command once the handover has caught up; right
+impedance returns over 0.5 seconds. Rate limiting can extend catch-up time.
+This example selects `gravity_handoff=True`; the earlier assisted entry retains its
+original controller. Logs: `logs/dual_shared_circle_*.jsonl`. Both circles use each
+arm's local base coordinates. The left arm remains a position tracker throughout;
+only the right arm enters zero-stiffness gravity dragging.
+If a previous failure left a latched electronic stop, `--execute --reset-stop`
+explicitly resets stopped arms once, verifies fresh healthy feedback, then starts
+the usual enable/home sequence. Ordinary startup does not clear stops.
+See [handover equations and timing](docs/piper-shared-reference.md).
 
 ## Piper installation
 

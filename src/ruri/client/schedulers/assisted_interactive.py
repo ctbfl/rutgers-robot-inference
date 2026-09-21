@@ -12,7 +12,7 @@ from ruri.client.utils import inference_client
 from ruri.client.utils.prompt_terminal import PromptTerminal
 
 from ._actions import clip_target
-from .assisted import AssistedScheduler
+from .assisted import AssistedScheduler, policy_version
 from .rtc_interactive import InteractiveRTCScheduler, _validate_switch
 
 
@@ -21,15 +21,6 @@ PAUSED = (
     "Both arms paused. Enter a task to resume, home, or switch <port>. "
     "Esc or Ctrl-C quits."
 )
-
-
-def policy_version(policy):
-    metadata = policy.metadata
-    return str(
-        metadata.get("policy_version")
-        or metadata.get("policy", {}).get("checkpoint_path")
-        or policy.endpoint
-    )
 
 
 class InteractiveAssistedRTC:
@@ -87,6 +78,7 @@ class InteractiveAssistedRTC:
                 rtc_latency_window=get_arg(args, "rtc_latency_window", 10),
                 rtc_initial_delay_steps=get_arg(args, "rtc_initial_delay_steps", 4),
                 inference_timeout_s=get_arg(args, "policy_timeout_s", 5.0),
+                rtc_during_policy=get_arg(args, "rtc_during_policy", False),
             )
             robot.start()
             logger.info(

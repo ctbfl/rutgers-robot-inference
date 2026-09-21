@@ -512,6 +512,129 @@ class AssistedHardwareTests(MockPiperRigTestCase):
         )
 
 
+class DualHandoffHardwareTests(MockPiperRigTestCase):
+    def make_rig(self):
+        return assisted.PiperRig(SinglePiperAssistedConfig(gravity_handoff=True,
+            reference_speed=4., max_reference_speed=4., policy_reference_speed=.5), "canL", "canF")
+
+    def test_leader_gravity_blend_and_follower_fixed_gains_use_separate_velocities(self):
+        self.rig.enable()
+        control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
+        control.mode = 'POLICY'
+        qd = np.array([.1, -.2, .3, -.4, .2, -.1])
+        self.rig.samples = (replace(self.rig.samples[0], qd=qd), self.rig.samples[1])
+        self.rig.leader_gravity.torque = lambda q: np.full(6, .3)
+        self.rig.follower_gravity.torque = lambda q: np.full(6, .6)
+        self.assertEqual(assisted.mit.GravityCompensator.call_count, 2)
+        assisted.mit.GravityCompensator.assert_any_call(assisted.mit.ASSET_ROOT / "calibration_follower.json")
+        control.reference_velocity = np.full(6, .05)
+        control.follower_velocity = np.array([4., -4., 2., -.5, .1, 0.])
+        control.target[0] += .6  # Intentional gap is no longer a raw-error abort.
+        control.leader_target[0] += .6
+        for alpha in (0., .5, 1., .5, 0.):
+            control.reference.alpha = alpha
+            self.rig.send(control, .01)
+            leader = [x.kwargs for x in self.arms[0].move_mit.call_args_list[-6:]]
+            follower = [x.kwargs for x in self.arms[1].move_mit.call_args_list[-6:]]
+            np.testing.assert_allclose([x['kp'] for x in leader], (1-alpha)*3.)
+            np.testing.assert_allclose([x['kd'] for x in leader], (1-alpha)*.5)
+            np.testing.assert_allclose([x['t_ff'] for x in leader], .3-alpha*.2*qd)
+            np.testing.assert_allclose([x['v_des'] for x in leader], 0. if alpha == 1. else .05)
+            np.testing.assert_allclose([x['kp'] for x in follower], 10.)
+            np.testing.assert_allclose([x['kd'] for x in follower], .8)
+            np.testing.assert_allclose([x['t_ff'] for x in follower], .6)
+            np.testing.assert_allclose([x['p_des'] for x in follower], control.target[:6])
+            np.testing.assert_allclose([x['v_des'] for x in follower], control.follower_velocity)
+
+    def test_live_interpolation_reaches_left_sdk_and_leader_remains_gravity_only(self):
+        self.rig.enable()
+        control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
+        control.mode = 'POLICY'
+        leader, follower = self.rig.read()
+        leader[0] += .3
+        saw_human = False
+        for k in range(140):
+            self.advance(.01)
+            control.last_heartbeat = control.last_command = self.now
+            if control.reference.phase == 'human':
+                leader[0] += .001
+                saw_human = True
+            control.tick(leader, follower)
+            self.rig.send(control, .01)
+            left = [x.kwargs for x in self.arms[1].move_mit.call_args_list[-6:]]
+            np.testing.assert_allclose([x['p_des'] for x in left], control.target[:6])
+            np.testing.assert_allclose([x['v_des'] for x in left], control.follower_velocity)
+        self.assertTrue(saw_human)
+        self.assertEqual(control.reference.alpha, 1.)
+        np.testing.assert_allclose(control.target, leader)
+
+    def test_original_left_gravity_also_applies_to_enable_home_and_hold(self):
+        self.rig.follower_gravity.torque = lambda q: np.full(6, .6)
+        self.rig.enable()
+        for arm in self.arms:
+            arm.move_mit.side_effect = lambda **kw: self.q.__setitem__(kw['joint_index']-1, kw['p_des'])
+        self.rig.home()
+        control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
+        self.rig.send(control, .01)
+        self.assertTrue(control.status()['follower_gravity_compensation'])
+        for call in self.arms[1].move_mit.call_args_list:
+            self.assertEqual(call.kwargs['t_ff'], .6)
+            self.assertEqual(call.kwargs['kp'], 10.)
+            self.assertEqual(call.kwargs['kd'], .8)
+        for call in self.arms[0].move_mit.call_args_list:
+            self.assertEqual(call.kwargs['kp'], 3.)
+            self.assertEqual(call.kwargs['kd'], .5)
+
+    def test_left_mit_writes_match_single_piper_for_identical_reference_and_feedback(self):
+        from ruri.client.controllers.single_piper.mit import policy_controller as original
+        self.rig.enable()
+        control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
+        control.mode = 'POLICY'
+        control.target[:6] = [.3, .6, -.8, .2, -.3, .1]
+        control.follower_velocity = np.array([.1, -.2, .3, -.4, .2, -.1])
+        self.rig.follower_gravity.torque = lambda q: np.arange(6)*.17
+        expected = MagicMock()
+        original.send_position_impedance(expected, self.rig.samples[1], control.target[:6],
+            control.follower_velocity, self.rig.follower_gravity,
+            original.DEFAULT_FOLLOWER_KP, original.DEFAULT_FOLLOWER_KD,
+            self.rig.config.max_reference_speed, 'original single Piper')
+        for alpha in (0., .5, 1.):
+            control.reference.alpha = alpha
+            self.rig.send(control, .01)
+            self.assertEqual(self.arms[1].move_mit.call_args_list[-6:], expected.move_mit.call_args_list)
+
+    def test_explicit_reset_only_resets_latched_arm_before_enable(self):
+        self.rig.config = replace(self.rig.config, reset_latched_stop=True)
+        status = self.arms[0].get_arm_status.return_value
+        status.msg.arm_status = 'EMERGENCY_STOP(0x1)'
+        def reset():
+            status.msg.arm_status = 'NORMAL'
+            status.timestamp += .01
+        self.arms[0].reset.side_effect = reset
+        self.rig.enable()
+        self.arms[0].reset.assert_called_once()
+        self.arms[1].reset.assert_not_called()
+        self.assertTrue(self.rig.enabled)
+
+    def test_stop_reset_requires_fresh_normal_feedback_before_any_enable(self):
+        self.rig.config = replace(self.rig.config, reset_latched_stop=True)
+        status = self.arms[0].get_arm_status.return_value
+        status.msg.arm_status = 'EMERGENCY_STOP(0x1)'
+        self.arms[0].reset.side_effect = lambda: setattr(status.msg, 'arm_status', 'NORMAL')
+        with self.assertRaisesRegex(assisted.mit.TeleopAbort, 'reset lacked fresh NORMAL'):
+            self.rig.enable()
+        self.arms[0].reset.assert_called_once()
+        for arm in self.arms:
+            arm.enable.assert_not_called()
+            arm.set_follower_mode.assert_not_called()
+
+    def test_explicit_reset_does_not_reset_healthy_arms(self):
+        self.rig.config = replace(self.rig.config, reset_latched_stop=True)
+        self.rig.enable()
+        for arm in self.arms:
+            arm.reset.assert_not_called()
+
+
 class LeaderOnlyHardwareTests(MockPiperRigTestCase):
     def make_rig(self):
         return assisted.LeaderRig(SinglePiperAssistedConfig(leader_only=True), "canL")
@@ -527,27 +650,56 @@ class LeaderOnlyHardwareTests(MockPiperRigTestCase):
         np.testing.assert_allclose([call.kwargs['v_des'] for call in calls], control.reference_velocity)
         self.assertEqual(self.arms[1].mock_calls, [])
 
-    def test_single_driver_and_fixed_mit_for_every_authority(self):
+    def test_single_driver_blends_impedance_into_exact_gravity_teleop(self):
         assisted.mit.build_arm.assert_called_once_with("canL")
         self.rig.enable()
         self.assertIsNone(self.rig.follower)
         self.arms[1].assert_not_called()
         self.assertEqual(self.arms[1].mock_calls, [])
-        for mode, correcting in (("HOLD", False), ("POLICY", False), ("POLICY", True), ("HUMAN", False)):
-            control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
-            control.mode, control.correcting = mode, correcting
+        control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
+        control.mode = 'POLICY'
+        qd = np.array([.1, -.2, .3, -.4, .2, -.1])
+        self.rig.samples = (replace(self.rig.samples[0], qd=qd),)
+        gravity = np.arange(6)*.1
+        self.rig.leader_gravity.torque = lambda q: gravity.copy()
+        control.leader_target[:6] += .01
+        for alpha in (0., .25, .5, .75, 1., .75, .5, .25, 0.):
+            control.reference.alpha = alpha
             control.reference_velocity = np.array([.03, -.04, .02, .01, -.01, .0])
-            self.rig.leader_gravity.torque = lambda q: np.arange(6)*.1
             self.rig.send(control, .01)
             calls = self.arms[0].move_mit.call_args_list[-6:]
-            np.testing.assert_allclose([c.kwargs["v_des"] for c in calls], control.reference_velocity)
-            np.testing.assert_allclose([c.kwargs["t_ff"] for c in calls], np.arange(6)*.1)
-            self.assertTrue(all(c.kwargs["kp"] == 3. and c.kwargs["kd"] == .5 for c in calls))
+            np.testing.assert_allclose([c.kwargs["v_des"] for c in calls],
+                                       0. if alpha == 1. else control.reference_velocity)
+            np.testing.assert_allclose([c.kwargs["t_ff"] for c in calls], gravity-alpha*.2*qd)
+            self.assertTrue(all(c.kwargs["kp"] == (1-alpha)*3. and
+                                c.kwargs["kd"] == (1-alpha)*.5 for c in calls))
+            actual_torque = np.array([x.kwargs['t_ff']+x.kwargs['kp']*(x.kwargs['p_des']-self.q[i])
+                                      +x.kwargs['kd']*(x.kwargs['v_des']-qd[i])
+                                      for i,x in enumerate(calls)])
+            np.testing.assert_allclose(actual_torque,
+                gravity+(1-alpha)*(3.*.01+.5*(control.reference_velocity-qd))-alpha*.2*qd)
         self.assertNotIn("follower_q", self.rig.telemetry())
         self.rig.emergency_stop()
         self.rig.close()
         self.arms[0].electronic_emergency_stop.assert_called_once()
         self.assertEqual(self.arms[1].mock_calls, [])
+
+    def test_gravity_phase_ignores_position_target_but_preserves_torque_guard(self):
+        self.rig.enable()
+        control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
+        control.mode = 'POLICY'
+        control.reference.alpha = 1.
+        control.leader_target[0] += .8
+        self.rig.send(control, .01)
+        calls = self.arms[0].move_mit.call_args_list[-6:]
+        np.testing.assert_allclose([x.kwargs['p_des'] for x in calls], self.q)
+        self.assertTrue(all(x.kwargs['kp'] == 0. and x.kwargs['kd'] == 0. for x in calls))
+        self.rig.leader_gravity.torque = lambda q: np.ones(6)*100.
+        with self.assertRaises(assisted.mit.TeleopAbort):
+            self.rig.send(control, .01)
+        control.reference.alpha = float('nan')
+        with self.assertRaisesRegex(assisted.mit.TeleopAbort, 'weight'):
+            self.rig.send(control, .01)
 
     def test_single_home_reaches_zero_and_preserves_fixed_gains(self):
         self.rig.enable()
@@ -569,15 +721,25 @@ class LeaderOnlyHardwareTests(MockPiperRigTestCase):
         self.assertFalse(self.rig.enabled)
         self.assertEqual(self.arms[1].mock_calls, [])
 
-    def test_single_track_error_and_stale_status_stop_motion(self):
+    def test_single_position_error_does_not_abort_any_handoff_phase(self):
         self.rig.enable()
         control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
-        control.leader_target[0] += .36
-        before = self.arms[0].move_mit.call_count
-        with self.assertRaisesRegex(assisted.mit.TeleopAbort, "tracking error"):
-            self.rig.send(control, .01)
-        self.assertEqual(self.arms[0].move_mit.call_count, before)
-        control.leader_target[0] -= .36
+        for error in (.351, .6):
+            control.leader_target[:6] = self.q
+            control.leader_target[0] += error
+            for mode, phase, alpha in (("POLICY", "policy", 0.), ("POLICY", "blend", .73),
+                                       ("POLICY", "human", 1.), ("POLICY", "recover", .5),
+                                       ("HUMAN", "blend", .5), ("HOLD", "policy", 0.)):
+                with self.subTest(error=error, mode=mode, phase=phase):
+                    control.mode, control.reference.phase = mode, phase
+                    control.reference.alpha = alpha
+                    before = self.arms[0].move_mit.call_count
+                    self.rig.send(control, .01)
+                    self.assertEqual(self.arms[0].move_mit.call_count, before+6)
+
+    def test_single_stale_status_still_stops_motion(self):
+        self.rig.enable()
+        control = AssistedControl(self.rig.config, *self.rig.read(), clock=lambda: self.now)
         self.rig.send(control, .01)
         self.advance(.3)
         with self.assertRaisesRegex(assisted.mit.TeleopAbort, "timestamps"):
