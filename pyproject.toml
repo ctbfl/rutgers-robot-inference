@@ -30,8 +30,7 @@ piper = [
 
 
 [project.scripts]
-ruri-server = "ruri.server.__main__:main"
-ruri-client = "ruri.client.__main__:main"
+ruri-serve-pi05-sim-real = "ruri.server.pi05_sim_real:main"
 
 
 [tool.setuptools.packages.find]

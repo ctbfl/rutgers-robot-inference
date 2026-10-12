@@ -91,6 +91,7 @@ from ruri.server.wrappers.pi05.pi05 import (
     OPENPI_STATE,
     OPENPI_WRIST_IMAGE,
     Pi05Wrapper,
+    _reject_domain_checkpoint,
 )
 
 
@@ -187,6 +188,7 @@ class Pi05RTCWrapper(Pi05Wrapper):
         conditioning it was trained for. Reading the Orbax metadata costs ~20 ms
         and turns that into an error.
         """
+        _reject_domain_checkpoint(self.checkpoint_path)
         params_dir = self.checkpoint_path / "params"
         if params_dir.exists():
             try:

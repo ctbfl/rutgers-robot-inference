@@ -173,6 +173,9 @@ def serve(
     socket = context.socket(zmq.REP)
 
     server_info: dict | None = None
+    from ruri.server.diagnostics import RequestRecorder
+
+    recorder = RequestRecorder.from_environment(policy.describe())
 
     try:
         socket.bind(bind_address)
@@ -193,19 +196,32 @@ def serve(
             # A REP socket must answer every request it receives, or it locks
             # into a "must send" state and the next recv fails outright. So
             # every failure turns into a reply rather than escaping the loop.
+            capture = None
             try:
                 request = recv(socket)
+                if recorder is not None:
+                    try:
+                        capture = recorder.begin(request)
+                    except Exception:
+                        logging.exception('Diagnostic snapshot failed; inference continues')
                 response = handle_request(policy, request, server_info)
             except Exception as exc:
                 logging.exception("Request failed")
                 response = {"error": f"{type(exc).__name__}: {exc}"}
 
             send(socket, response)
+            if recorder is not None:
+                try:
+                    recorder.finish(capture, response)
+                except Exception:
+                    logging.exception('Diagnostic enqueue failed; inference continues')
 
     except KeyboardInterrupt:
         print("\n[RURI] Stopping inference server...")
 
     finally:
+        if recorder is not None:
+            recorder.close()
         socket.close(linger=0)
         context.term()
 

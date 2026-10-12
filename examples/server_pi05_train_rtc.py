@@ -127,6 +127,15 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing the pi05_train_rtc package (the model class lives outside OpenPI).",
     )
     parser.add_argument(
+        "--train-config",
+        default=None,
+        help=(
+            "A run's run_config.py exposing make_train_config(exp_name). Required for a "
+            "checkpoint trained on any dataset other than row1, since the data config "
+            "locates the norm stats inside the checkpoint."
+        ),
+    )
+    parser.add_argument(
         "--no-warmup",
         action="store_true",
         help="Skip both startup warmup inferences. Not recommended: the JAX compiles land on the first real requests instead.",
@@ -169,6 +178,7 @@ def main() -> None:
         num_denoising_steps=args.num_denoising_steps,
         default_inference_delay=args.default_inference_delay,
         train_rtc_package=args.train_rtc_package,
+        train_config_file=args.train_config,
         warmup=not args.no_warmup,
         rtc_warmup=not args.no_warmup,
     )

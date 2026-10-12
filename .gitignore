@@ -1,5 +1,7 @@
 # Machine-specific launch scripts (absolute checkpoint and venv paths).
 examples/shell_scripts/*
+# FastWAM's thin launcher derives the repo path and accepts environment overrides.
+!examples/shell_scripts/serve_fastwam.sh
 
 # Runtime logs (server and client scheduler traces).
 logs/

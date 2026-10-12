@@ -61,6 +61,7 @@ transport layer's job, not the wrapper's.
 from __future__ import annotations
 
 import logging
+import json
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -197,6 +198,7 @@ class Pi05Wrapper(PolicyWrapper):
 
     def _load_policy(self) -> "Policy":
         """Build the OpenPI policy, failing fast on a bad checkpoint path."""
+        _reject_domain_checkpoint(self.checkpoint_path)
         # Deferred so that importing ruri without OpenPI installed works.
         try:
             from openpi.policies import policy_config as openpi_policy_config
@@ -358,6 +360,19 @@ class Pi05Wrapper(PolicyWrapper):
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+
+
+def _reject_domain_checkpoint(checkpoint_path: Path) -> None:
+    """Ordinary OpenPI loaders silently intersect away unknown learned layers."""
+    metadata = checkpoint_path / "params/_METADATA"
+    if metadata.is_file():
+        tree = json.loads(metadata.read_text()).get("tree_metadata", {})
+        if any(any(key.get("key") == "domain_proj" for key in leaf.get("key_metadata", []))
+               for leaf in tree.values()):
+            raise ValueError(
+                "This checkpoint contains domain_proj. Use Pi05SimRealWrapper "
+                "with an explicit domain; a plain/RTC wrapper would discard domain conditioning."
+            )
 
 
 def _require(

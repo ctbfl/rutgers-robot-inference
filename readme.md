@@ -43,6 +43,13 @@ Schedulers own chunk selection, RTC/aggregation and final target clipping.
 Controllers validate that final target, convert it to hardware units and send
 it; `send_action()` does not silently alter or return the target.
 
+## Pi05 sim/real inference server
+
+The sim/real training-time RTC wrapper uses the existing client protocol.
+See [checkpoint layout, installation and verification](docs/pi05_sim_real.md).
+Select the deployment domain on the server; clients keep their existing
+state, camera, prompt and RTC fields.
+
 ## Piper installation
 
 The official Agilex SDK is pinned as a Git submodule. It and the Piper-only

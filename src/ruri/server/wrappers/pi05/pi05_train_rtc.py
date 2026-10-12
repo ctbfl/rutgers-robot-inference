@@ -91,6 +91,8 @@ during training. Verified end to end by ``pi05-rtc/serve_pi05_train_rtc.py
 
 from __future__ import annotations
 
+import importlib.util
+import hashlib
 import logging
 import sys
 import time
@@ -108,6 +110,7 @@ from ruri.server.wrappers.pi05.pi05 import (
     OPENPI_STATE,
     OPENPI_WRIST_IMAGE,
     Pi05Wrapper,
+    _reject_domain_checkpoint,
 )
 
 
@@ -151,6 +154,12 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
         train_rtc_package:
             Directory containing the ``pi05_train_rtc`` package. Only used if
             the package is not already importable.
+        train_config_file:
+            A run's ``run_config.py``, whose ``make_train_config(exp_name)``
+            builds that run's ``TrainConfig``. Omit to use the package's own
+            config, which is pinned to the row1 dataset. A checkpoint trained on
+            any other dataset needs its run config: the data config's
+            ``asset_id`` is what locates the norm stats inside the checkpoint.
         rtc_warmup:
             Compile the prefix-conditioned path at startup. Passing
             ``prefix_actions`` changes the traced signature, so warming only
@@ -172,6 +181,11 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
         },
     }
 
+    # Class-level defaults: the effort wrappers bypass __init__ below, and
+    # optional_more_metadata() still reads these.
+    train_config_file: Path | None = None
+    train_config_name: str | None = None
+
     def __init__(
         self,
         checkpoint_path,
@@ -179,6 +193,7 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
         *,
         default_inference_delay: int = 4,
         train_rtc_package: str | Path = PI05_TRAIN_RTC_PACKAGE,
+        train_config_file: str | Path | None = None,
         rtc_warmup: bool = True,
         **kwargs: Any,
     ):
@@ -192,6 +207,8 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
         # Set before super().__init__, which runs warmup(), which needs them.
         self.default_inference_delay = int(default_inference_delay)
         self.train_rtc_package = Path(train_rtc_package)
+        if train_config_file is not None:
+            self.train_config_file = Path(train_config_file).expanduser().resolve()
         self.rtc_warmup = rtc_warmup
 
         super().__init__(checkpoint_path, config_name, **kwargs)
@@ -212,6 +229,7 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
         ``Pi05Wrapper._load_policy`` resolves the config through OpenPI's
         registry, which cannot produce this model class -- hence the override.
         """
+        _reject_domain_checkpoint(self.checkpoint_path)
         try:
             from openpi.policies import policy_config as openpi_policy_config
         except ImportError as exc:
@@ -220,7 +238,7 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
                 "an environment where `import openpi` works."
             ) from exc
 
-        make_train_config = self._import_train_rtc()
+        make_train_config = self._import_train_config()
 
         if not self.checkpoint_path.is_dir():
             raise FileNotFoundError(
@@ -235,6 +253,7 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
                 )
 
         train_config = make_train_config("serve")
+        self.train_config_name = train_config.name
 
         sample_kwargs: dict[str, Any] | None = None
         if self.num_denoising_steps is not None:
@@ -258,6 +277,35 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
             len(policy._model.delay_probs) - 1,
         )
         return policy
+
+    def _import_train_config(self):
+        """``make_train_config`` from :attr:`train_config_file`, else the package's own."""
+        make_train_config = self._import_train_rtc()
+        if self.train_config_file is None:
+            return make_train_config
+
+        if not self.train_config_file.is_file():
+            raise FileNotFoundError(f"train_config_file does not exist: {self.train_config_file}")
+        # Dataclasses and postponed annotations need the executing module in
+        # sys.modules. Distinct run configs must not overwrite one another.
+        name = "_ruri_train_config_" + hashlib.sha256(str(self.train_config_file).encode()).hexdigest()[:16]
+        spec = importlib.util.spec_from_file_location(name, self.train_config_file)
+        module = importlib.util.module_from_spec(spec)
+        previous = sys.modules.get(name)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+            raise
+        if not callable(getattr(module, "make_train_config", None)):
+            raise AttributeError(
+                f"{self.train_config_file} defines no make_train_config(exp_name)."
+            )
+        return module.make_train_config
 
     def _import_train_rtc(self):
         """Import ``pi05_train_rtc``, adding its directory to sys.path if needed."""
@@ -555,6 +603,10 @@ class Pi05TrainRTCWrapper(Pi05Wrapper):
                 "paper": "arXiv 2512.05964",
                 "trained_delay_support": f"0-{self.max_inference_delay}",
                 "default_inference_delay": self.default_inference_delay,
+                "train_config_name": self.train_config_name,
+                "train_config_file": (
+                    None if self.train_config_file is None else str(self.train_config_file)
+                ),
             }
         )
         return metadata
