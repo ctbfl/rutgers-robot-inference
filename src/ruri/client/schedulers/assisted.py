@@ -12,6 +12,7 @@ import logging
 import queue
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 
@@ -46,6 +47,7 @@ class InferenceToken:
     consumed_steps: int
     estimated_delay_steps: int
     rtc_requested: bool
+    scheduler_instance_id: str = ""
 
 
 class AssistedScheduler:
@@ -63,6 +65,8 @@ class AssistedScheduler:
         rtc_initial_delay_steps=None,
         max_observation_age_s=1.0,
         rtc_during_policy=False,
+        request_adapter=None,
+        request_interval_steps=None,
     ):
         if not policy_version or not prompt:
             raise ValueError("policy_version and prompt are required")
@@ -74,6 +78,10 @@ class AssistedScheduler:
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         self.controller, self.policy = controller, policy
+        # Optional data/protocol adapter. Default execution and RTC behavior
+        # remain unchanged; adapters cannot replace the action timeline.
+        self.request_adapter = request_adapter
+        self.scheduler_instance_id = uuid.uuid4().hex
         self.policy_version, self.prompt = policy_version, prompt
         self.control_hz, self.timeout = control_hz, inference_timeout_s
         self.max_observation_age_s = max_observation_age_s
@@ -83,6 +91,14 @@ class AssistedScheduler:
         self._rtc_segment = None
         self._reference_revision = None
         self.horizon = int(policy.output_chunk_size)
+        if request_interval_steps is not None and (
+                type(request_interval_steps) is not int or
+                not 1 <= request_interval_steps < self.horizon):
+            raise ValueError("request_interval_steps must be null or an integer below the chunk horizon")
+        self.request_interval_steps = request_interval_steps
+        self._sample_step = 0
+        self._request_grid = None
+        self._last_request_sample_step = None
         self.execute = (
             min(5, self.horizon)
             if execution_horizon is None
@@ -200,9 +216,10 @@ class AssistedScheduler:
             self._invalidate()
             self._want_policy = True
 
-    def replace_policy(self, policy, version, *, prompt=None):
+    def replace_policy(self, policy, version, *, prompt=None, allow_human=False):
         with self._lock:
-            if self._want_policy or self.controller.status()["mode"] != "HOLD":
+            allowed = ("HOLD", "HUMAN") if allow_human else ("HOLD",)
+            if self._want_policy or self.controller.status()["mode"] not in allowed:
                 raise RuntimeError("pause before replacing policy")
             horizon = int(policy.output_chunk_size)
             if horizon != self.horizon:
@@ -233,7 +250,15 @@ class AssistedScheduler:
     def _request(self, sample, state):
         if self._pending is not None:
             return
-        if (
+        grid = (self._generation, state["epoch"], state["reference_revision"])
+        if self.request_interval_steps is not None:
+            # Anchor to collection ticks, not chunk consumption or completion
+            # time. A late response skips a grid point; it never shifts phase.
+            if self._request_grid is not None and self._request_grid[:3] == grid:
+                if ((self._sample_step - self._request_grid[3]) % self.request_interval_steps
+                        or self._last_request_sample_step == self._sample_step):
+                    return
+        elif (
             self._timeline.pending_count()
             and self._timeline.current_chunk_consumed_steps() < self.execute
         ):
@@ -259,6 +284,7 @@ class AssistedScheduler:
             consumed,
             delay,
             tail is not None,
+            self.scheduler_instance_id,
         )
         inputs = RTCScheduler._policy_inputs(
             observation=sample["observation"],
@@ -267,15 +293,21 @@ class AssistedScheduler:
             previous_tail=tail,
             consumed_steps=consumed,
         )
-        self._requests.put_nowait(
-            (token, self.policy, inputs, self.horizon, self._timeline)
-        )
+        policy = self.policy
+        if self.request_adapter is not None:
+            policy, inputs = self.request_adapter.prepare(token, policy, inputs)
+        self._requests.put_nowait((token, policy, inputs, self.horizon, self._timeline))
         self._pending = token
+        if self.request_interval_steps is not None:
+            if self._request_grid is None or self._request_grid[:3] != grid:
+                self._request_grid = (*grid, self._sample_step)
+            self._last_request_sample_step = self._sample_step
 
     def step(self, sample):
         with self._lock:
             if self._closed.is_set():
                 raise RuntimeError("scheduler is closed")
+            self._sample_step += 1
             self.last_step = {
                 "waiting": False,
                 "policy_version": self.policy_version,
