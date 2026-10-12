@@ -12,7 +12,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from ruri.client.controllers.single_piper.mit.gravity import PiperGravity, rpy_to_R, axis_angle_to_R
-from ruri.client.controllers.single_piper.normalization import normalize_pose
+from ruri.client.controllers.single_piper.normalization import GRIPPER_NOMINAL_MAX_M, normalize_pose
 from ruri.client.controllers.single_piper.calibration_ranges import NOMINAL
 from ruri.client.controllers.single_piper_assisted.control import physical_bounds
 from ruri.client.controllers.single_piper_assisted.config import SinglePiperAssistedConfig
@@ -144,8 +144,10 @@ class CirclePolicy(PolicyWrapper):
         # Measured states may overshoot nominal bounds; action validation must
         # not truncate or reject real encoder observations near home.
         low, high = physical_bounds(NOMINAL)
+        gripper_max = self.kin.config.gripper_max_m or GRIPPER_NOMINAL_MAX_M
+        high[6] = gripper_max
         measured = low+(np.r_[(state[:6]+100.)/200., state[6]/100.])*(high-low)
-        q, width = measured[:6], float(np.clip(measured[6], 0., .08))
+        q, width = measured[:6], float(np.clip(measured[6], 0., gripper_max))
         elapsed = self.clock()-self.started
         goal, _ = self.goal(elapsed)
         current = self.kin.fk(q)[0]
@@ -175,7 +177,7 @@ class CirclePolicy(PolicyWrapper):
                      "observed_tcp": current.tolist(), "proposed_tcp": next_xyz.tolist(),
                      "ik_status": status, "ik_step_scale": scale,
                      "ik_error_mm": error_mm, "ik_failure": failure}
-        return {"action_chunk": normalize_pose(next_q, width)[None, :], "circle": self.last}
+        return {"action_chunk": normalize_pose(next_q, width*GRIPPER_NOMINAL_MAX_M/gripper_max)[None, :], "circle": self.last}
 
     def validate_path(self, samples=120, *, policy_speed=DEFAULT_POLICY_SPEED):
         """Check approach, entire loop, closure and gravity ceilings offline."""

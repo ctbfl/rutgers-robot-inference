@@ -85,12 +85,15 @@ resume do not wait for measured arm or gripper agreement. Use
 `--no-startup-home` to start from nominal-clamped current poses instead. Every
 MIT position command passes through the nominal clamp and then that arm's
 measured hardware clamp; measured feedback is preserved. The same virtual
-reference drives both arms through the validated 100 Hz MIT worker. A 50 ms
-filtered joint deflection above 5 degrees for 0.1 seconds starts the 0.5-second
-right-arm impedance fade. Once the right arm reaches pure gravity control, the
+reference drives both arms through the validated 100 Hz MIT worker. The right
+gripper opens fully during policy tracking. Close it by **1 cm** to request
+takeover: the left gripper holds its measured opening, the right actively matches
+it, then the right arm enters pure gravity directly. Joint deflection does not
+trigger takeover. Once the right arm reaches pure gravity control, the
 left blends to its live readings over 0.5 seconds. Quiet right-arm motion for
 0.5 seconds starts recovery once the follower reference catches up; impedance
-returns over 0.5 seconds. Inference continues throughout intervention.
+returns over 0.5 seconds. The right gripper reopens fully and re-arms for the next
+gesture; its automatic opening does not move the left gripper. Inference continues throughout intervention.
 During autonomous policy tracking the original RTC prefix and latency alignment
 remain active. Intervention discards old chunks and in-flight results; recovery
 uses fresh observations without a stale prefix, then starts a fresh RTC segment.
@@ -127,6 +130,9 @@ Press `q` to pause, then enter another task, `home`, or `switch PORT`.
 Esc / Ctrl-C requests HOLD and exits.
 It uses the accepted circle controller with the remote policy in place of the
 circle policy: right human intervention and left handover stay local. The server
+gripper convention stays 0–100, mapped locally to the validated 0–100 mm range
+(action 10 commands 10 mm). The right gripper opens to 100 mm, triggers at
+90 mm, and aligns to the left at 20 cm/s before gravity takeover. The server
 still receives the left arm's 7D state, top/wrist images and the ordinary optional
 RTC context, and returns `(H, 7)` actions. There are no intervention/dataset/video
 or effort files. `--simulate` uses the same server connection with simulated
@@ -165,15 +171,20 @@ python examples/client_dual_piper_shared_circle.py --execute  # enable and home 
 ```
 
 One circle policy feeds both arms the same joint reference during policy tracking
-and right-arm stiffness unloading. Once the right arm reaches pure gravity mode,
+and gripper alignment. All Piper controllers now use a 0–100 mm nominal gripper
+range and 0–100 mm per-arm clamps, with normalized gripper values 0–100.
+This trial uses a 100 mm right
+open target (0.2 N while opening, then a weak spring capped at 0.05 N), and a fixed **90 mm** takeover threshold.
+Close the right gripper to 90 mm or below to request takeover, at any speed;
+after matching the left gripper, the right arm enters pure gravity directly. Then
 the left arm blends from its last sent reference to the **live** right joint readings
 over 0.5 seconds, using a quintic curve and its own reference velocity. The left arm
 keeps the original single-Piper tracking gains (Kp=10, Kd=0.8) and calibrated
 gravity feed-forward, including startup and home. On release, the shared
 reference resumes from the last left command once the handover has caught up; right
 impedance returns over 0.5 seconds. Rate limiting can extend catch-up time.
-This example selects `gravity_handoff=True`; the earlier assisted entry retains its
-original controller. Logs: `logs/dual_shared_circle_*.jsonl`. Both circles use each
+This example selects `gravity_handoff=True, human_trigger="gripper"`; the right-only
+circle retains joint-deflection entry. Logs: `logs/dual_shared_circle_*.jsonl`. Both circles use each
 arm's local base coordinates. The left arm remains a position tracker throughout;
 only the right arm enters zero-stiffness gravity dragging.
 If a previous failure left a latched electronic stop, `--execute --reset-stop`

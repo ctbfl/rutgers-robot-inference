@@ -23,6 +23,7 @@ from piper_circle_policy import (
     DEFAULT_POLICY_SPEED,
 )
 from ruri.client.controllers.single_piper_assisted import SinglePiperAssistedController
+from ruri.client.controllers.single_piper.normalization import GRIPPER_NOMINAL_MAX_M
 from ruri.client.controllers.single_piper_assisted.config import SinglePiperAssistedConfig
 from ruri.client.schedulers.assisted import AssistedScheduler
 
@@ -64,7 +65,9 @@ def parse_args(argv=None, *, dual=False):
                         help="explicitly reset latched electronic stops once before enable/home")
     parser.add_argument("--configure-can", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log", type=Path, default=None)
-    parser.add_argument("--simulate-intervention", action="store_true", help="simulation only: constrain J1 +0.2 rad for 2s")
+    parser.add_argument("--simulate-intervention", action="store_true", help=(
+        "simulation only: close right gripper by 1.2cm" if dual else
+        "simulation only: constrain J1 +0.2 rad for 2s"))
     args = parser.parse_args(argv)
     if not np.isfinite(args.seconds) or args.seconds < 0:
         parser.error("seconds must be finite and nonnegative")
@@ -85,6 +88,8 @@ def main(argv=None, *, dual=False):
     args = parse_args(argv, dual=dual)
     config = SinglePiperAssistedConfig(
         leader_only=not dual, gravity_handoff=dual, camera_enabled=False, simulate=args.simulate,
+        human_trigger="gripper" if dual else "joint",
+        gripper_max_m=.1 if dual else None,
         reset_latched_stop=args.reset_stop,
         startup_home=True, start_home_speed=.15, reference_speed=args.reference_speed,
         policy_reference_speed=args.policy_speed, max_reference_speed=args.reference_speed,
@@ -116,7 +121,8 @@ def main(argv=None, *, dual=False):
                                           control_hz=30., execution_horizon=1, rtc_initial_delay_steps=0)
             scheduler.resume()
             arms = "both arms; right leader / left follower" if dual else "right leader"
-            print(f"RUNNING: {arms}; drag right to take over, stay still for 0.5s to resume. Ctrl-C holds. Log: {log_path}", flush=True)
+            gesture = "close right gripper by 1cm" if dual else "drag right"
+            print(f"RUNNING: {arms}; {gesture} to take over, stay still for 0.5s to resume. Ctrl-C holds. Log: {log_path}", flush=True)
             began = next_tick = next_print = time.monotonic()
             injected = False
             while not args.seconds or time.monotonic()-began < args.seconds:
@@ -125,7 +131,9 @@ def main(argv=None, *, dual=False):
                     from ruri.client.controllers.single_piper.normalization import normalize_pose
                     measured = sample["telemetry"]["leader"]
                     q = np.array(measured["q"]); q[0] += .2
-                    robot.simulate_leader(normalize_pose(q, measured["gripper_width"]), duration_s=2.)
+                    width = measured["gripper_width"]-(.012 if dual else 0.)
+                    width *= GRIPPER_NOMINAL_MAX_M/(config.gripper_max_m or GRIPPER_NOMINAL_MAX_M)
+                    robot.simulate_leader(normalize_pose(q, width), duration_s=.05 if dual else 2.)
                     injected = True
                 step = scheduler.step(sample)
                 row = {"kind": "sample", "telemetry": sample["telemetry"], "trace": sample["trace"],
@@ -135,7 +143,11 @@ def main(argv=None, *, dual=False):
                 if c["mode"] == "HOLD" and not c["armed"] and time.monotonic()-began > 1.:
                     raise RuntimeError(f"worker entered HOLD: {c['reason']}")
                 if time.monotonic() >= next_print:
-                    follower_status = (f"left_blend={c['follower_handoff_progress']:.2f}  "
+                    follower_status = (f"grip={c['gripper_handoff_phase']} "
+                                       f"width={sample['telemetry']['leader']['gripper_width']*1000:.1f}mm "
+                                       f"trigger={c['gripper_trigger_width_m']*1000:.1f}mm "
+                                       f"goal={c['leader_gripper_target_m']*1000:.1f}mm "
+                                       f"left_blend={c['follower_handoff_progress']:.2f}  "
                                        f"limited={c['follower_handoff_limited']}  " if dual else "")
                     print(f"t={time.monotonic()-began:5.1f}s  authority={c['authority_phase']}  "
                           f"alpha={c['human_weight']:.2f}  confirm={c['intervention_confirm_s']:.2f}s  "

@@ -9,12 +9,38 @@
 右臂交接机制并增加左臂插值。左臂复用原 single Piper 的固定 MIT 增益和重力前馈。
 未开启重力交接选项的双臂 assisted 继续使用 `SharedReference`。
 
+当前双臂圆圈及远程 RTC 默认 `human_trigger="gripper"`：右夹爪全开待命，向内移动
+1 cm 触发，先主动对齐左夹爪开度，再直接进入右臂纯重力。退出恢复跟随时右夹爪
+重新全开。关节偏移不会触发。完整时序见[夹爪触发接管](piper-assisted-rtc.md#夹爪触发接管)。
+关节触发版本存档于 `6bec532`；单右臂圆圈保留 `human_trigger="joint"`。
+
+双臂圆圈及双臂远程 RTC 入口显式使用 `gripper_max_m=0.100`：夹爪目标范围 0–100 mm，右夹爪全开
+目标 100 mm，**固定触发阈值为实测开度 ≤90 mm**，不看速度、不累计位移。
+该配置贯穿本地归一化、控制器、双臂同步范围与 SDK 发送；不再被旧 80 mm nominal
+或旧夹爪实测范围截断。全局 nominal 与两臂夹爪 clamp 现已统一为 0–100 mm，
+关节范围保持原值；远程 policy 的夹爪 0–100 在本地对应 0–100 mm，
+通信格式与 RTC chunk 数值保持不变。
+
+右夹爪张开阶段使用实测有效的 0.2 N；到位后才使用弱回弹：
+`F=min(0.05, max(0.005, 5*abs(open-q))) N`。退出后同样先用 0.2 N 回开。
+启动和退出后的自动张开阶段等待实测 ≥98 mm 稳定 50 ms，
+随后固定 90 mm 阈值持续有效；这不是按每一周期位移判断。
+触发后的右夹爪对齐使用独立 `gripper_alignment_speed=0.2 m/s`，而 policy 夹爪
+命令仍用 `gripper_reference_speed=0.04 m/s`。验收日志中原对齐耗时 1.3/1.3/2.1 秒，
+对应 42.8/43.3/12.4 mm 的左夹爪开度；新速度下命令移动加 50 ms 到位确认约
+0.3–0.5 秒。实测右夹爪仍须进入 2 mm 容差，命令到位不能替代反馈确认。
+2026-09-21 实机查询已确认两臂固件夹爪行程配置为 100 mm 档位；没有改零点或示教比例。
+同日真机力度试验：42.7 mm 起始，0.05 N / 0.1 N 各 2.5 秒均未移动；0.2 N 在
+约 0.77 秒达到 99.6 mm。随后从 40.2 mm 回开三次，均到达 99.4–99.6 mm，
+用时 0.74–0.76 秒（含到位稳定 0.2 秒）。记录：`logs/right_gripper_force_trial_20260921_145427.jsonl`。
+
 ## 代码边界
 
 - `single_piper_assisted/gravity_handoff.py`：纯数值的进入确认、权重过渡、静止窗口和 reference 状态。
   复用 `SharedReference` 的状态/状态报告接口，不调用它的导纳更新逻辑。
 - `single_piper_assisted/control.py`：在 MIT 周期调用数值控制器，管理会话、watchdog、action 新鲜度与 revision。
 - `single_piper_assisted/follower_handoff.py`：左臂从共享目标接到实时右臂读数的插值与限速。
+- `single_piper_assisted/gripper_handoff.py`：全开准备、1 cm 手势、夹爪对齐和重新准备。
 - `single_piper/mit/assisted.py`：`LeaderRig` 打开一个右臂 driver，使用 V189 握手、右臂重力标定及 MIT 发送。
 - `schedulers/assisted.py`：异步推理与旧 chunk 丢弃，不计算 alpha 或电机力矩。
 - `examples/piper_circle_policy.py`：使用最新实测关节状态的普通 policy。SciPy FK/IK 只属于示例。
@@ -41,7 +67,7 @@ SDK 中的 p_des 字段仍存在，但零刚度时不产生位置恢复力。此
 `reference_active=false`；shadow reference 的变化不是位置伺服命令，`reference_qd=0`。
 反馈速度上限仍然有效。SDK 与 calibration 继续使用 legacy 扭矩单位，不是独立力传感器测量。
 
-## 进入和退出
+## 关节偏移入口的进入和退出（单右臂圆圈）
 
 默认控制周期 100 Hz。权重过渡使用 `smoothstep(u)=3u²-2u³`，首尾变化率为零。
 
@@ -79,8 +105,8 @@ HOLD、home 和故障处理仍沿用已有生命周期，不被自动交接覆�
 
 | 阶段 | 右臂 leader | 左臂 follower |
 | --- | --- | --- |
-| policy / 进入确认 | 跟踪共同 r | 跟踪共同 r |
-| blend：0.5 s 卸载 | r 速度平滑刹停，阻抗随 alpha 下降 | 同一 r 与速度，保留固定阻抗 |
+| policy / 夹爪待命 | 跟踪共同 r，右夹爪全开 | 跟踪共同 r，夹爪由 policy 控制 |
+| gripper_align | 共同 r 速度在 0.1 s 内刹停，保持阻抗；右夹爪主动对齐 | 同一 r 与速度；夹爪固定触发时开度 |
 | human 前 0.5 s | 原 teleop 的纯重力补偿与阻尼 | 从最后已发送的共同 r 插值到实时 qL |
 | human 后续 | 纯重力补偿与阻尼 | 每周期跟随实时 qL，受关节范围及 4 rad/s 限制 |
 | recover：0.5 s | 阻抗平滑恢复，跟随共同 r | 固定阻抗，跟随共同 r |
@@ -97,18 +123,21 @@ tauF = gravityF(qF) + KpF*(rF-qF) + KdF*(vF-qdF)
 此前直接把左臂 t_ff 清零会让位置误差承担重力支撑，已撤销这个偏离原控制器的改动。
 两臂收到相同目标不代表实测关节位置完全一致，仍存在正常跟踪误差。
 
-记进入 human 的时刻为 t0，**上一周期发给左臂的目标**为 r0。第一帧仍发送 r0。
+记进入 human 的时刻为 t0，**上一周期发给左臂的目标和速度**为 r0、v0。第一帧保持这两个命令。
 接下来令 `u=clip((t-t0)/0.5, 0, 1)`，采用五次平滑函数：
 
 ```text
 s(u) = 10u^3 - 15u^4 + 6u^5
-rF_des(t) = (1-s(u))*r0 + s(u)*clip(qL(t), common_bounds)
+h(u) = u - 6u^3 + 8u^4 - 3u^5
+rF_des(t) = clip((1-s(u))*r0 + s(u)*clip(qL(t), common_bounds)
+                + 0.5*h(u)*v0, common_bounds)
 rF(k+1) = rF(k) + clip(rF_des-rF(k), -vmax*dt, vmax*dt)
 vF(k+1) = (rF(k+1)-rF(k))/dt
 ```
 
-插值终点每周期更新，不冻结 t0 时的右臂读数。五次函数首尾一阶、二阶导数为零；
-配合此前共享 r 的刹停，平滑进入跟随。左臂 MIT 同时收到实际插值位置与对应速度，
+插值终点每周期更新，不冻结 t0 时的右臂读数。五次权重函数首尾一阶、二阶导数为零；
+额外 Hermite 项承接 v0，即使夹爪很快对齐、reference 尚未完全刹停，也保留进入速度。
+v0=0 时退化为原插值。左臂 MIT 同时收到实际插值位置与对应速度，
 不会错误地使用右臂纯重力阶段的零 reference velocity。
 0.5 秒是插值时长，不是实测左臂必须精确到位的保证。若限速生效，继续有界追赶，
 不跳目标也不因 gap 本身 abort；到达时间相应延长。日志 `follower_handoff_limited` 会标记限速。
@@ -120,8 +149,8 @@ vF(k+1) = (rF(k+1)-rF(k))/dt
 右臂在 0.5 秒内恢复阻抗。若左臂尚在限速追赶，右臂继续纯重力，等待跟上后再恢复。
 判据针对命令的连续性，不要求左右实测 q 完全一致；MIT 的正常跟踪误差可以存在。
 
-恢复中再次介入仍使用 5° / 0.1 秒确认；下一次左臂插值重新从当时已发送目标开始。
-圆周虚拟点和 policy 推理在所有阶段持续运行。夹爪沿用原双臂同步与力反馈通道，不参与六关节插值。
+恢复跟随后右夹爪重新全开准备，下一次闭合 1 cm 才再次接管；左臂插值重新从当时已发送目标开始。
+圆周虚拟点和 policy 推理在所有阶段持续运行。夹爪对齐完成后沿用原同步与力反馈通道，不参与六关节插值。
 
 ```bash
 # 默认只检查双方关节范围、IK 路径及双方重力标定。
@@ -144,17 +173,18 @@ PYTHONPATH=src:vendor/pyAgxArm python examples/client_dual_piper_shared_circle.p
 human 时 `reference_q` 是右臂 shadow pose，左臂命令必须查看 `follower_reference_q`。
 `reference_active=false` 在此仅表示右臂位置弹簧卸载，左臂仍在执行跟随。
 终端 `left_blend` 显示插值进度，`limited` 显示是否触发 reference 限速。
+`width / trigger / goal` 分别显示右夹爪实测值、固定触发阈值和实际目标，单位 mm。
 
 ## Policy 与 reference
 
-自动交接不退出外层 POLICY 会话，不停止推理。进入 blend、human、recover 时 revision 改变，
+自动交接不退出外层 POLICY 会话，不停止推理。进入 gripper_align（关节入口为 blend）、human、recover 时 revision 改变，
 旧 chunk 和在途结果失效。人工阶段的 policy proposal 不执行；恢复阶段重新从最新实测位置推理。
 policy observation 最长有效期默认 1 秒，keepalive 不会刷新旧 action 的有效期。
 
 圆圈入口使用 `ruri_gravity_handoff_v1`，保持不带 RTC prefix 的单步重规划。
 新的远程入口在正常 policy 阶段使用原 RTC chunk 衔接，在介入及恢复阶段清空 prefix，
 见 [远程 RTC 接入说明](piper-assisted-rtc.md)。双臂旧 `ruri_shared_reference_v1` 路径保持原调度方式。
-夹爪是独立的位置/力通道；本轮不是夹爪力反馈验收。
+夹爪仍是独立的位置/力通道；新入口增加手势识别与对齐握手，保持原 teleop 力反馈。
 
 ## 圆圈与运行
 
@@ -215,5 +245,9 @@ policy 圆周目标、推理结果及 MIT telemetry。`follower.q=null`，`leade
 双臂新增离线检查覆盖：卸载阶段目标一致、实时移动终点、交接首帧无跳变、限速追赶、
 恢复与再次介入、左右独立速度发送、左臂固定阻抗与重力前馈（含启用、home、HOLD），
 与右臂纯重力端点。另用相同 reference 和反馈逐字段比较左臂 MIT 命令与原 single Piper 发送器。
-完整双臂脚本仿真已走通 policy → blend → human → recover → policy。
-仿真 rig 是简化运动模型，不验证真实接触动力学或拖动手感；新增双臂交接尚待真机验收。
+夹爪入口另覆盖 1 cm 触发、噪声拒绝、实测对齐、固定左夹爪、直接纯重力、退出重新全开、
+再次接管与暂停取消。远程 RTC 仿真已走通 policy → gripper_align → human → recover → policy，
+并检查在接管期间不使用旧 RTC prefix。SDK mock 检查夹爪命令、力反馈与两臂增益。
+仿真 rig 是简化运动模型，不验证真实接触动力学或拖动手感。
+2026-09-21 双臂圆圈的夹爪接管、退出重新全开及 20 cm/s 对齐已通过用户真机验收；
+远程 RTC 共用该控制实现，实际模型任务效果仍以推理真机测试为准。

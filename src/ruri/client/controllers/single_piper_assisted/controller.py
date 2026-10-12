@@ -20,6 +20,7 @@ from ruri.client.controllers.single_piper.mit_process import ManagedMITProcess
 from ruri.client.controllers.single_piper.normalization import (
     ACTION_LOWER,
     ACTION_UPPER,
+    GRIPPER_NOMINAL_MAX_M,
     denormalize_action,
     normalize_pose,
     normalize_teleop_target,
@@ -108,6 +109,11 @@ class SinglePiperAssistedController(RobotSetupController):
     def is_connected(self):
         return self._connected
 
+    def _normalize_gripper(self, action):
+        action = action.copy()
+        action[6] *= GRIPPER_NOMINAL_MAX_M/(self.config.gripper_max_m or GRIPPER_NOMINAL_MAX_M)
+        return action
+
     @property
     def action_bounds(self):
         if self._io is not None:
@@ -116,7 +122,8 @@ class SinglePiperAssistedController(RobotSetupController):
                 state["action_upper"], dtype=np.float32
             )
         low, high = synchronized_bounds(self.config)
-        return normalize_pose(low[:6], low[6]), normalize_pose(high[:6], high[6])
+        return (self._normalize_gripper(normalize_pose(low[:6], low[6])),
+                self._normalize_gripper(normalize_pose(high[:6], high[6])))
 
     def connect(self):
         if self.is_connected:
@@ -186,7 +193,7 @@ class SinglePiperAssistedController(RobotSetupController):
             **packet["control"],
             "connected": self.is_connected,
             "phase": packet["phase"],
-            "target": normalize_teleop_target(packet),
+            "target": self._normalize_gripper(normalize_teleop_target(packet)),
             "monotonic_ns": packet["monotonic_ns"],
             "sequence": packet["sequence"],
         }
@@ -208,6 +215,7 @@ class SinglePiperAssistedController(RobotSetupController):
         if values.shape != (7,) or not np.all(np.isfinite(values)):
             raise ValueError("action must contain seven finite values")
         q, grip = denormalize_action(np.clip(values, ACTION_LOWER, ACTION_UPPER))
+        grip *= (self.config.gripper_max_m or GRIPPER_NOMINAL_MAX_M)/GRIPPER_NOMINAL_MAX_M
         if reference_revision is None:
             reference_revision = self.status()["reference_revision"]
         self.last_command_id = self._io.send(
@@ -225,6 +233,7 @@ class SinglePiperAssistedController(RobotSetupController):
         if not self.config.simulate or self._io is None:
             raise RuntimeError("leader injection is available only in simulation")
         q, grip = denormalize_action(normalized_pose)
+        grip *= (self.config.gripper_max_m or GRIPPER_NOMINAL_MAX_M)/GRIPPER_NOMINAL_MAX_M
         self._io.send(
             "simulation_leader", target=np.r_[q, grip].tolist(), duration_s=duration_s
         )
@@ -245,8 +254,16 @@ class SinglePiperAssistedController(RobotSetupController):
                 and np.max(np.abs(qd)) <= 0.05
             )
 
+        def home_packet():
+            packet = self._controlled_packet(self._io.snapshot())
+            scale = GRIPPER_NOMINAL_MAX_M/(self.config.gripper_max_m or GRIPPER_NOMINAL_MAX_M)
+            # Adapt an explicit range override to the generic home generator.
+            return {**packet,
+                    "follower": {**packet["follower"], "gripper_width": packet["follower"]["gripper_width"]*scale},
+                    "action": {**packet["action"], "gripper_width": packet["action"]["gripper_width"]*scale}}
+
         yield from home_actions(
-            lambda: self._controlled_packet(self._io.snapshot()),
+            home_packet,
             control_hz=control_hz,
             speed_rad_s=speed_rad_s,
             extra_settled=leader_settled,
@@ -315,13 +332,14 @@ class SinglePiperAssistedController(RobotSetupController):
                 f"worker phase={packet['phase']}: {packet.get('reason')}"
             )
         observation = {**recording_observation(self._controlled_packet(packet)), **images}
+        observation["observation.state"] = self._normalize_gripper(observation["observation.state"])
         for value in observation.values():
             value.setflags(write=False)
         return {
             "observation_id": f"{self._session}:{self._observation_sequence}",
             "monotonic_ns": time.monotonic_ns(),
             "observation": observation,
-            "action": normalize_teleop_target(packet),
+            "action": self._normalize_gripper(normalize_teleop_target(packet)),
             "telemetry": packet,
             "cameras": camera_times,
             "trace": self._io.drain_trace(),

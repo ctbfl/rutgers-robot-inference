@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-"""Both arms share a circle goal; drag the right arm to lead the left.
+"""Both arms share a circle goal; close the right gripper by 1cm to take over.
+
+The right gripper matches the left before gravity mode, then reopens on release.
 
 --execute enables/homes both registered arms, then runs until Ctrl-C.
 Default: offline audit with both arms' bounds and gravity calibrations.

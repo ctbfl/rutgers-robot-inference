@@ -3,9 +3,12 @@
 
 Enter a task prompt to enable both arms. The right/secondary Piper is the
 leader; left/main is the task follower. Both track the same virtual reference.
-Drag the right arm to enter gravity control; the left blends to its readings
+Close the open right gripper by 1cm to request control. It matches the left
+gripper, then the right arm enters gravity control; the left blends to its readings
 over 0.5s. Background inference continues and RTC restarts from current state
 on release. Remote observation/action formats are unchanged.
+Grippers use the validated 0-100 mm firmware range locally; the policy still
+sends/receives 0-100 (for example, action 10 commands 10 mm).
 
   q             pause both arms; enter another task prompt to resume.
   home          at the paused prompt: paired home at up to 1 rad/s, then hold.
@@ -76,7 +79,8 @@ def parse_args(argv=None, *, interactive=True):
     )
     parser.add_argument("--log-level", default="INFO")
     # The same local controller settings accepted in the dual circle trial.
-    parser.set_defaults(leader_only=False, gravity_handoff=True, rtc_during_policy=True,
+    parser.set_defaults(leader_only=False, gravity_handoff=True, human_trigger="gripper", rtc_during_policy=True,
+                        gripper_max_m=.1,
                         reference_speed=4., max_reference_speed=4., policy_reference_speed=.5,
                         camera_enabled=True, record_effort=False, reset_latched_stop=False)
     return parser.parse_args(argv)

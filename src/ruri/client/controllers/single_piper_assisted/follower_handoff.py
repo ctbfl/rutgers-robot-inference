@@ -1,7 +1,7 @@
 """Transfer the follower from the shared goal to a live leader in joint space.
 
 Only actuator references live here; no inference, SDK access or authority logic.
-The leader unloads to zero reference velocity before this transfer begins.
+The transfer also preserves a moving policy reference at direct takeover.
 """
 
 import numpy as np
@@ -19,6 +19,7 @@ class FollowerHandoff:
         self.r = vector(reference, "follower reference")
         self.velocity = vector(velocity, "follower velocity")
         self.start = self.r.copy()
+        self.start_velocity = self.velocity.copy()
         self.elapsed = 0.
         self.active = False
         self.limited = False
@@ -38,13 +39,19 @@ class FollowerHandoff:
         if not self.active:
             self.active = True
             self.start = self.r.copy()
+            self.start_velocity = self.velocity.copy()
             # First gravity-only tick sends exactly the preceding shared goal.
             self.elapsed = 0.
+            return self.r.copy(), self.velocity.copy()
         else:
             self.elapsed += dt
         u = self.progress
         weight = u*u*u*(10.+u*(-15.+6.*u))
-        desired = (1.-weight)*self.start+weight*goal
+        # Quintic Hermite term: derivative is the old velocity at entry and
+        # zero at the end. The original zero-velocity transfer is unchanged.
+        tangent = self.config.follower_handoff_s*(u-6*u**3+8*u**4-3*u**5)
+        desired = np.clip((1.-weight)*self.start+weight*goal+tangent*self.start_velocity,
+                          self.lower, self.upper)
         delta = desired-self.r
         step = np.clip(delta, -self.config.reference_speed*dt, self.config.reference_speed*dt)
         self.limited = bool(np.any(abs(delta-step) > 1e-12))

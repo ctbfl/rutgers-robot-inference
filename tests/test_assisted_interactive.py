@@ -69,6 +69,7 @@ class AssistedInteractiveTests(unittest.TestCase):
     def controller(self, args):
         robot = SinglePiperAssistedController(
             {
+                **vars(args),
                 "simulate": True,
                 "command_address": udp_address(),
                 "telemetry_address": udp_address(),
@@ -185,6 +186,45 @@ class AssistedInteractiveTests(unittest.TestCase):
         self.assertEqual(candidate.inputs[0]["prompt"], "A0")
         self.assertNotIn("context.rtc.prev_chunk_left_over", candidate.inputs[0])
         self.assertNotIn("context.rtc.estimated_inference_delay_steps", candidate.inputs[1])
+
+    def test_gripper_takeover_reopens_and_resumes_rtc_with_100mm_range(self):
+        from client_single_piper_assisted_rtc_interactive import parse_args
+        self.args = parse_args(['--policy-endpoint', 'localhost:5557', '--simulate',
+                                '--no-startup-home'])
+        policy = HoldingPolicy()
+
+        def operator():
+            wait_until(lambda: len(policy.inputs) >= 2, timeout_s=5)
+            robot = self.instances['robot']
+            for intervention in (1, 2):
+                wait_until(lambda: robot.status()['gripper_handoff_phase'] == 'armed')
+                packet = robot.get_sample()['telemetry']
+                self.assertGreaterEqual(packet['leader']['gripper_width'], .098)
+                self.assertAlmostEqual(robot.status()['gripper_trigger_width_m'], .09)
+                # The task gripper stays at 40 mm while the leader opens to 100.
+                self.assertAlmostEqual(packet['follower']['gripper_width'], .04, places=4)
+                gesture = robot.get_observation()['observation.state'].copy()
+                gesture[6] = 88.
+                robot.simulate_leader(gesture, duration_s=.05)
+                wait_until(lambda: robot.status()['authority_phase'] == 'human')
+                calls = len(policy.inputs)
+                wait_until(lambda: robot.status()['authority_phase'] == 'policy')
+                wait_until(lambda: robot.status()['gripper_handoff_phase'] == 'armed')
+                wait_until(lambda: any('context.rtc.prev_chunk_left_over' in x
+                                       for x in policy.inputs[calls:]))
+                self.assertEqual(robot.status()['intervention_id'], intervention)
+            self.terminal.push('pause')
+            wait_until(lambda: len(self.terminal.prompt_requests) == 2)
+            self.terminal.push('prompt', 'B0')
+            wait_until(lambda: any(x['prompt'] == 'B0' for x in policy.inputs))
+
+        self.run_operator(operator)
+        stats = self.run_demo(policy)
+        self.assertEqual(stats['corrections'], 2)
+        for inputs in policy.inputs:
+            self.assertAlmostEqual(inputs['observation.state'][6], 40., places=3)
+        first_b = next(x for x in policy.inputs if x['prompt'] == 'B0')
+        self.assertNotIn('context.rtc.prev_chunk_left_over', first_b)
 
     def test_exit_before_prompt_does_not_start_arms(self):
         self.terminal = FakeTerminal([TerminalEvent("exit")])

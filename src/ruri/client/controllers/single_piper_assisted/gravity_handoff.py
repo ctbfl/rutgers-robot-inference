@@ -29,6 +29,7 @@ class GravityHandoff(SharedReference):
         self._motion = deque()
         self.motion_range = np.zeros(6)
         self._entry_velocity = np.zeros(6)
+        self._alignment_elapsed = 0.
         self.rebased = False
 
     def hold(self, reference=None):
@@ -63,7 +64,17 @@ class GravityHandoff(SharedReference):
         return (self._time-self._human_since >= c.human_release_delay_s-1e-12
                 and self.quiet_elapsed >= c.human_release_delay_s-1e-12)
 
+    def _enter_human(self, q):
+        self.phase, self.alpha = "human", 1.
+        self.intervening = True
+        self._human_since = self._time
+        self._motion.clear()
+        self._motion.append((self._time, q.copy()))
+        self.filtered_error[:] = 0.
+        self.quiet_elapsed = 0.
+
     def step(self, leader, policy, dt, *, manual=False,
+             gripper_triggered=False, gripper_aligned=False,
              recovery_ready=True, recovery_reference=None):
         if not math.isfinite(dt) or dt < 0:
             raise ValueError("reference dt must be finite and nonnegative")
@@ -80,16 +91,31 @@ class GravityHandoff(SharedReference):
         )
 
         entered = False
+        if gripper_triggered:
+            self.phase, self.intervening = "gripper_align", True
+            self._entry_velocity = self.velocity.copy()
+            self._alignment_elapsed = 0.
+            entered = True
         if self.phase in ("policy", "recover"):
             error = self.interaction/c.leader_policy_kp
             self.filtered_error += -math.expm1(-dt/c.interaction_filter_s)*(error-self.filtered_error)
-            self.trigger_active = bool(np.max(abs(self.filtered_error)) > math.radians(c.human_trigger_angle_deg))
+            self.trigger_active = (c.human_trigger == "joint" and
+                                  bool(np.max(abs(self.filtered_error)) > math.radians(c.human_trigger_angle_deg)))
             self.confirm_elapsed = min(c.human_confirm_s, self.confirm_elapsed+dt) if self.trigger_active else 0.
             if manual or self.confirm_elapsed >= c.human_confirm_s-1e-12:
                 self._begin_takeover()
                 entered = True
 
-        if self.phase == "blend":
+        if self.phase == "gripper_align":
+            # Keep one shared goal while the grippers match. Brake its existing
+            # motion over 0.1s; incoming policy proposals do not move that goal.
+            if not entered:
+                self._alignment_elapsed += dt
+            velocity = (1.-smoothstep(self._alignment_elapsed/.1))*self._entry_velocity
+            if gripper_aligned:
+                # Explicit input: skip the old spring-unloading ramp entirely.
+                self._enter_human(q)
+        elif self.phase == "blend":
             # Confirm once, then finish unloading. The disappearing spring
             # signal during unloading is not evidence that the person released.
             if not entered:
@@ -98,12 +124,7 @@ class GravityHandoff(SharedReference):
             self.alpha = self._rise_start+(1.-self._rise_start)*progress
             velocity = (1.-progress)*self._entry_velocity
             if self.rise_elapsed >= c.human_takeover_s-1e-12:
-                self.phase, self.alpha = "human", 1.
-                self._human_since = self._time
-                self._motion.clear()
-                self._motion.append((self._time, q.copy()))
-                self.filtered_error[:] = 0.
-                self.quiet_elapsed = 0.
+                self._enter_human(q)
         elif self.phase == "human":
             velocity = np.zeros(6)
             if self._observe_stillness(q) and not manual and recovery_ready:
@@ -139,5 +160,5 @@ class GravityHandoff(SharedReference):
             self.velocity = (new_r-self.r)/dt
             self.r = new_r
         self.human_latched = self.alpha == 1.
-        self.alpha_target = 1. if self.phase in ("blend", "human") else 0.
+        self.alpha_target = 1. if self.phase in ("gripper_align", "blend", "human") else 0.
         return self.r.copy(), self.velocity.copy()

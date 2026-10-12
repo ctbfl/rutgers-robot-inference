@@ -107,6 +107,99 @@ class MockPiperRigTestCase(unittest.TestCase):
         )
         return arm
 
+class GripperTakeoverHardwareTests(MockPiperRigTestCase):
+    def make_rig(self):
+        return assisted.PiperRig(SinglePiperAssistedConfig(
+            gravity_handoff=True, human_trigger="gripper", gripper_max_m=.1), "canL", "canF")
+
+    def test_open_align_gravity_force_feedback_and_resume_commands(self):
+        self.rig.read()
+        leader, follower = self.rig.read()
+        control = AssistedControl(self.rig.config, leader, follower, clock=lambda: self.now)
+        control.mode = "POLICY"
+        right_grip = self.arms[0].init_effector.return_value
+        left_grip = self.arms[1].init_effector.return_value
+
+        def tick():
+            self.advance(.01)
+            control.last_heartbeat = control.last_command = self.now
+            control.tick(leader, follower, self.now)
+            self.rig.send(control, .01)
+
+        tick()
+        right_grip.move_gripper_m.assert_called_with(control.gripper_handoff.open_width,
+                                                   self.rig.config.gripper_open_force)
+        leader[6] = control.gripper_handoff.open_width
+        for _ in range(5):
+            tick()
+        right_grip.move_gripper_m.assert_called_with(.1, .05)
+        left_grip.move_gripper_m.assert_called_with(.04, self.rig.config.grip_force)
+        leader[6] -= .005
+        tick()
+        right_grip.move_gripper_m.assert_called_with(.1, .05)
+        self.assertEqual(control.gripper_handoff.phase, "armed")
+        leader[6] -= .005
+        tick()
+        self.assertEqual(control.reference.phase, "gripper_align")
+        # Alignment has its own active command, not the force-reflection branch.
+        right_grip.move_gripper_m.assert_called_with(leader[6], self.rig.config.grip_force)
+        left_grip.move_gripper_m.assert_called_with(.04, self.rig.config.grip_force)
+        for _ in range(200):
+            leader[6] = control.leader_target[6]
+            tick()
+            if control.reference.phase == "human":
+                break
+        self.assertEqual(control.reference.phase, "human")
+        for call in self.arms[0].move_mit.call_args_list[-6:]:
+            self.assertEqual(call.kwargs["kp"], 0.)
+            self.assertEqual(call.kwargs["kd"], 0.)
+        for call in self.arms[1].move_mit.call_args_list[-6:]:
+            self.assertEqual(call.kwargs["kp"], 10.)
+            self.assertEqual(call.kwargs["kd"], .8)
+        reflected_force = self.rig.config.grip_base + self.rig.config.grip_gain*.2
+        right_grip.move_gripper_m.assert_called_with(.04, reflected_force)
+        for _ in range(130):
+            tick()
+            if control.reference.phase == "policy":
+                break
+        self.assertEqual(control.reference.phase, "policy")
+        right_grip.move_gripper_m.assert_called_with(control.gripper_handoff.open_width,
+                                                   self.rig.config.gripper_open_force)
+        self.assertLess(left_grip.move_gripper_m.call_args.args[0], .05)
+
+    def test_absolute_human_gripper_does_not_reapply_entry_opening_offset(self):
+        self.rig.config = replace(self.rig.config, human_gripper_absolute_teleop=True)
+        leader, follower = self.rig.read()
+        leader[6], follower[6] = .1, .04
+        control = AssistedControl(self.rig.config, leader, follower, clock=lambda: self.now)
+        control._revoke('HUMAN', 'free reset teleop')
+        right_grip = self.arms[0].init_effector.return_value
+        left_grip = self.arms[1].init_effector.return_value
+        self.assertAlmostEqual(control.anchor_leader[6] - control.anchor_target[6], .06)
+        for width in (.1, .06, .025, .08, .04):
+            # Simulate the operator selecting different settled openings.
+            leader[6] = follower[6] = width
+            self.rig.grips = [SimpleNamespace(width=width, force=.2),
+                              SimpleNamespace(width=width, force=.2)]
+            for _ in range(80):
+                self.advance(.01)
+                control.last_heartbeat = control.last_command = self.now
+                control.tick(leader, follower, self.now)
+                self.rig.send(control, .01)
+            self.assertEqual(control.mode, 'HUMAN')
+            self.assertEqual(control.gripper_handoff.phase, 'teleop')
+            right_grip.move_gripper_m.assert_called_with(width, self.rig.config.grip_base + .2 * self.rig.config.grip_gain)
+            left_grip.move_gripper_m.assert_called_with(width, self.rig.config.grip_force)
+        # Returning to policy still arms the normal squeeze-to-intervene gesture.
+        control._revoke('HOLD', 'start next recording')
+        control.mode = 'POLICY'
+        self.advance(.01)
+        control.last_heartbeat = control.last_command = self.now
+        control.tick(leader, follower, self.now)
+        self.rig.send(control, .01)
+        right_grip.move_gripper_m.assert_called_with(.1, self.rig.config.gripper_open_force)
+
+
 class AssistedHardwareTests(MockPiperRigTestCase):
     def test_enable_holds_both_arms_then_policy_and_human_commands(self):
         self.rig.enable()
@@ -318,7 +411,7 @@ class AssistedHardwareTests(MockPiperRigTestCase):
         np.testing.assert_allclose(target, assisted.clamp_pose(target))
         self.assertAlmostEqual(target[1], 0.0)
         self.assertAlmostEqual(target[5], assisted.mit.JOINT_LIMIT_UPPER[5])
-        self.assertAlmostEqual(target[6], 0.08)
+        self.assertAlmostEqual(target[6], 0.1)
 
     def test_startup_home_uses_teleop_trajectory_and_keeps_zero_hold_references(self):
         positions = [self.q.copy(), self.q.copy()]

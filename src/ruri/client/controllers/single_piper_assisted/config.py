@@ -12,6 +12,11 @@ from ruri.client.controllers.single_piper_leader_follower_teleop.config import (
 class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
     leader_only: bool = False
     gravity_handoff: bool = False
+    human_trigger: str = "joint"
+    gripper_trigger_m: float = 0.01
+    gripper_max_m: float | None = None
+    gripper_open_force: float = 0.2
+    human_gripper_absolute_teleop: bool = False
     follower_handoff_s: float = 0.5
     reset_latched_stop: bool = False
     camera_enabled: bool = True
@@ -21,6 +26,7 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
     alignment_speed: float = 0.2
     alignment_tolerance: float = 0.04
     gripper_reference_speed: float = 0.04
+    gripper_alignment_speed: float = 0.2
     heartbeat_timeout_s: float = 0.5
     reference_speed: float = 0.15
     policy_reference_speed: float = 0.15
@@ -78,6 +84,9 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
             ("human_release_s", 0.1, 5.0),
             ("interaction_release", 0.0, 10.0),
             ("gripper_reference_speed", 0.001, 0.1),
+            ("gripper_alignment_speed", 0.01, 0.3),
+            ("gripper_trigger_m", 0.005, 0.04),
+            ("gripper_open_force", 0.001, 0.2),
             ("heartbeat_timeout_s", 0.1, 2.0),
             ("policy_max_age_s", 0.1, 5.0),
         ):
@@ -86,6 +95,14 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
                 raise ValueError(f"{name} must be finite in [{low}, {high}]")
         if self.human_release_delay_s >= self.human_release_s:
             raise ValueError("require release delay < release duration")
+        if self.human_trigger not in ("joint", "gripper"):
+            raise ValueError("human_trigger must be joint or gripper")
+        if self.gripper_max_m is not None and (
+            isinstance(self.gripper_max_m, bool) or self.gripper_max_m not in (.08, .1)
+        ):
+            raise ValueError("gripper_max_m must be None, 0.08 or 0.1")
+        if self.human_trigger == "gripper" and (self.leader_only or not self.gravity_handoff):
+            raise ValueError("gripper takeover requires dual-arm gravity handoff")
         if len(self.human_quiet_range_deg) != 6 or any(
             isinstance(v, bool) or not isinstance(v, (int, float))
             or not math.isfinite(v) or not 0.001 <= v <= 1.

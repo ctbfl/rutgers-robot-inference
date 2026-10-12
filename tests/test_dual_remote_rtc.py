@@ -31,7 +31,7 @@ class DualRemoteRTCTests(unittest.TestCase):
     def test_tcp_policy_intervention_resume_and_no_recording(self):
         ready = queue.Queue()
         stop = threading.Event()
-        wire, phases, errors, robots = [], [], [], []
+        wire, phases, errors, robots, samples = [], [], [], [], []
 
         def server():
             context = zmq.Context()
@@ -54,7 +54,9 @@ class DualRemoteRTCTests(unittest.TestCase):
                     else:
                         wire.append((time.monotonic(), request))
                         time.sleep(.025)  # Old actions continue during the remote request.
-                        send(reply, {'action_chunk': np.tile(request['observation.state'], (10, 1)),
+                        action = request['observation.state'].copy()
+                        action[6] = 10.  # Old 8 mm intent now commands 10 mm locally.
+                        send(reply, {'action_chunk': np.tile(action, (10, 1)),
                                      'rtc.applied': 'context.rtc.prev_chunk_left_over' in request,
                                      'rtc.method': 'inference-time'})
             except Exception as exc:
@@ -75,6 +77,7 @@ class DualRemoteRTCTests(unittest.TestCase):
             original = robot.get_sample
             def sample():
                 result = original()
+                samples.append(result)
                 phases.append((time.monotonic(), result['telemetry']['control']['authority_phase']))
                 return result
             robot.get_sample = sample
@@ -84,14 +87,18 @@ class DualRemoteRTCTests(unittest.TestCase):
         def intervene():
             try:
                 deadline = time.monotonic()+5.
-                while len(wire) < 3:
+                while (len(wire) < 3 or not robots or
+                       robots[0].status().get('gripper_handoff_phase') != 'armed' or
+                       abs(robots[0]._io.snapshot()['follower']['gripper_width']-.01) > .0001):
                     if time.monotonic() > deadline:
                         raise AssertionError('remote inference did not start')
                     time.sleep(.01)
                 robot = robots[0]
                 leader = robot._io.snapshot()['leader']
                 q = np.asarray(leader['q']); q[0] += .25
-                robot.simulate_leader(normalize_pose(q, leader['gripper_width']), duration_s=.8)
+                gesture = normalize_pose(q, 0.)
+                gesture[6] = 88.  # 88 mm, below the fixed 90 mm trigger.
+                robot.simulate_leader(gesture, duration_s=.05)
             except Exception as exc:
                 errors.append(exc)
 
@@ -110,17 +117,29 @@ class DualRemoteRTCTests(unittest.TestCase):
         if errors:
             raise errors[0]
         self.assertFalse(robots[0].is_connected)
+        self.assertEqual(robots[0].config.gripper_max_m, .1)
+        self.assertTrue(any(abs(s['telemetry']['follower']['gripper_width']-.01) < .0001
+                            for s in samples))
+        for sample in samples:
+            packet = sample['telemetry']
+            self.assertAlmostEqual(sample['observation']['observation.state'][6],
+                                   packet['follower']['gripper_width']*1000., places=4)
+            self.assertAlmostEqual(sample['action'][6],
+                                   packet['action']['gripper_width']*1000., places=4)
+        self.assertTrue(any(abs(x['observation.state'][6]-10.) < .01 for _, x in wire))
         self.assertGreater(stats['rtc_results'], 0)
-        self.assertTrue({'policy', 'blend', 'human', 'recover'} <= {p for _, p in phases})
+        self.assertTrue({'policy', 'gripper_align', 'human', 'recover'} <= {p for _, p in phases})
+        self.assertNotIn('blend', {p for _, p in phases})
         self.assertEqual(phases[-1][1], 'policy')
         human_start = next(t for t, p in phases if p == 'human')
+        alignment_start = next(t for t, p in phases if p == 'gripper_align')
         recovery_start = next(t for t, p in phases if p == 'recover')
         resumed = next(t for t, p in phases if t > recovery_start and p == 'policy')
         self.assertTrue(any('context.rtc.prev_chunk_left_over' in x for t, x in wire if t < human_start))
         self.assertTrue(any(human_start < t < recovery_start for t, _ in wire))
         # Exclude boundary scheduling races by a control tick.
         for t, request in wire:
-            if human_start+.04 < t < recovery_start:
+            if alignment_start+.04 < t < recovery_start:
                 self.assertNotIn('context.rtc.prev_chunk_left_over', request)
         self.assertTrue(any('context.rtc.prev_chunk_left_over' in x for t, x in wire if t > resumed))
         allowed = {'type', 'prompt', 'observation.state', 'observation.images.top',
@@ -130,6 +149,8 @@ class DualRemoteRTCTests(unittest.TestCase):
             self.assertLessEqual(set(request), allowed)
             self.assertEqual(request['prompt'], 'A0')
             self.assertEqual(request['observation.state'].shape, (7,))
+            if 'context.rtc.prev_chunk_left_over' in request:
+                np.testing.assert_allclose(request['context.rtc.prev_chunk_left_over'][:, 6], 10.)
             for name in ('top', 'wrist'):
                 self.assertEqual(request[f'observation.images.{name}'].shape, (24, 32, 3))
                 self.assertEqual(request[f'observation.images.{name}'].dtype, np.uint8)

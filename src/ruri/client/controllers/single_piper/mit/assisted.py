@@ -130,16 +130,20 @@ class NominalLimitedArm:
 class LimitedGripper:
     """Nominal then measured limits for every gripper write, including shared homing."""
 
-    def __init__(self, gripper, arm_name):
+    def __init__(self, gripper, arm_name, gripper_max_m=None):
         self._gripper = gripper
         lower, upper = physical_bounds(measured_for_arm(arm_name))
         self._lower, self._upper = lower[6], upper[6]
+        self._nominal_upper = mit.GRIPPER_LIMIT_UPPER
+        if gripper_max_m is not None:
+            self._lower, self._upper = 0., gripper_max_m
+            self._nominal_upper = gripper_max_m
 
     def __getattr__(self, name):
         return getattr(self._gripper, name)
 
     def move_gripper_m(self, width, force):
-        nominal = np.clip(width, mit.GRIPPER_LIMIT_LOWER, mit.GRIPPER_LIMIT_UPPER)
+        nominal = np.clip(width, mit.GRIPPER_LIMIT_LOWER, self._nominal_upper)
         self._gripper.move_gripper_m(
             float(np.clip(nominal, self._lower, self._upper)), force
         )
@@ -180,10 +184,10 @@ class PiperRig:
                 mit.ASSET_ROOT / "calibration_follower.json"
             )
             self.leader_gripper = LimitedGripper(
-                self.leader.init_effector("agx_gripper"), self.leader_name
+                self.leader.init_effector("agx_gripper"), self.leader_name, config.gripper_max_m
             )
             self.follower_gripper = LimitedGripper(
-                self.follower.init_effector("agx_gripper"), self.follower_name
+                self.follower.init_effector("agx_gripper"), self.follower_name, config.gripper_max_m
             )
             time.sleep(0.5)
             self.fresh = [
@@ -299,7 +303,7 @@ class PiperRig:
         # Capture AFTER role setup: the old pre-settle pose can already differ
         # from the arm we are about to support. Reuse these exact references in
         # the first persistent HOLD tick.
-        self.initial_hold = tuple(clamp_pose(value) for value in self.read())
+        self.initial_hold = tuple(clamp_pose(value, self.config.gripper_max_m) for value in self.read())
 
         def read_feedback():
             self.read()
@@ -502,15 +506,18 @@ class PiperRig:
         self._send_gripper(
             self.follower_gripper, self.follower_name, control.target[6], c.grip_force
         )
-        if control.mode == "HUMAN" or control.correcting:
+        gripper_phase = control.gripper_handoff.phase if control.gripper_handoff else None
+        if (control.mode == "HUMAN" or control.correcting) and gripper_phase != "aligning":
             force = min(
                 c.grip_max_force, c.grip_base + c.grip_gain * abs(self.grips[1].force)
             )
-            # Reflect force at the offset-corrected leader coordinate, retaining
-            # the relative gripper anchor instead of reverting to absolute teleop.
+            # Gravity HUMAN follows the absolute leader width. Reflect at the
+            # same coordinate: retaining a 100mm leader / 40mm follower entry
+            # offset would keep pushing the leader 60mm wider on every tick.
+            # Legacy relative teleop keeps its original anchor by default.
             width = (
                 self.grips[1].width
-                if control.correcting
+                if control.correcting or (c.uses_gravity_handoff and c.human_gripper_absolute_teleop)
                 else (
                     control.anchor_leader[6]
                     + self.grips[1].width
@@ -519,11 +526,14 @@ class PiperRig:
             )
             self._send_gripper(self.leader_gripper, self.leader_name, width, force)
         else:
+            force = (control.gripper_handoff.opening_force(self.grips[0].width)
+                     if gripper_phase in ("opening", "armed")
+                     else c.grip_force if gripper_phase == "aligning" else c.grip_base)
             self._send_gripper(
                 self.leader_gripper,
                 self.leader_name,
                 control.leader_target[6],
-                c.grip_base,
+                force,
             )
         self.send_span_ns = time.monotonic_ns() - start_ns
         # Match the single-arm worker: check mode after this tick's MIT writes,
@@ -544,9 +554,11 @@ class PiperRig:
                     ) from exc
             self.last_status = now
 
-    @staticmethod
-    def _send_gripper(gripper, arm_name, width, force):
+    def _send_gripper(self, gripper, arm_name, width, force):
         low, high = physical_bounds(measured_for_arm(arm_name))
+        if self.config.gripper_max_m is not None:
+            gripper.move_gripper_m(float(np.clip(width, 0., self.config.gripper_max_m)), force)
+            return
         nominal = np.clip(width, mit.GRIPPER_LIMIT_LOWER, mit.GRIPPER_LIMIT_UPPER)
         gripper.move_gripper_m(float(np.clip(nominal, low[6], high[6])), force)
 
@@ -608,7 +620,8 @@ class LeaderRig(PiperRig):
             self.leader = NominalLimitedArm(mit.build_arm(leader_can))
             mit.reject_teaching_mode(self.leader, "right leader")
             self.leader_gravity = mit.GravityCompensator(mit.ASSET_ROOT / "calibration_leader.json")
-            self.leader_gripper = LimitedGripper(self.leader.init_effector("agx_gripper"), actual.name)
+            self.leader_gripper = LimitedGripper(self.leader.init_effector("agx_gripper"), actual.name,
+                                                  config.gripper_max_m)
             self.fresh = [[mit.FeedbackWatchdog(config.feedback_timeout_s) for _ in range(8)]]
             self.status_fresh = mit.FeedbackWatchdog(config.feedback_timeout_s)
             self.last_status = 0.0
@@ -624,7 +637,7 @@ class LeaderRig(PiperRig):
         self.startup_phase = "right leader CAN/MIT enable"
         self.leader.set_follower_mode()
         time.sleep(0.3)
-        self.initial_hold = tuple(clamp_pose(v) for v in self.read())
+        self.initial_hold = tuple(clamp_pose(v, self.config.gripper_max_m) for v in self.read())
         hold = AssistedControl(self.config, *self.initial_hold)
         confirmation = mit.MITStartupConfirmation(self.leader)
         deadline = time.monotonic() + 5.0
@@ -691,7 +704,7 @@ class LeaderRig(PiperRig):
             self.send(control, 1.0/c.mit_rate_hz)
             on_progress()
             time.sleep(1.0/c.mit_rate_hz)
-        start = clamp_pose(self.read()[0])
+        start = clamp_pose(self.read()[0], self.config.gripper_max_m)
         duration = mit.recovery_home_duration(start[:6], start[:6], speed)
         print(f"RIGHT LEADER HOME: {duration:.1f}s, reference <= {speed:.2f} rad/s", flush=True)
         began = time.monotonic()

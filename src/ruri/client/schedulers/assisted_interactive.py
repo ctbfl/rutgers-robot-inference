@@ -81,13 +81,16 @@ class InteractiveAssistedRTC:
                 rtc_during_policy=get_arg(args, "rtc_during_policy", False),
             )
             robot.start()
+            gesture = ("Close the right gripper by 1cm to request control; it matches the left before gravity mode. "
+                       if get_arg(args, "human_trigger", "joint") == "gripper" else "Drag the right arm to correct. ")
             logger.info(
                 "Paired Piper: right/secondary leader, left/main follower; "
-                "shared reference, 100 Hz MIT. Drag the right arm to correct; "
-                "policy inference continues. q pauses. No dataset recording."
+                "shared reference, 100 Hz MIT. %s"
+                "Policy inference continues. q pauses. No dataset recording.", gesture
             )
             scheduler.resume()
             previous_intervention = (False, 0)
+            previous_gripper_phase = None
             next_tick = time.monotonic()
             while True:
                 while (event := terminal.poll_event(0.0)) is not None:
@@ -164,13 +167,20 @@ class InteractiveAssistedRTC:
                     sample["observation"].pop("observation.joint_effort", None)
                 scheduler.step(sample)
                 state = robot.status()
+                gripper_phase = state.get("gripper_handoff_phase")
+                if gripper_phase != previous_gripper_phase:
+                    if gripper_phase == "armed":
+                        logger.info("Right gripper open and ready: close by 1cm to take over")
+                    elif gripper_phase == "teleop":
+                        logger.info("Right arm in gravity mode; gripper synchronization and force feedback active")
+                    previous_gripper_phase = gripper_phase
                 intervention = (state["intervention_active"], state["intervention_id"])
                 if intervention != previous_intervention:
                     if intervention[0]:
                         stats["corrections"] += 1
-                        logger.info(
-                            "Right leader controls the follower; inference continues in background"
-                        )
+                        logger.info("Gripper takeover requested; matching right gripper to left"
+                                    if gripper_phase == "aligning" else
+                                    "Right leader controls the follower; inference continues in background")
                     else:
                         logger.info(
                             "Correction released; continuing policy from current state"

@@ -15,12 +15,13 @@ import numpy as np
 from ruri.client.controllers.single_piper.calibration_ranges import (
     NOMINAL, measured_for_arm,
 )
-from ruri.client.controllers.single_piper.normalization import normalize_pose
+from ruri.client.controllers.single_piper.normalization import GRIPPER_NOMINAL_MAX_M, normalize_pose
 
 from .config import SinglePiperAssistedConfig
 from .reference import SharedReference
 from .gravity_handoff import GravityHandoff
 from .follower_handoff import FollowerHandoff
+from .gripper_handoff import GripperHandoff
 
 PROTOCOL = "ruri_assisted_control_v4"
 
@@ -51,13 +52,18 @@ def synchronized_bounds(config, leader_name="right_arm", follower_name="left_arm
     a, b = (llo-offset)*sign, (lhi-offset)*sign
     low = np.maximum.reduce((low, flo, np.minimum(a, b)))
     high = np.minimum.reduce((high, fhi, np.maximum(a, b)))
+    if config.gripper_max_m is not None:
+        # Optional gripper range override; joint envelopes stay unchanged.
+        low[6], high[6] = 0., config.gripper_max_m
     if np.any(low >= high):
         raise ValueError("leader/follower have no common reference range")
     return low, high
 
 
-def clamp_pose(values):
+def clamp_pose(values, gripper_max_m=None):
     low, high = physical_bounds(NOMINAL)
+    if gripper_max_m is not None:
+        low[6], high[6] = 0., gripper_max_m
     return np.clip(pose(values), low, high)
 
 
@@ -82,8 +88,8 @@ class AssistedControl:
         self.lower, self.upper = synchronized_bounds(config, leader_name, follower_name)
         self.leader = pose(leader)
         self.follower = pose(follower)
-        self.target = clamp_pose(self.follower)
-        self.leader_target = clamp_pose(self.leader)
+        self.target = self.clamp(self.follower)
+        self.leader_target = self.clamp(self.leader)
         self.anchor_leader = self.leader.copy()
         self.anchor_target = self.target.copy()
         self.mode = "HOLD"
@@ -106,6 +112,8 @@ class AssistedControl:
         self.policy_error = np.zeros(7)
         self.coupling_error = np.zeros(7)
         self.source = "hold"
+        self.follower_control_source = "hold"
+        self.follower_gripper_source = "hold"
         reference_type = GravityHandoff if config.uses_gravity_handoff else SharedReference
         self.reference = reference_type(config, self.target[:6], self.lower[:6], self.upper[:6])
         self.target[:6] = self.reference.r
@@ -113,9 +121,22 @@ class AssistedControl:
         self.follower_velocity = np.zeros(6)
         self.follower_handoff = (FollowerHandoff(config, self.target[:6], self.lower[:6], self.upper[:6])
                                  if config.uses_gravity_handoff and not config.leader_only else None)
+        leader_open = min(physical_bounds(NOMINAL)[1][6],
+                          physical_bounds(measured_for_arm(leader_name))[1][6])
+        if config.gripper_max_m is not None:
+            leader_open = config.gripper_max_m
+        self.gripper_handoff = (GripperHandoff(config, leader_open, self.lower[6], self.upper[6])
+                                if config.human_trigger == "gripper" else None)
 
     def mapped(self, follower):
-        return clamp_pose(self.sign * follower + self.offset)
+        return self.clamp(self.sign * follower + self.offset)
+
+    def clamp(self, values):
+        return clamp_pose(values, self.config.gripper_max_m)
+
+    def normalize(self, q, width):
+        scale = GRIPPER_NOMINAL_MAX_M/(self.config.gripper_max_m or GRIPPER_NOMINAL_MAX_M)
+        return normalize_pose(q, width*scale)
 
     @property
     def aligned(self):
@@ -135,15 +156,18 @@ class AssistedControl:
         self.command_id = None
         # Lifecycle HOLD captures leader position; active sharing uses one r.
         if previous_mode == "HUMAN" or mode == "HOLD":
-            self.leader_target = clamp_pose(self.leader)
+            self.leader_target = self.clamp(self.leader)
             if self.config.leader_only:
                 self.target = np.clip(self.leader_target, self.lower, self.upper)
                 self.leader_target = self.target.copy()
         self.correcting = self.policy_valid = False
         self.source = "human" if mode == "HUMAN" else "hold"
+        self.follower_control_source = self.follower_gripper_source = "hold"
         self.policy_reference = self.target.copy()
         self.policy_observation_ns = None
         self.reference.hold(self.target[:6])
+        if self.gripper_handoff is not None:
+            self.gripper_handoff.reset()
         self.reference_velocity[:] = 0
         self.follower_velocity[:] = 0
         if self.follower_handoff is not None:
@@ -221,7 +245,7 @@ class AssistedControl:
                 <= self.config.policy_max_age_s
             ):
                 raise ValueError("policy observation is stale")
-            target = np.clip(clamp_pose(packet.get("target")), self.lower, self.upper)
+            target = np.clip(self.clamp(packet.get("target")), self.lower, self.upper)
             if model_action:
                 self.policy_reference = target
                 self.policy_observation_ns = observation_ns
@@ -277,6 +301,15 @@ class AssistedControl:
             "recovery_ready": handoff.ready(leader[:6]),
             "recovery_reference": self.target[:6].copy(),
         }
+        gripper = self.gripper_handoff
+        aligning_gripper = False
+        if gripper is not None:
+            if self.mode == "HUMAN":
+                gripper.phase = "teleop"
+            else:
+                triggered, aligned = gripper.observe(leader[6], self.follower[6], dt)
+                recovery.update(gripper_triggered=triggered, gripper_aligned=aligned)
+            aligning_gripper = gripper.phase == "aligning"
         reference, self.reference_velocity = self.reference.step(
             leader[:6], candidate, dt, manual=self.mode == "HUMAN", **recovery
         )
@@ -299,20 +332,50 @@ class AssistedControl:
                 if not finishing_handoff:
                     self._rebase_policy()
         # Grippers have a separate position/force channel, outside the torque norm.
-        if self.mode == "HUMAN" or self.correcting:
+        if gripper is not None and aligning_gripper:
+            self.target[6] = gripper.follower_hold
+            self.follower_gripper_source = "hold"
+        elif self.mode == "HUMAN" or self.correcting:
             self.target[6] = np.clip(leader[6], self.lower[6], self.upper[6])
+            self.follower_gripper_source = "human"
         elif self.policy_valid:
             self.target[6] += float(np.clip(
                 self.policy_reference[6]-self.target[6],
                 -c.gripper_reference_speed*dt, c.gripper_reference_speed*dt
             ))
+            self.follower_gripper_source = "policy"
+        else:
+            self.follower_gripper_source = "hold"
         self.leader_target = self.mapped(self.target)
         if handoff is not None and self.reference.phase == "human":
             self.leader_target[:6] = self.mapped(np.r_[reference, self.target[6]])[:6]
+        if gripper is not None:
+            if self.reference.phase == "human":
+                gripper.phase = "teleop"
+            elif previous_phase == "recover" and self.reference.phase == "policy":
+                gripper.reset()
+            if gripper.phase in ("opening", "armed", "aligning"):
+                self.leader_target[6] = gripper.leader_target
         self.source = (
             "human" if self.mode == "HUMAN" or self.reference.human_latched else "shared" if self.correcting
             else "policy" if self.policy_valid else "hold"
         )
+        # Attribute the target sent to the task arm, independently of leader
+        # stiffness. Interpolation towards live leader readings is human-owned;
+        # recovery follows policy targets even while leader alpha is still > 0.
+        if c.uses_gravity_handoff:
+            phase = self.reference.phase
+            if phase == "human":
+                if handoff is None or handoff.progress > 0.:
+                    self.follower_control_source = "human"
+                # At progress zero, follow() preserves the previous command.
+            elif phase == "recover" and previous_phase != "recover":
+                self.follower_control_source = "hold"  # Rebase tick; no new policy motion yet.
+            elif phase not in ("gripper_align", "blend"):
+                self.follower_control_source = "policy" if candidate is not None else "hold"
+            # Braking/alignment retain the origin of the preceding reference.
+        else:
+            self.follower_control_source = self.source
 
     def tick(self, leader, follower, now: float | None = None):
         now = self.clock() if now is None else now
@@ -353,16 +416,24 @@ class AssistedControl:
             "epoch": self.epoch,
             "mode": self.mode,
             "source": self.source,
+            "follower_control_source": (self.follower_control_source
+                if self.mode in ("POLICY", "HUMAN") else "hold"),
+            "follower_gripper_source": (self.follower_gripper_source
+                if self.mode in ("POLICY", "HUMAN") else "hold"),
+            "follower_transition": (self.mode in ("POLICY", "HUMAN") and (
+                self.reference.phase in ("gripper_align", "blend", "recover") or
+                (self.reference.phase == "human" and self.follower_handoff is not None
+                 and self.follower_handoff.progress < 1.))),
             "control_schema": "ruri_gravity_handoff_v1" if self.config.uses_gravity_handoff else "ruri_shared_reference_v1",
             "leader_only": self.config.leader_only,
             "controlled_arm": "right_arm" if self.config.leader_only else "left_arm",
             "follower_present": not self.config.leader_only,
             "follower_gravity_compensation": not self.config.leader_only,
-            "virtual_reference": normalize_pose(
+            "virtual_reference": self.normalize(
                 self.target[:6], self.target[6]
             ).tolist(),
             "reference_revision": self.reference_revision,
-            "policy_reference": normalize_pose(
+            "policy_reference": self.normalize(
                 self.policy_reference[:6], self.policy_reference[6]
             ).tolist(),
             "policy_valid": self.policy_valid,
@@ -370,6 +441,13 @@ class AssistedControl:
             "intervention_active": self.correcting or self.mode == "HUMAN",
             "execution_owner": "shared_reference" if self.mode in ("POLICY", "HUMAN") else "hold",
             "human_weight": self.reference.alpha,
+            "human_trigger": self.config.human_trigger,
+            "gripper_handoff_phase": (self.gripper_handoff.phase
+                if self.gripper_handoff is not None and self.mode in ("POLICY", "HUMAN") else "inactive"),
+            "gripper_closure_m": self.gripper_handoff.closure if self.gripper_handoff else None,
+            "leader_gripper_target_m": float(self.leader_target[6]),
+            "gripper_trigger_width_m": (self.gripper_handoff.open_width-self.config.gripper_trigger_m
+                                         if self.gripper_handoff else None),
             "human_weight_target": self.reference.alpha_target,
             "authority_phase": self.reference.phase,
             "human_exclusive": self.reference.human_latched,
@@ -406,6 +484,6 @@ class AssistedControl:
             "command_id": self.command_id,
             "last_request": self.last_request,
             "rejected": self.rejected,
-            "action_lower": normalize_pose(self.lower[:6], self.lower[6]).tolist(),
-            "action_upper": normalize_pose(self.upper[:6], self.upper[6]).tolist(),
+            "action_lower": self.normalize(self.lower[:6], self.lower[6]).tolist(),
+            "action_upper": self.normalize(self.upper[:6], self.upper[6]).tolist(),
         }
