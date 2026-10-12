@@ -157,14 +157,17 @@ warmed both inference paths, and passed domain-flip / RTC checks. Model weights
 are resident on the GPU; keeping NumPy weights on the host was measured to
 cause repeated transfers and was corrected before deployment.
 
-- Local full suite: 171 passed, 6 optional tests skipped. Final focused suite:
-  16 passed after the device-residency correction.
-- Remote full CPU suite: 170 passed, 7 skipped (optional dependencies).
+- Local merged full suite: 404 passed, 6 optional tests skipped.
+- Remote merged full CPU suite: 403 passed, 7 skipped (optional dependencies).
 - Six sequential requests through the existing RURI client over SSH forwarding:
-  model time median **59.5 ms**, roundtrip median **85.6 ms** with two 480×640
+  model time median **58.4 ms**, roundtrip median **84.6 ms** with two 480×640
   RGB images and ten denoising steps. GPU had other services running.
-- Prefix checks at delays 1, 4 and 7: maximum absolute error **9.54e-6**.
-- Serving process GPU allocation observed at **8096 MiB**.
+- Prefix checks at delays 1, 4 and 7: maximum absolute error **7.63e-6**.
+- Actual 5090 policy with the upstream dual-arm simulated worker: 240 control
+  steps over eight seconds, 53 requests and 37 RTC results. Gripper alignment,
+  human takeover, recovery and resumed RTC all passed without writing recordings.
+- The policy menu description exactly matches the inference endpoint metadata.
+- Serving process GPU allocation after these checks: **8750 MiB**.
 
 These are synthetic functional/latency checks, not an insertion-success test.
 The running server is in remote tmux session `ruri-sim-real`; logs are at
@@ -191,5 +194,13 @@ python tests/smoke_pi05_sim_real_server.py \
 ```
 
 Validation logs and the installed package freeze are retained in
-`/home/hjs/ruri-deps/` (`sim-real-self-test.log`, `cpu-tests.log`,
-`network-smoke-final.json`, `inference-environment.txt`).
+`/home/hjs/ruri-deps/`. The merge validation uses `merged-cpu-tests.log`,
+`merged-self-test.log`, `merged-network-smoke.json`, `merged-dual-client-smoke.json`
+and `merged-inference-environment.txt`. Original source patches, untracked files,
+Git history and the prior server log are retained under
+`backups/integration-20261011/`; the original remote edits also remain in Git stash.
+
+For the full client suite, initialize `vendor/pyAgxArm` and install the `piper`
+extra even on a machine with no arm attached. These tests use fake hardware.
+When testing an isolated worktree with `PYTHONPATH`, use absolute paths: several
+tests change directory before starting simulated worker subprocesses.
