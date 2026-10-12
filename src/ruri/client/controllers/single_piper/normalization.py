@@ -25,7 +25,8 @@ ACTION_UPPER = np.asarray([100.0] * 7, dtype=np.float32)
 # the two files recording what each arm on this rig actually reaches. It is the
 # AgileX manual's figures with joint6 and the gripper corrected: the manual is
 # accurate to 3.4 deg on joint1-joint5, but states joint6 as +/-100 deg when
-# both arms measure +/-172, and the gripper as 70 mm against a measured 82.4 mm.
+# both arms measure +/-172. Firmware S-V1.9-1 uses the configured 0-100 mm
+# gripper range; its normalized opening fraction remains 0-100.
 #
 # Replaces the table inherited from WeGo, which additionally narrowed joint5 to
 # +/-65 and gave joint6 the asymmetric [-100, 130] that matched neither the
@@ -34,6 +35,7 @@ ACTION_UPPER = np.asarray([100.0] * 7, dtype=np.float32)
 CALIBRATION_RANGES = {
     name: tuple(bounds) for name, bounds in calibration_ranges.NOMINAL.ranges.items()
 }
+GRIPPER_NOMINAL_MAX_M = CALIBRATION_RANGES[GRIPPER_NAME][1] / 1_000_000.0
 
 
 def _normalize_raw(name: str, raw_value: float) -> float:

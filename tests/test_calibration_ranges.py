@@ -63,6 +63,27 @@ class CopiesDoNotDriftTests(unittest.TestCase):
 
 
 class NominalIsTheSingleSourceTests(unittest.TestCase):
+    def test_gripper_normalization_uses_the_new_firmware_coordinate(self):
+        from ruri.client.controllers.single_piper.normalization import normalize_pose, denormalize_action
+        for width_mm in (0., 10., 50., 90., 100.):
+            with self.subTest(width_mm=width_mm):
+                action = normalize_pose(np.zeros(6), width_mm / 1000.)
+                self.assertAlmostEqual(action[6], width_mm)
+                self.assertAlmostEqual(denormalize_action(action)[1], width_mm / 1000.)
+        # Measured overshoot remains visible; only commands are clamped.
+        self.assertAlmostEqual(normalize_pose(np.zeros(6), .1048)[6], 104.8, places=4)
+
+    def test_both_hardware_gripper_clamps_allow_full_new_range(self):
+        from unittest.mock import MagicMock
+        from ruri.client.controllers.single_piper.mit.assisted import LimitedGripper
+        for arm in ('left_arm', 'right_arm'):
+            raw = MagicMock()
+            gripper = LimitedGripper(raw, arm)
+            for requested, expected in ((-.01, 0.), (.01, .01), (.09, .09), (.1, .1), (.12, .1)):
+                with self.subTest(arm=arm, requested=requested):
+                    gripper.move_gripper_m(requested, 1.)
+                    raw.move_gripper_m.assert_called_with(expected, 1.)
+
     def test_normalizer_uses_the_nominal_envelope(self):
         self.assertEqual(
             {k: tuple(v) for k, v in CALIBRATION_RANGES.items()},

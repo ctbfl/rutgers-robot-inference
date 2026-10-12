@@ -3,7 +3,7 @@
 Three files live in ``calibration/``. ``piper_range.json`` is the nominal
 envelope: the abstract Piper this project normalizes against and clamps teleop
 targets to. ``left_arm_real.json`` and ``right_arm_real.json`` are what the two
-arms on this rig actually reach, measured with their motors off.
+arms' measured joint travel plus explicitly documented gripper clamp overrides.
 
 The nominal envelope is deliberately not either arm's measurement. It has to
 stay fixed across arms and across datasets, because normalizing two datasets
@@ -81,7 +81,7 @@ MEASURED_BY_ARM = {"left_arm": LEFT_ARM, "right_arm": RIGHT_ARM}
 
 
 def measured_for_arm(name: str) -> PiperRanges:
-    """Return what ``left_arm`` or ``right_arm`` physically reaches."""
+    """Return the per-arm clamp, including documented range overrides."""
     try:
         return MEASURED_BY_ARM[name]
     except KeyError:
