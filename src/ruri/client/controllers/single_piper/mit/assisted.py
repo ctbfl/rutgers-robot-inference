@@ -507,7 +507,7 @@ class PiperRig:
             self.follower_gripper, self.follower_name, control.target[6], c.grip_force
         )
         gripper_phase = control.gripper_handoff.phase if control.gripper_handoff else None
-        if (control.mode == "HUMAN" or control.correcting) and gripper_phase != "aligning":
+        if (control.mode == "HUMAN" or control.correcting) and gripper_phase != "aligning" and not control.teaching:
             force = min(
                 c.grip_max_force, c.grip_base + c.grip_gain * abs(self.grips[1].force)
             )

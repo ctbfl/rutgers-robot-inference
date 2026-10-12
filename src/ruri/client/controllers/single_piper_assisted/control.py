@@ -93,6 +93,14 @@ class AssistedControl:
         self.anchor_leader = self.leader.copy()
         self.anchor_target = self.target.copy()
         self.mode = "HOLD"
+        self.teaching = False
+        self.manual_takeover = False
+        self.teaching_events = []
+        self.teaching_sequence = 0
+        self.teaching_closed_s = 0.
+        self.teaching_minimum = None
+        self.teaching_squeezing = False
+        self.teaching_release_s = 0.
         self.epoch = 0
         self.armed = self.aligning = False
         self.reason = "startup hold"
@@ -150,6 +158,12 @@ class AssistedControl:
 
     def _revoke(self, mode: str, reason: str):
         previous_mode = self.mode
+        self.teaching = False
+        self.manual_takeover = False
+        self.teaching_closed_s = 0.
+        self.teaching_minimum = None
+        self.teaching_squeezing = False
+        self.teaching_release_s = 0.
         self.epoch += 1
         self.mode, self.reason = mode, reason
         self.armed = self.aligning = False
@@ -263,6 +277,19 @@ class AssistedControl:
             return False, "FAULT requires worker restart and hardware inspection"
         if type(epoch) is not int or epoch != self.epoch:
             return False, "stale control epoch"
+        if mode == "TAKEOVER":
+            if self.mode != "POLICY" or not self.correcting:
+                return False, "TAKEOVER requires active physical intervention"
+            self.manual_takeover = True
+            self.epoch += 1
+            self._rebase_policy()
+            return True, "physical takeover latched"
+        if mode == "TEACH":
+            if not self.config.uses_gravity_handoff or self.gripper_handoff is None or self.config.leader_only:
+                return False, "TEACH requires paired gravity handoff with gripper trigger"
+            self._revoke("HUMAN", "ordered pose teaching")
+            self.teaching = True
+            return True, "TEACH"
         if mode in ("HOLD", "HUMAN"):
             self._revoke(mode, "operator request")
             return True, mode
@@ -304,7 +331,45 @@ class AssistedControl:
         gripper = self.gripper_handoff
         aligning_gripper = False
         if gripper is not None:
-            if self.mode == "HUMAN":
+            if self.teaching:
+                # Observe teaching gestures independently of normal HUMAN
+                # gripper following; do not initiate a policy takeover.
+                if gripper.phase == "opening":
+                    gripper.observe(leader[6], self.follower[6], dt)
+                else:
+                    gripper.closure = max(0., gripper.open_width-leader[6])
+                    closed = gripper.closure >= c.gripper_trigger_m-1e-12
+                    if closed or self.teaching_squeezing:
+                        if self.teaching_minimum is None or leader[6] <= self.teaching_minimum['gripper_m']:
+                            self.teaching_minimum = dict(
+                                monotonic_ns=int(now*1e9), q_rad=self.follower[:6].tolist(),
+                                gripper_m=float(leader[6]), gripper_source='leader',
+                                leader_gripper_raw_m=float(self.leader[6]),
+                                follower_gripper_m=float(self.follower[6]))
+                        if not self.teaching_squeezing:
+                            self.teaching_closed_s += dt
+                            self.teaching_squeezing = self.teaching_closed_s >= .05-1e-12
+                    else:
+                        self.teaching_closed_s = 0.
+                        self.teaching_minimum = None
+                    # A held squeeze never confirms. A measured reopening of
+                    # 3 mm sustained for 50 ms confirms the minimum of this
+                    # gesture, not the width on crossing the closing threshold.
+                    released = (self.teaching_squeezing and
+                                leader[6]-self.teaching_minimum['gripper_m'] >= .003-1e-12)
+                    self.teaching_release_s = self.teaching_release_s+dt if released else 0.
+                    if self.teaching_release_s >= .05-1e-12:
+                        self.teaching_sequence += 1
+                        self.teaching_events.append(dict(sequence=self.teaching_sequence,
+                            **self.teaching_minimum, confirmed_monotonic_ns=int(now*1e9),
+                            gripper_capture='minimum_until_release_v1'))
+                        self.teaching_events = self.teaching_events[-16:]
+                        gripper.reset()
+                        self.teaching_closed_s = 0.
+                        self.teaching_minimum = None
+                        self.teaching_squeezing = False
+                        self.teaching_release_s = 0.
+            elif self.mode == "HUMAN":
                 gripper.phase = "teleop"
             else:
                 triggered, aligned = gripper.observe(leader[6], self.follower[6], dt)
@@ -331,6 +396,14 @@ class AssistedControl:
                                      and self.reference.phase == "policy")
                 if not finishing_handoff:
                     self._rebase_policy()
+        if self.manual_takeover and self.mode == "POLICY" and self.reference.phase == "human":
+            # Retain the existing alignment/blend. Once ready, keep gravity
+            # teleop latched even though the cancelled expert sends no targets.
+            self.mode = "HUMAN"
+            self.correcting = False
+            self.anchor_leader = self.leader.copy()
+            self.anchor_target = self.target.copy()
+            self.reason = "physical takeover latched in HUMAN"
         # Grippers have a separate position/force channel, outside the torque norm.
         if gripper is not None and aligning_gripper:
             self.target[6] = gripper.follower_hold
@@ -350,7 +423,7 @@ class AssistedControl:
         if handoff is not None and self.reference.phase == "human":
             self.leader_target[:6] = self.mapped(np.r_[reference, self.target[6]])[:6]
         if gripper is not None:
-            if self.reference.phase == "human":
+            if self.reference.phase == "human" and not self.teaching:
                 gripper.phase = "teleop"
             elif previous_phase == "recover" and self.reference.phase == "policy":
                 gripper.reset()
@@ -389,7 +462,7 @@ class AssistedControl:
                 self._revoke("HOLD", "client heartbeat timeout")
             elif (
                 self.mode == "POLICY" or self.armed
-            ) and now - self.last_command > self.config.command_timeout_s:
+            ) and not self.manual_takeover and now - self.last_command > self.config.command_timeout_s:
                 self._revoke("HOLD", "policy command timeout")
         if self.mode in ("POLICY", "HUMAN"):
             self._coupled_tick(now, dt)
@@ -412,6 +485,14 @@ class AssistedControl:
 
     def status(self):
         return {
+            "manual_takeover": self.manual_takeover,
+            "teaching": self.teaching,
+            "teaching_sequence": self.teaching_sequence,
+            "teaching_events": list(self.teaching_events),
+            "teaching_gesture_phase": ('inactive' if not self.teaching else
+                'releasing' if self.teaching_release_s else 'squeezing' if self.teaching_squeezing else
+                self.gripper_handoff.phase),
+            "teaching_min_gripper_m": (self.teaching_minimum['gripper_m'] if self.teaching_minimum else None),
             "worker_session": self.session,
             "epoch": self.epoch,
             "mode": self.mode,
