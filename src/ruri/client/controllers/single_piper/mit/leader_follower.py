@@ -1647,6 +1647,15 @@ def run(args: argparse.Namespace) -> int:
                         else follower_grip_sample.force
                     ),
                     overruns=overruns,
+                    control={
+                        "leader_joint_effort": last_leader.joint_effort.tolist(),
+                        "leader_gripper_force": (
+                            None if leader_grip_sample is None else leader_grip_sample.force
+                        ),
+                        # SDK receive timestamps: joint-angle packet, then J1..J6.
+                        "leader_feedback_timestamps_s": list(last_leader.stamps),
+                        "follower_feedback_timestamps_s": list(last_follower.stamps),
+                    },
                 )
 
             commands += 1
