@@ -24,7 +24,7 @@ wrapper 从 checkpoint 自带的 assets 读取归一化统计，复用训练时�
 pad 到模型宽度；模型再取这一维并裁剪到 `[-3,3]` 后送入 effort MLP。
 客户端 state 和 action 始终是七维。缺失 effort 会报错，不会自动补零。
 
-`SinglePiperConfig(include_effort_observation=True)` 使 `get_observation()`
+`SinglePiperConfig(send_effort=True)` 使 `get_observation()`
 从**同一个 telemetry 包**取得位置和 effort，使用与录制相同的
 `recording_observation()`。默认关闭，现有普通客户端保持原来的数据接口。
 
@@ -65,7 +65,7 @@ RTC warmup 会同时编译无前缀和有前缀两条路径。
 PROMPT='insert the row of five objects, from left to right, into the bottom row of holes on the manipulation-net board.'
 python examples/client_single_piper_blocking.py \
   --policy-endpoint tcp://SERVER_HOST:5561 \
-  --include-effort-observation --prompt "$PROMPT" \
+  --send-effort --prompt "$PROMPT" \
   --control-hz 30 --execute-actions-per-chunk 5
 ```
 
@@ -74,7 +74,7 @@ RTC 使用已有调度器，它会继续执行旧 chunk，同时发送对齐的�
 ```bash
 python examples/client_single_piper_rtc.py \
   --policy-endpoint tcp://SERVER_HOST:5562 \
-  --include-effort-observation --prompt "$PROMPT" \
+  --send-effort --prompt "$PROMPT" \
   --control-hz 30 --execution-horizon 5 --rtc-initial-delay-steps 4
 ```
 
@@ -105,7 +105,7 @@ with inference_client.connect("tcp://SERVER_HOST:5561") as policy:
 ```
 
 若已使用 `SinglePiperController`，在共享 args 中设置
-`include_effort_observation=True`，直接用它的 `get_observation()` 构造请求即可。
+`send_effort=True`，直接用它的 `get_observation()` 构造请求即可。
 不要另外读取第二次 state 再和第一次 effort 拼接；每次重新规划都发送当前测量。
 
 自己实现 RTC 时，在上述请求基础上加入：
@@ -149,3 +149,6 @@ PYTHONPATH=src /common/home/jh2400/projects/openpi/.venv/bin/python -m unittest 
 2000 的真实 checkpoint smoke 均通过。RTC 固定前缀在还原后动作空间中的最大绝对
 误差为 `1.91e-6`。两种模型都验证了只有最后一维 effort 会影响动作。
 详细记录位于 `/common/users/jh2400/pi05-effort/wrapper_validation/`。
+
+兼容旧调用：`--include-effort-observation` 是 `--send-effort` 的别名；
+`SinglePiperConfig(include_effort_observation=True)` 也会启用同一个 effort 输入路径。

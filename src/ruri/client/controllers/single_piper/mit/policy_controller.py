@@ -31,8 +31,12 @@ from .leader_follower import (
     DEFAULT_RATE_HZ,
     DEFAULT_START_HOME_SPEED,
     FOLLOWER_CAN,
+    GRIPPER_LIMIT_LOWER,
+    GRIPPER_LIMIT_UPPER,
     HOME_SETTLE_SECONDS,
     HOME_TOLERANCE,
+    JOINT_LIMIT_LOWER,
+    JOINT_LIMIT_UPPER,
     N_JOINTS,
     R2D,
     ArmSample,
@@ -56,15 +60,27 @@ COMMAND_PROTOCOL = "piper_mit_policy_command"
 COMMAND_VERSION = 1
 DEFAULT_COMMAND_ADDRESS = "udp://127.0.0.1:6671"
 DEFAULT_TELEMETRY_ADDRESS = "udp://127.0.0.1:6670"
-DEFAULT_COMMAND_TIMEOUT = 0.30
+# How long the server may go without landing a new action chunk on this machine
+# before the run is declared dead. It is a liveness check on the policy server,
+# not a control-loop parameter: with no new command the loop holds the last
+# target at zero velocity, which is safe indefinitely, so the only question this
+# answers is when to stop waiting and hand the arm back to abort recovery.
+# 0.30 assumed remote inference always returns inside a 30 Hz blocking cycle,
+# which a loaded GPU or a slow link makes untrue.
+DEFAULT_COMMAND_TIMEOUT = 1.0
+
+# Unrelated to the above despite the shared name upstream: how long a datagram
+# may sit in the local socket buffer and still be worth executing. This is an
+# MIT-layer transport property, so it does not move when the server deadline does.
+COMMAND_MAX_AGE = 0.30
 MAX_PACKET_BYTES = 8192
 DIAGNOSTIC_HISTORY_SECONDS = 5.0
 
-# Same physical domain used to normalize the demonstrations.
-POLICY_Q_MIN = np.deg2rad(np.array([-150.0, 0.0, -170.0, -100.0, -65.0, -100.0]))
-POLICY_Q_MAX = np.deg2rad(np.array([150.0, 180.0, 0.0, 100.0, 65.0, 130.0]))
-POLICY_GRIPPER_MIN = 0.0
-POLICY_GRIPPER_MAX = 0.068
+# The admission box is the nominal envelope the teleop loop already clamps to,
+# imported rather than restated. A private copy of it here is what silently
+# rejected every legal joint5 target past 65 deg after the measured table
+# replaced the inherited one: this file kept the old numbers, and a rejected
+# command is indistinguishable from one that never arrived.
 
 _running = True
 
@@ -109,6 +125,7 @@ class PolicyCommandReceiver:
         self.last_received_at: float | None = None
         self.accepted = 0
         self.rejected = 0
+        self.last_reject: str = ""
 
     def _decode(
         self, payload: bytes, source: tuple[str, int], now: float
@@ -143,12 +160,15 @@ class PolicyCommandReceiver:
             or not math.isfinite(gripper)
         ):
             raise ValueError("policy target must contain finite 6-D q and gripper")
-        if np.any(q < POLICY_Q_MIN) or np.any(q > POLICY_Q_MAX):
+        if np.any(q < JOINT_LIMIT_LOWER) or np.any(q > JOINT_LIMIT_UPPER):
             raise ValueError(
                 "policy joint target is outside the dataset calibration domain"
             )
-        if not POLICY_GRIPPER_MIN <= gripper <= POLICY_GRIPPER_MAX:
-            raise ValueError("policy gripper target is outside [0, 0.068] m")
+        if not GRIPPER_LIMIT_LOWER <= gripper <= GRIPPER_LIMIT_UPPER:
+            raise ValueError(
+                "policy gripper target is outside "
+                f"[{GRIPPER_LIMIT_LOWER:.3f}, {GRIPPER_LIMIT_UPPER:.3f}] m"
+            )
         return PolicyTarget(
             session=session, sequence=sequence, q=q, gripper_width=gripper
         )
@@ -167,8 +187,9 @@ class PolicyCommandReceiver:
                     self.session = target.session
                 if target.session != self.session or target.sequence <= self.sequence:
                     raise ValueError("wrong session or non-increasing sequence")
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 self.rejected += 1
+                self.last_reject = f"{type(exc).__name__}: {exc}"
                 continue
             self.sequence = target.sequence
             self.last_received_at = now
@@ -529,7 +550,7 @@ def run(args) -> int:
             "ALREADY WITHIN THRESHOLD. E-STOP IN HAND. ***"
         )
 
-        receiver = PolicyCommandReceiver(args.command_address, args.command_timeout)
+        receiver = PolicyCommandReceiver(args.command_address, COMMAND_MAX_AGE)
         telemetry = MITTelemetryPublisher(args.telemetry_address)
         arm.set_follower_mode()
         time.sleep(0.3)
@@ -586,8 +607,15 @@ def run(args) -> int:
                     receiver.last_received_at is None
                     or now - receiver.last_received_at > args.command_timeout
                 ):
+                    # A rejected command never advances last_received_at, so a
+                    # client that is still sending lands here too. Report the
+                    # reject count: it is the difference between "the client
+                    # stopped" and "the client is sending targets we refuse".
                     raise TeleopAbort(
-                        f"policy command timeout {now - receiver.last_received_at:.3f}s exceeds {args.command_timeout:.3f}s"
+                        f"policy command timeout {now - receiver.last_received_at:.3f}s "
+                        f"exceeds {args.command_timeout:.3f}s "
+                        f"(accepted={receiver.accepted} rejected={receiver.rejected}"
+                        f"{'; last reject: ' + receiver.last_reject if receiver.rejected else ''})"
                     )
                 if args.seconds > 0 and now - first_command_time >= args.seconds:
                     print(f"policy duration {args.seconds:.1f}s complete")
@@ -669,7 +697,8 @@ def run(args) -> int:
                 age_text = "waiting" if age is None else f"{age * 1000:4.0f}ms"
                 print(
                     f"  policy={'ON' if command_started else 'WAIT'} track={track * R2D:4.1f}deg "
-                    f"|qd|max={speed:4.2f}rad/s command_age={age_text} overruns={overruns}"
+                    f"|qd|max={speed:4.2f}rad/s command_age={age_text} "
+                    f"rejected={receiver.rejected} overruns={overruns}"
                 )
                 next_report = now + 0.5
             next_tick += dt

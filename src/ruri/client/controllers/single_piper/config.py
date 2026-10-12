@@ -36,12 +36,24 @@ class SinglePiperConfig:
     teleop_control_address: str | None = None
     arm_connect_timeout_s: float = 120.0
     telemetry_timeout_s: float = 0.25
-    command_timeout_s: float = 0.30
+    #: Server liveness deadline handed to the MIT worker: no new policy chunk
+    #: reaching this machine for this long means the policy server is gone.
+    command_timeout_s: float = 1.0
     worker_shutdown_timeout_s: float = 45.0
     startup_home_skip_threshold_rad: float = 0.05
     diagnostic_log: Path | None = None
+    #: Keep every MIT telemetry packet of a run, not just the newest one,
+    #: so the effort the arm produced can be read back afterwards.
+    record_effort: bool = False
+    effort_log_dir: Path = Path("logs")
+    #: Put the measured effort in the observation handed to the policy. Off
+    #: unless the served policy declares observation.joint_effort as an input:
+    #: a policy that was not trained on it has no use for the extra key.
+    send_effort: bool = False
 
     python_executable: Path | None = None
+    #: Compatibility with the original effort-wrapper configuration spelling.
+    #: Normalize it to send_effort so both paths use the same observation code.
     include_effort_observation: bool = False
 
     @classmethod
@@ -56,12 +68,14 @@ class SinglePiperConfig:
             item.name: get_arg(args, item.name, item.default)
             for item in fields(cls)
         }
-        for name in ("diagnostic_log", "python_executable"):
+        for name in ("diagnostic_log", "effort_log_dir", "python_executable"):
             if values[name] is not None:
                 values[name] = Path(values[name])
         return cls(**values)
 
     def __post_init__(self) -> None:
+        if self.include_effort_observation:
+            object.__setattr__(self, "send_effort", True)
         if self.teleop_control_address is not None:
             from .mit_io import parse_local_udp
 

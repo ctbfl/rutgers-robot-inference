@@ -456,6 +456,67 @@ class ControllerTests(unittest.TestCase):
         controller.stop()
         self.assertFalse(controller.is_connected)
 
+    def test_send_effort_adds_the_measured_effort_to_the_observation(self):
+        # An effort-conditioned policy refuses a request without this key, and
+        # the flag is what puts it there. Off by default, which the standard
+        # observation test above pins by asserting the smaller key set.
+        def can_discovery(**_):
+            return PiperCanDevice(
+                "can-test",
+                4,
+                frozenset((0x2A1, 0x2A5, 0x2A6, 0x2A7)),
+                find_arm_registration("left", "main").can_hardware_id,
+            )
+
+        def build(send_effort):
+            controller = SinglePiperController(
+                SinglePiperConfig(configure_can=False, send_effort=send_effort),
+                camera_discovery=lambda: type("Devices", (), {
+                    "head_serial": "head", "wrist_serial": "wrist"
+                })(),
+                can_discovery=can_discovery,
+                camera_factory=lambda serial, _: FakeCamera(
+                    10 if serial == "head" else 20
+                ),
+                telemetry_factory=FakeTelemetry,
+                command_factory=FakeCommands,
+                worker_factory=FakeWorker,
+            )
+            controller.connect()
+            controller.start_arm()
+            return controller
+
+        controller = build(True)
+        observation = controller.get_observation()
+        self.assertEqual(
+            set(observation),
+            {
+                "observation.state",
+                "observation.joint_effort",
+                "observation.images.top",
+                "observation.images.wrist",
+            },
+        )
+        effort = observation["observation.joint_effort"]
+        self.assertEqual(effort.shape, (7,))
+        # Six joint torques in N*m, then the gripper force in N. The gripper is
+        # last because that is the index an effort-conditioned policy reads.
+        np.testing.assert_allclose(effort[:6], [0.2, 0.4, 0.6, 0.8, 1.0, 1.2], atol=1e-6)
+        self.assertAlmostEqual(float(effort[6]), 1.5, places=6)
+
+        # The state is the same vector either way: turning the flag on adds a
+        # key, it does not change what the policy already saw.
+        plain = build(False)
+        np.testing.assert_allclose(
+            plain.get_observation()["observation.state"],
+            observation["observation.state"],
+            atol=1e-6,
+        )
+        self.assertNotIn("observation.joint_effort", plain.get_observation())
+
+        controller.disconnect()
+        plain.disconnect()
+
     def test_standard_observation_and_action_injection(self):
         commands = FakeCommands("unused")
 

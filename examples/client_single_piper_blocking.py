@@ -36,10 +36,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument(
-        "--include-effort-observation", action="store_true",
-        help="send measured joint/gripper effort; required for effort policy servers",
-    )
     parser.add_argument("--control-hz", type=float, default=30.0)
     parser.add_argument(
         "--execute-actions-per-chunk",
@@ -85,6 +81,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.05,
         help="skip startup homing when max joint error from home is below this",
+    )
+    parser.add_argument(
+        "--record-effort",
+        action="store_true",
+        help="write every MIT telemetry packet of this run to logs/effort-*.jsonl",
+    )
+    parser.add_argument(
+        "--send-effort",
+        "--include-effort-observation",
+        dest="send_effort",
+        action="store_true",
+        help=(
+            "include observation.joint_effort in the observation sent to the "
+            "policy; required by policies that declare it as an input"
+        ),
     )
     parser.add_argument(
         "--diagnostic-log",

@@ -81,3 +81,47 @@ class PublisherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EffortRecordingTests(unittest.TestCase):
+    """--record-effort keeps every packet, not just the newest."""
+
+    def test_every_drained_packet_reaches_the_log(self):
+        import json
+        import tempfile
+        import time
+        from pathlib import Path
+
+        from ruri.client.controllers.single_piper.mit_io import MITTelemetryReceiver
+
+        address = "udp://127.0.0.1:6689"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "effort.jsonl"
+            receiver = MITTelemetryReceiver(address)
+            receiver.record_to(path)
+            receiver.open()
+            sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                for index in range(5):
+                    packet = {
+                        "protocol": "piper_mit_telemetry",
+                        "version": 1,
+                        "sequence": index,
+                        "phase": "engaged",
+                        "follower": {"joint_effort": [float(index)] * 6,
+                                     "gripper_force": float(index)},
+                    }
+                    sender.sendto(json.dumps(packet).encode(), ("127.0.0.1", 6689))
+                time.sleep(0.05)
+                # One poll, five packets: the receiver keeps only the newest in
+                # memory, so this is exactly the loss the log exists to prevent.
+                receiver._drain(0.1)
+                self.assertEqual(receiver._latest["sequence"], 4)
+            finally:
+                sender.close()
+                receiver.close()
+
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(records[0]["kind"], "trace_header")
+            self.assertEqual([r["sequence"] for r in records[1:]], [0, 1, 2, 3, 4])
+            self.assertEqual(records[1]["follower"]["joint_effort"], [0.0] * 6)

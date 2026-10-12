@@ -10,6 +10,7 @@ import numpy as np
 
 from ruri.client.controllers.single_piper import calibration_ranges as base
 from ruri.client.controllers.single_piper.mit import leader_follower as mit_teleop
+from ruri.client.controllers.single_piper.mit import policy_controller as mit_policy
 from ruri.client.controllers.single_piper.normalization import CALIBRATION_RANGES
 from ruri.client.controllers.single_piper_leader_follower_teleop import (
     calibration_ranges as teleop,
@@ -80,6 +81,28 @@ class NominalIsTheSingleSourceTests(unittest.TestCase):
             self.assertAlmostEqual(
                 mit_teleop.JOINT_LIMIT_UPPER[index], math.radians(high / 1000.0),
                 places=12, msg=f"{name} upper limit drifted",
+            )
+
+    def test_gripper_loop_limits_match_the_nominal_envelope(self):
+        low, high = base.NOMINAL["gripper"]
+        self.assertAlmostEqual(mit_teleop.GRIPPER_LIMIT_LOWER, low / 1_000_000.0, places=12)
+        self.assertAlmostEqual(mit_teleop.GRIPPER_LIMIT_UPPER, high / 1_000_000.0, places=12)
+
+    def test_policy_admission_box_is_the_same_object_as_the_teleop_box(self):
+        # The policy path used to restate this table instead of importing it, and
+        # went stale when the measured calibration replaced the inherited one.
+        # Identity, not equality: a copy is the failure being tested for.
+        self.assertIs(mit_policy.JOINT_LIMIT_LOWER, mit_teleop.JOINT_LIMIT_LOWER)
+        self.assertIs(mit_policy.JOINT_LIMIT_UPPER, mit_teleop.JOINT_LIMIT_UPPER)
+        self.assertIs(mit_policy.GRIPPER_LIMIT_LOWER, mit_teleop.GRIPPER_LIMIT_LOWER)
+        self.assertIs(mit_policy.GRIPPER_LIMIT_UPPER, mit_teleop.GRIPPER_LIMIT_UPPER)
+
+    def test_no_private_joint_table_survives_in_the_policy_path(self):
+        # The specific regression: a module-level table of its own.
+        for name in ("POLICY_Q_MIN", "POLICY_Q_MAX", "POLICY_GRIPPER_MIN", "POLICY_GRIPPER_MAX"):
+            self.assertFalse(
+                hasattr(mit_policy, name),
+                f"{name} is back; the policy path must not keep its own envelope",
             )
 
 
