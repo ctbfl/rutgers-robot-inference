@@ -167,6 +167,70 @@ class GravityHandoffTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.reference(human_quiet_range_deg=values)
 
+    def recovering(self, ref):
+        q = self.human(ref)
+        while ref.phase != 'recover':
+            ref.step(q, None, .01)
+        return q
+
+    def test_opt_in_motion_ramp_waits_for_fresh_policy_even_after_gain_ramp(self):
+        r = self.reference(human_policy_recovery_s=.5, reference_speed=4.,
+                           max_reference_speed=4., policy_reference_speed=.5)
+        self.recovering(r)
+        initial = r.r.copy()
+        for _ in range(100):
+            r.step(r.r.copy(), None, .01)
+        self.assertEqual(r.phase, 'policy')
+        self.assertEqual(r.alpha, 0.)
+        self.assertEqual(r.recovery_motion_weight, 0.)
+        np.testing.assert_array_equal(r.r, initial)
+        target = initial + .5
+        r.step(r.r.copy(), target, .01)
+        # A large fresh actor target cannot immediately request .5 rad/s.
+        self.assertLess(np.max(np.abs(r.velocity)), .001)
+        for _ in range(49):
+            r.step(r.r.copy(), target, .01)
+        self.assertEqual(r.recovery_motion_weight, 1.)
+        self.assertIsNone(r._policy_recovery_elapsed)
+        np.testing.assert_allclose(r.velocity, .5)
+
+    def test_motion_ramp_continues_across_recovery_completion_without_reset(self):
+        r = self.reference(human_policy_recovery_s=.5, reference_speed=4.,
+                           max_reference_speed=4., policy_reference_speed=.5)
+        self.recovering(r)
+        for _ in range(40):
+            r.step(r.r.copy(), None, .01)
+        weights = []
+        for _ in range(50):
+            r.step(r.r.copy(), r.r + .5, .01)
+            weights.append(r.recovery_motion_weight)
+        self.assertEqual(r.phase, 'policy')
+        self.assertTrue(all(b >= a for a, b in zip(weights, weights[1:])))
+        self.assertLess(weights[9], .11)
+        self.assertEqual(weights[-1], 1.)
+
+    def test_retakeover_and_hold_cancel_recovery_ramp(self):
+        r = self.reference(human_policy_recovery_s=.5)
+        self.recovering(r)
+        r.step(r.r.copy(), r.r + .5, .01)
+        self.assertIsNotNone(r._policy_recovery_elapsed)
+        r.step(r.r.copy(), None, .01, manual=True)
+        self.assertEqual(r.phase, 'blend')
+        self.assertIsNone(r._policy_recovery_elapsed)
+        r.hold()
+        self.assertEqual(r.recovery_motion_weight, 1.)
+        self.assertIsNone(r._policy_recovery_elapsed)
+
+    def test_motion_ramp_default_off_and_config_validation(self):
+        r = self.reference()
+        self.assertEqual(r.config.human_policy_recovery_s, 0.)
+        self.recovering(r)
+        r.step(r.r.copy(), r.r + .5, .01)
+        np.testing.assert_allclose(r.velocity, .15)
+        for value in (-.1, float('nan'), float('inf'), True, 6):
+            with self.assertRaises(ValueError):
+                self.reference(human_policy_recovery_s=value)
+
     def test_worker_rebases_and_revokes_old_policy_at_release(self):
         now = 10.
         q = np.array([0., .4, -.4, 0., 0., 0., .04])

@@ -31,12 +31,16 @@ class GravityHandoff(SharedReference):
         self._entry_velocity = np.zeros(6)
         self._alignment_elapsed = 0.
         self.rebased = False
+        self._policy_recovery_elapsed = None
+        self.recovery_motion_weight = 1.
 
     def hold(self, reference=None):
         super().hold(reference)
         self._reset_handoff()
 
     def _begin_takeover(self):
+        self._policy_recovery_elapsed = None
+        self.recovery_motion_weight = 1.
         self.phase = "blend"
         self.intervening = True
         self._rise_start = self.alpha
@@ -92,6 +96,8 @@ class GravityHandoff(SharedReference):
 
         entered = False
         if gripper_triggered:
+            self._policy_recovery_elapsed = None
+            self.recovery_motion_weight = 1.
             self.phase, self.intervening = "gripper_align", True
             self._entry_velocity = self.velocity.copy()
             self._alignment_elapsed = 0.
@@ -132,6 +138,9 @@ class GravityHandoff(SharedReference):
                 self._recovery_elapsed = self.confirm_elapsed = 0.
                 self.filtered_error[:] = 0.
                 self.rebased = True
+                if c.human_policy_recovery_s > 0:
+                    self._policy_recovery_elapsed = 0.
+                    self.recovery_motion_weight = 0.
                 # Rebase while stiffness is still exactly zero. The enclosing
                 # worker invalidates the old revision before any fresh motion.
                 # A dual follower resumes from its last commanded reference,
@@ -150,6 +159,20 @@ class GravityHandoff(SharedReference):
         else:
             self.alpha = 0.
             velocity = self.policy_velocity.copy()
+
+        if self._policy_recovery_elapsed is not None and self.phase in ("recover", "policy"):
+            # Arm only after the physical rebase. A network wait cannot spend
+            # the motion ramp; the old pre-rebase proposal is never eligible.
+            # Keep ramping across recover -> policy if fresh inference arrived
+            # late. This affects executed reference velocity, not model pairs.
+            if target is not None and not self.rebased:
+                self._policy_recovery_elapsed = min(c.human_policy_recovery_s,
+                                                   self._policy_recovery_elapsed + dt)
+            self.recovery_motion_weight = smoothstep(
+                self._policy_recovery_elapsed / c.human_policy_recovery_s)
+            velocity = velocity * self.recovery_motion_weight
+            if self._policy_recovery_elapsed >= c.human_policy_recovery_s:
+                self._policy_recovery_elapsed = None
 
         if self.phase == "human":
             self.r = np.clip(q, self.lower, self.upper)

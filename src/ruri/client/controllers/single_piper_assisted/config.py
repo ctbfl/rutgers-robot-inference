@@ -40,6 +40,7 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
     human_takeover_s: float = 0.5
     human_release_delay_s: float = 0.5
     human_release_s: float = 1.0
+    human_policy_recovery_s: float = 0.0
     human_quiet_range_deg: tuple[float, ...] = (0.1,) * 6
     interaction_release: float = 0.02
     policy_max_age_s: float = 1.0
@@ -82,6 +83,7 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
             ("follower_handoff_s", 0.05, 5.0),
             ("human_release_delay_s", 0.05, 5.0),
             ("human_release_s", 0.1, 5.0),
+            ("human_policy_recovery_s", 0.0, 5.0),
             ("interaction_release", 0.0, 10.0),
             ("gripper_reference_speed", 0.001, 0.1),
             ("gripper_alignment_speed", 0.01, 0.3),
@@ -95,6 +97,8 @@ class SinglePiperAssistedConfig(SinglePiperLeaderFollowerTeleopConfig):
                 raise ValueError(f"{name} must be finite in [{low}, {high}]")
         if self.human_release_delay_s >= self.human_release_s:
             raise ValueError("require release delay < release duration")
+        if self.human_policy_recovery_s and not self.uses_gravity_handoff:
+            raise ValueError("human_policy_recovery_s requires gravity handoff")
         if self.human_trigger not in ("joint", "gripper"):
             raise ValueError("human_trigger must be joint or gripper")
         if self.gripper_max_m is not None and (

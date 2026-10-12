@@ -473,6 +473,7 @@ class AssistedControl:
             "follower_handoff_progress": self.follower_handoff.progress if self.follower_handoff else None,
             "follower_handoff_limited": self.follower_handoff.limited if self.follower_handoff else False,
             "policy_reference_velocity": self.reference.policy_velocity.tolist(),
+            "policy_recovery_motion_weight": getattr(self.reference, "recovery_motion_weight", 1.),
             "human_reference_velocity": self.reference.human_velocity.tolist(),
             "intervention_id": self.intervention_id,
             "policy_error": self.policy_error.tolist(),
