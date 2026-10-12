@@ -1271,8 +1271,8 @@ def validate_args(args: argparse.Namespace) -> None:
         parse_local_udp(args.control_address)
         if args.reset_home_speed > args.max_reference_speed:
             raise ValueError("--reset-home-speed cannot exceed --max-reference-speed")
-    if not 0.0 < args.max_joint_speed <= 5.0:
-        raise ValueError("--max-joint-speed must be in (0, 5]")
+    if not 0.0 < args.max_joint_speed <= 9.0:
+        raise ValueError("--max-joint-speed must be in (0, 9]")
     if not 0.0 < args.max_reference_speed <= 5.0:
         raise ValueError("--max-reference-speed must be in (0, 5]")
     if not 0.05 <= args.feedback_timeout <= 1.0:

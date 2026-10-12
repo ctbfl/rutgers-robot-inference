@@ -61,8 +61,8 @@ class SinglePiperLeaderFollowerTeleopConfig(SinglePiperConfig):
             raise ValueError("max_start_gap must be in (0, 0.5]")
         if not 0.0 < self.max_track_error <= 0.7:
             raise ValueError("max_track_error must be in (0, 0.7]")
-        if not 0.0 < self.max_joint_speed <= 5.0:
-            raise ValueError("max_joint_speed must be in (0, 5]")
+        if not 0.0 < self.max_joint_speed <= 9.0:
+            raise ValueError("max_joint_speed must be in (0, 9]")
         if not 0.0 < self.max_reference_speed <= 5.0:
             raise ValueError("max_reference_speed must be in (0, 5]")
         if not 0.05 <= self.feedback_timeout_s <= 1.0:
