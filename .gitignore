@@ -4,6 +4,9 @@ examples/shell_scripts/*
 # Runtime logs (server and client scheduler traces).
 logs/
 
+# Local poses appended by the Piper teaching and recovery tools.
+/tools/piper/auto_restore_poses.jsonl
+
 # Byte-compiled
 __pycache__/
 *.py[cod]
