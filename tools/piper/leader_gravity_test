@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+piper_repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+cd "$piper_repo"
+export PYTHONPATH="$piper_repo/src:$piper_repo/vendor/pyAgxArm${PYTHONPATH:+:$PYTHONPATH}"
+exec "${PIPER_PYTHON:-/home/omen/miniforge3/envs/lerobot-061/bin/python}" -u \
+    -m ruri.client.controllers.single_piper.mit.leader_gravity_check \
+    --execute --wait-for-enter --seconds 60 "$@"

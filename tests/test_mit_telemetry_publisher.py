@@ -86,6 +86,59 @@ if __name__ == "__main__":
 class EffortRecordingTests(unittest.TestCase):
     """--record-effort keeps every packet, not just the newest."""
 
+    def test_background_recording_keeps_packets_without_polling_and_preserves_latch(self):
+        import tempfile
+        import time
+        from pathlib import Path
+        from ruri.client.controllers.single_piper.mit_io import MITTelemetryReceiver
+
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as probe:
+            probe.bind(('127.0.0.1',0))
+            port=probe.getsockname()[1]
+        address=f'udp://127.0.0.1:{port}'
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'trace.jsonl'
+            receiver=MITTelemetryReceiver(address)
+            receiver.open()
+            sender=MITTelemetryPublisher(address)
+            try:
+                sender.publish(phase='engaged')
+                original=receiver.latch_engaged(1.)
+                receiver.record_to(path,background=True)
+                for _ in range(24):
+                    sender.publish(phase='engaged')
+                    time.sleep(.01)
+                deadline=time.monotonic()+1
+                while receiver._latest['sequence']!=25 and time.monotonic()<deadline:
+                    time.sleep(.005)
+                self.assertEqual(receiver._latest['sequence'],25)
+                self.assertEqual(receiver.latched(),original)
+                self.assertEqual(receiver.latch_engaged(1.)['sequence'],25)
+            finally:
+                sender.close();receiver.close()
+            packets=[json.loads(s) for s in path.read_text().splitlines()]
+            self.assertEqual([p['sequence'] for p in packets if 'sequence' in p],list(range(1,26)))
+
+    def test_trace_disk_error_is_reported(self):
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import MagicMock,patch
+        from ruri.client.controllers.single_piper.mit_io import _EffortTrace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stream=MagicMock()
+            stream.write.side_effect=OSError('disk full')
+            with patch.object(Path,'open',return_value=stream):
+                trace=_EffortTrace(Path(tmp)/'trace.jsonl','udp://127.0.0.1:12345')
+            deadline=time.monotonic()+1
+            while trace.error is None and time.monotonic()<deadline:
+                time.sleep(.005)
+            with self.assertRaisesRegex(RuntimeError,'log failed'):
+                trace.check()
+            with self.assertRaisesRegex(RuntimeError,'log failed'):
+                trace.close()
+
     def test_every_drained_packet_reaches_the_log(self):
         import json
         import tempfile

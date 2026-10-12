@@ -1,0 +1,39 @@
+Use case: infographic-diagram.
+Create one polished cartoon-style illustrated architecture poster for a robotics research project. Wide landscape canvas, approximately 16:10, high resolution suitable for a README and presentation. This is a brand-new image. Use clear Simplified Chinese labels and the exact English project name. Soft rounded technical illustration, expressive but professional cartoon linework, pale paper background, generous whitespace, readable typography, coherent arrows; two realistically recognizable small AgileX Piper six-joint robot arms in charcoal black / dark gray with circular joints, compact desktop bases and parallel-finger grippers. No humanoid robots, no robot faces. A human hand gently guides the physical leader. The follower works over a tabletop peg insertion board with a small wrist camera; a small overhead camera is also shown. Exactly TWO physical arms.
+
+Header:
+Large "RURI"
+Subtitle "Rutgers Robot Inference"
+Supporting line "Piper 人机协同控制架构"
+
+Layout and technical content: one large CLIENT region taking about two thirds of the width, one separate REMOTE SERVER region on the right. Network boundary between them. The bottom half of the client prominently contains the two physical Piper arms and their control structure. Prioritize visual clarity over lots of text.
+
+CLIENT / 客户端 region contains:
+- A small "观测" module, subtitle "双相机 + 真实关节状态". Thin feedback arrows from the physical robot sensors and joints feed this module.
+- A clear "RTC 调度器 · 30 Hz" module for action chunk timing / latency alignment, subtitle "动作对齐 · 过期动作丢弃".
+- Below it a shared reference hub labeled "共享虚拟参考 q_ref", small English "Virtual Leader". Make it visually a translucent software trajectory hub, NOT a third robot arm.
+- The MOST prominent colored callout in the whole architecture, beyond the project title, reads exactly "自研重力补偿 + 100 Hz MIT 控制环". It is a large highlighted enclosure inside the client, owning BOTH robot command channels. Add a very clear timing badge "100 Hz = 每 10 ms 更新".
+- Inside this enclosure place a concise idealized joint-level equation typeset legibly:
+"τ_cmd = τ_g(q) + K_p(q_ref − q) + K_d(q̇_ref − q̇)"
+Small annotations color-match the terms: "重力前馈" under τ_g, and "柔顺跟踪" under the proportional / derivative terms. Add a smaller label "URDF 重力模型 · NumPy 实现". Formula is schematic impedance + gravity compensation, not a claim of perfect cancellation.
+- The shared reference q_ref branches visibly into TWO PARALLEL outgoing command paths through this same 100 Hz MIT enclosure to the two physical arms. Label the arms "Piper Leader" / "人类交互臂" and "Piper Follower" / "任务执行臂". Both arms receive reference targets directly from the shared reference, with coordinate mapping implicit. Absolutely do not draw policy -> physical leader -> follower as a serial actuation chain. Do not draw an outgoing command arrow from the physical leader to the follower.
+- The human hand touches and guides the leader. A distinct warm orange feedback/correction arrow from the measured leader pose returns UP to the shared software reference hub, labeled "人类纠正更新参考". Keep this distinct from blue policy arrows. The leader is gravity-compensated with compliant tracking so it can be guided while the model is active.
+- Small line below the arms: "人类可纠正 · 策略持续推理".
+
+REMOTE SERVER / 远程服务器 region:
+Draw a friendly technical GPU server tower and a neat software card titled "Policy Wrapper".
+Inside the card use "π₀.₅ / Pi0.5", and a prominent "Training-time RTC" label.
+A small stack of checkpoint cards labeled "Checkpoint A", "Checkpoint B", "Checkpoint C" with one selected. Subtitle "模型加载 · GPU 推理".
+Optional compact pill: "同一服务器 · 多端口 checkpoint".
+A network arrow FROM client observation + scheduler context TO server labeled "观测 + Prompt + RTC 上下文".
+A SEPARATE network arrow FROM server TO client RTC scheduler labeled "Action Chunk · H = 30".
+Keep these arrow directions clear and avoid crossings. Server performs asynchronous chunk inference, NOT the 100 Hz motor loop.
+No training optimizer or RL training code inside RURI; this illustration is the inference/control architecture, not the training pipeline.
+
+Bottom compact explanatory strip with three illustrated beats, no additional physical robot drawings necessary:
+"策略推进" → "手动纠正 · 推理持续" → "从当前状态继续"
+Below that, a small color legend using three short labels: blue "策略动作", orange "人类纠正", gray "状态反馈".
+
+Technical invariants:
+Policy targets drive both arms in parallel via a shared VIRTUAL reference. Human input updates the shared reference; it does not require stopping server inference. No physical leader bottleneck on the follower's autonomous policy path. Distinguish client scheduler 30 Hz from local MIT loop 100 Hz and asynchronous remote GPU inference. Exact two physical arms. Do not suggest ideal instantaneous synchronization or perfect zero error. No reward or performance numbers. No keyboard-switch diagrams, no giant wall of code, no invented third platform, no unrelated props.
+Typography must be clean and legible with correctly spelled RURI, Rutgers Robot Inference, Piper, Policy Wrapper, Training-time RTC, and all Chinese labels. Present a cohesive cartoon scientific architecture illustration, not a screenshot of an app.

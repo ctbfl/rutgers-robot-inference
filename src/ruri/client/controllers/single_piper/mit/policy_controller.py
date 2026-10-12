@@ -42,10 +42,13 @@ from .leader_follower import (
     ArmSample,
     FeedbackWatchdog,
     GravityCompensator,
+    MITStartupConfirmation,
     TeleopAbort,
     arm_status_text,
     build_arm,
+    bounded_torque,
     home_reference,
+    joint_vector,
     read_gripper,
     read_sample,
     recovery_home_duration,
@@ -230,18 +233,22 @@ def write_diagnostic_log(
 
 
 def enable_follower_with_hold(
-    arm, gravity, kp, kd, max_reference_speed, timeout=5.0
+    arm, gravity, kp, kd, max_reference_speed, timeout=5.0, *, hold_target=None
 ) -> ArmSample:
     deadline = time.perf_counter() + timeout
-    hold = None
-    last = None
+    last = read_sample(arm, "follower before enable")
+    hold = last.q.copy() if hold_target is None else joint_vector(hold_target, "startup hold")
+    bounded_torque(gravity.torque(last.q), "follower before enable")
+    confirmation = MITStartupConfirmation(arm)
     while time.perf_counter() < deadline:
+        if not _running:
+            raise TeleopAbort("startup cancelled")
+        if confirmation.auto_mode_disabled:
+            require_can_mit_enabled(arm, "follower startup")
         enabled = arm.get_joints_enable_status_list()
         if not (enabled and all(enabled)):
             arm.enable()
         last = read_sample(arm, "follower")
-        if hold is None:
-            hold = last.q.copy()
         enabled = arm.get_joints_enable_status_list()
         if enabled and all(enabled):
             send_position_impedance(
@@ -255,14 +262,13 @@ def enable_follower_with_hold(
                 max_reference_speed,
                 "follower startup hold",
             )
-            ctrl, mode, _ = arm_status_text(arm)
-            if "CAN" in ctrl and "MIT" in mode:
-                arm.set_auto_set_motion_mode_enabled(False)
+            if confirmation.observe():
                 return last
         time.sleep(0.02)
     raise TeleopAbort(
         "failed to enable follower and confirm CAN/MIT: "
-        f"enabled={arm.get_joints_enable_status_list()} mode={arm_status_text(arm)[:2]}"
+        f"enabled={arm.get_joints_enable_status_list()} mode={arm_status_text(arm)[:2]}; "
+        "healthy, advancing status timestamps required"
     )
 
 
@@ -439,10 +445,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--grip-force", type=float, default=1.0)
     parser.add_argument(
+        "--hold-only",
+        action="store_true",
+        help=(
+            "hold the measured startup pose without homing, policy input, or "
+            "gripper commands; exiting leaves joint torque enabled"
+        ),
+    )
+    parser.add_argument(
         "--seconds",
         type=float,
         default=0.0,
-        help="seconds after first policy command; 0 is unlimited",
+        help="seconds after first policy command, or after HOLD ready; 0 is unlimited",
     )
     parser.add_argument(
         "--execute",
@@ -484,9 +498,16 @@ def run(args) -> int:
     print(
         f"controller: follower-only MIT {args.rate:.0f} Hz, kp={args.follower_kp}, kd={args.follower_kd}"
     )
-    print("policy joint target: latest 30 Hz pose, tracked directly with v_des=0")
+    print(
+        "joint target: measured startup pose, held with v_des=0"
+        if args.hold_only else
+        "policy joint target: latest 30 Hz pose, tracked directly with v_des=0"
+    )
     print(f"measured joint-speed abort: {args.max_joint_speed:.1f} rad/s")
-    print("policy gripper target: direct/full speed (no software slew limit)")
+    print(
+        "gripper: feedback only" if args.hold_only else
+        "policy gripper target: direct/full speed (no software slew limit)"
+    )
     print(f"connecting follower={args.follower_can}")
 
     arm = gripper = receiver = telemetry = None
@@ -517,6 +538,9 @@ def run(args) -> int:
                     "max_track_error": args.max_track_error,
                     "commands": commands,
                     "overruns": overruns,
+                    "hold_only": args.hold_only,
+                    "firmware": getattr(arm, "firmware_info", None),
+                    "firmware_driver": getattr(arm, "firmware_driver", None),
                 },
             )
             print(
@@ -540,29 +564,35 @@ def run(args) -> int:
             raise TeleopAbort("missing follower gripper feedback")
         print(f"  gripper={grip.width * 1000:.1f} mm")
         if not args.execute:
-            print("READ-ONLY CHECK COMPLETE: nothing enabled and no command sent.")
+            print("READ-ONLY CHECK COMPLETE: firmware queried; no enable or motion command sent.")
             return 0
 
         signal.signal(signal.SIGINT, _stop)
         signal.signal(signal.SIGTERM, _stop)
-        print(
-            "\n*** FOLLOWER WILL ENTER MIT; HOME MOTION IS SKIPPED WHEN "
-            "ALREADY WITHIN THRESHOLD. E-STOP IN HAND. ***"
-        )
+        if args.hold_only:
+            print("\n*** MIT HOLD ONLY: maintain startup pose; no homing or gripper commands. ***")
+        else:
+            print(
+                "\n*** FOLLOWER WILL ENTER MIT; HOME MOTION IS SKIPPED WHEN "
+                "ALREADY WITHIN THRESHOLD. E-STOP IN HAND. ***"
+            )
 
-        receiver = PolicyCommandReceiver(args.command_address, COMMAND_MAX_AGE)
+        if not args.hold_only:
+            receiver = PolicyCommandReceiver(args.command_address, COMMAND_MAX_AGE)
         telemetry = MITTelemetryPublisher(args.telemetry_address)
         arm.set_follower_mode()
         time.sleep(0.3)
+        initial_hold = read_sample(arm, "follower before enable").q.copy()
         sample = enable_follower_with_hold(
-            arm, gravity, args.follower_kp, args.follower_kd, args.max_reference_speed
+            arm, gravity, args.follower_kp, args.follower_kd, args.max_reference_speed,
+            hold_target=initial_hold,
         )
         started = True
         print(
             f"  follower enabled: ctrl={arm_status_text(arm)[0]} "
             f"mode={arm_status_text(arm)[1]}"
         )
-        if not hold_then_home_follower(
+        if not args.hold_only and not hold_then_home_follower(
             arm,
             gravity,
             gripper,
@@ -576,8 +606,8 @@ def run(args) -> int:
         sample = read_sample(arm, "follower")
         grip = read_gripper(gripper)
         if grip is None:
-            raise TeleopAbort("missing gripper after home")
-        latest_goal = sample.q.copy()
+            raise TeleopAbort("missing gripper after startup")
+        latest_goal = initial_hold if args.hold_only else sample.q.copy()
         grip_goal = grip.width
         first_command_time = None
         watchdog = FeedbackWatchdog(args.feedback_timeout)
@@ -585,13 +615,20 @@ def run(args) -> int:
         next_tick = time.perf_counter()
         next_report = next_tick
         next_status = next_tick
-        print(
-            f"READY: holding home; waiting for policy commands at {args.command_address}"
-        )
+        hold_started_at = next_tick
+        if args.hold_only:
+            print("READY: MIT HOLD at measured pose; policy input and gripper commands disabled")
+        else:
+            print(
+                f"READY: holding home; waiting for policy commands at {args.command_address}"
+            )
 
         while _running:
             now = time.perf_counter()
-            target = receiver.receive_latest()
+            if args.hold_only and args.seconds > 0 and now - hold_started_at >= args.seconds:
+                print(f"MIT hold duration {args.seconds:.1f}s complete")
+                break
+            target = None if receiver is None else receiver.receive_latest()
             target_delta = np.zeros(N_JOINTS)
             target_received = target is not None
             if target is not None:
@@ -636,7 +673,7 @@ def run(args) -> int:
                         "wall_time_ns": time.time_ns(),
                         "monotonic_ns": time.monotonic_ns(),
                         "target_received": target_received,
-                        "target_sequence": receiver.sequence,
+                        "target_sequence": None if receiver is None else receiver.sequence,
                         "q": sample.q.tolist(),
                         "qd": sample.qd.tolist(),
                         "q_target": q_cmd.tolist(),
@@ -655,7 +692,7 @@ def run(args) -> int:
                     f"measured J{joint} speed {speed:.3f} rad/s exceeds "
                     f"{args.max_joint_speed:.3f}"
                 )
-            send_position_impedance(
+            torque = send_position_impedance(
                 arm,
                 sample,
                 q_cmd,
@@ -666,8 +703,15 @@ def run(args) -> int:
                 args.max_reference_speed,
                 "follower policy",
             )
+            if diagnostic_samples is not None:
+                diagnostic_samples[-1]["t_ff"] = torque.tolist()
+                diagnostic_samples[-1]["joint_effort"] = sample.joint_effort.tolist()
+                diagnostic_samples[-1]["current_a"] = [
+                    float(arm.get_motor_states(j).msg.current) for j in range(1, 7)
+                ]
             # Explicit user choice: direct target, no software gripper slew limit.
-            gripper.move_gripper_m(grip_goal, args.grip_force)
+            if not args.hold_only:
+                gripper.move_gripper_m(grip_goal, args.grip_force)
             grip = read_gripper(gripper)
             if grip is None:
                 raise TeleopAbort("lost gripper feedback")
@@ -676,7 +720,7 @@ def run(args) -> int:
                 require_can_mit_enabled(arm, "follower policy")
                 next_status = now + 0.5
             telemetry.publish(
-                phase="engaged",
+                phase="hold" if args.hold_only else "engaged",
                 follower_q=sample.q,
                 follower_qd=sample.qd,
                 follower_joint_effort=sample.joint_effort,
@@ -691,14 +735,14 @@ def run(args) -> int:
             if now >= next_report:
                 age = (
                     None
-                    if receiver.last_received_at is None
+                    if receiver is None or receiver.last_received_at is None
                     else now - receiver.last_received_at
                 )
                 age_text = "waiting" if age is None else f"{age * 1000:4.0f}ms"
                 print(
                     f"  policy={'ON' if command_started else 'WAIT'} track={track * R2D:4.1f}deg "
                     f"|qd|max={speed:4.2f}rad/s command_age={age_text} "
-                    f"rejected={receiver.rejected} overruns={overruns}"
+                    f"rejected={0 if receiver is None else receiver.rejected} overruns={overruns}"
                 )
                 next_report = now + 0.5
             next_tick += dt
@@ -748,7 +792,7 @@ def run(args) -> int:
                             args.max_reference_speed,
                             "final hold",
                         )
-                        if grip is not None:
+                        if grip is not None and not args.hold_only:
                             gripper.move_gripper_m(grip.width, args.grip_force)
                         time.sleep(1.0 / args.rate)
                 except Exception as exc:  # noqa: BLE001 - best-effort final hold

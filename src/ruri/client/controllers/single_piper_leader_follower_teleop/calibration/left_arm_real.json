@@ -10,6 +10,14 @@
     "gripper": "micrometre"
   },
   "measured_on": "2026-09-04",
+  "range_overrides": {
+    "gripper": {
+      "configured_on": "2026-09-21",
+      "firmware": "S-V1.9-1",
+      "reason": "Operator-selected 0-100 mm clamp; not a new mechanical-stop measurement.",
+      "previous_measured_range": [-2240.0, 79940.0]
+    }
+  },
   "method": [
     "Motors de-energized, every joint dragged by hand onto both mechanical stops.",
     "Angles decoded from the raw 0x2A5/0x2A6/0x2A7 encoder feedback frames and the",
@@ -44,8 +52,8 @@
       170550.0
     ],
     "gripper": [
-      -2240.0,
-      79940.0
+      0.0,
+      100000.0
     ]
   }
 }

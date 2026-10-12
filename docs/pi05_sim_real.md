@@ -114,8 +114,8 @@ the shared 5090 deployment. Adjust that fraction for the machine's deployment
 layout. Warmup compiles both unconditioned and RTC paths before binding.
 
 The old packaging declarations `ruri-server` and `ruri-client` pointed to
-nonexistent `__main__` modules and were removed. Existing client example scripts
-and the client library are unchanged.
+nonexistent `__main__` modules and were removed. The sim/real wrapper requires
+no client protocol changes, including with the interactive and paired RTC clients.
 
 ## Source parity and tests
 
@@ -146,8 +146,11 @@ insertion accuracy.
 
 Installed under `/home/hjs/rutgers-robot-inference` with the environment and
 assets under `/home/hjs/ruri-deps`. The source checkout is on
-`deploy/sim-real-20261011`, with the current uncommitted changes copied from
-the development workspace. No changes were pushed or committed.
+`deploy/sim-real-20261011`. The integrated source includes upstream `main` and
+`feature/piper-shared-reference` through `ac705ab`, alongside the local sim/real,
+effort, torque and FastWAM wrappers. The canonical effort CLI option is
+`--send-effort`; `--include-effort-observation` remains a compatible alias for
+the original single-arm clients.
 
 The RTX 5090 (driver 580.159.03) successfully loaded the 10000-step EMA export,
 warmed both inference paths, and passed domain-flip / RTC checks. Model weights

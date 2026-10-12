@@ -28,6 +28,9 @@ piper = [
     "typing-extensions>=3.7.4.3",
 ]
 
+piper-circle = [
+    "scipy>=1.10",
+]
 
 [project.scripts]
 ruri-serve-pi05-sim-real = "ruri.server.pi05_sim_real:main"

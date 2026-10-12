@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -115,16 +117,85 @@ class InferenceClientTests(unittest.TestCase):
         self.assertEqual(response["action_chunk"].shape, (1, 7))
 
     def test_connect_rejects_metadata_without_output_chunk_size(self):
-        context_patch, send_patch, recv_patch, _, _ = self._transport(
+        context_patch, send_patch, recv_patch, context, sockets = self._transport(
             [{"inputs": {}}]
         )
         with context_patch, send_patch, recv_patch:
             with self.assertRaisesRegex(ValueError, "outputs"):
                 inference_client.connect("tcp://policy.example:5555")
+        sockets[0].close.assert_called_once_with(linger=0)
+        context.term.assert_called_once_with()
+
+    def test_port_switch_preserves_hostname_and_ipv6_host(self):
+        for host in ("172.16.68.130", "arcla.cs.rutgers.edu", "[::1]"):
+            self.assertEqual(
+                inference_client.endpoint_with_port(f"tcp://{host}:5557", "5558"),
+                f"tcp://{host}:5558",
+            )
+        for port in ("0", "65536", "-1", "abc", "5558/path", "other:5558"):
+            with self.subTest(port=port), self.assertRaises(ValueError):
+                inference_client.endpoint_with_port("tcp://host:5557", port)
 
     def test_connect_rejects_empty_endpoint(self):
         with self.assertRaisesRegex(ValueError, "policy_endpoint"):
             inference_client.connect(" ")
+
+    def test_host_port_shorthand_is_normalized_for_connection_and_switching(self):
+        context_patch, send_patch, recv_patch, _, sockets = self._transport(
+            [{"outputs": {"output_chunk_size": 1}}]
+        )
+        with context_patch, send_patch, recv_patch:
+            with inference_client.connect("172.16.68.130:5557") as policy:
+                self.assertEqual(policy.endpoint, "tcp://172.16.68.130:5557")
+                self.assertEqual(
+                    inference_client.endpoint_with_port(policy.endpoint, "5558"),
+                    "tcp://172.16.68.130:5558",
+                )
+        sockets[0].connect.assert_called_once_with("tcp://172.16.68.130:5557")
+
+    def test_malformed_tcp_endpoint_fails_before_opening_any_socket(self):
+        with patch.object(inference_client.zmq, "Context") as context:
+            for endpoint in (
+                "host",
+                "tcp://host",
+                "host:bad",
+                "host:0",
+                "host:65536",
+                "tcp://user@host:5557",
+                "tcp://host:5557/path",
+            ):
+                with (
+                    self.subTest(endpoint=endpoint),
+                    self.assertRaisesRegex(ValueError, "policy_endpoint"),
+                ):
+                    inference_client.connect(endpoint)
+            context.assert_not_called()
+
+    def test_connect_failure_closes_socket_before_context_cleanup(self):
+        import zmq
+
+        context = Mock()
+        socket = context.socket.return_value
+        socket.connect.side_effect = zmq.ZMQError(zmq.EINVAL)
+        with self.assertRaises(zmq.ZMQError):
+            inference_client._PolicyConnection._open_socket(
+                context, "bad://address", 0.1
+            )
+        socket.close.assert_called_once_with(linger=0)
+
+    def test_real_zmq_bad_transport_exits_instead_of_hanging_on_context_term(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from ruri.client.utils.inference_client import connect; connect('bad://address')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ZMQError", result.stderr)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,7 @@ class _EffortTrace:
         self._stream = self.path.open("a", encoding="utf-8", buffering=1)
         self._records: queue.SimpleQueue[dict[str, Any] | object] = queue.SimpleQueue()
         self._stop_token = object()
+        self.error: Exception | None = None
         self._thread = threading.Thread(
             target=self._write_loop, name="ruri-effort-log", daemon=True
         )
@@ -63,14 +64,26 @@ class _EffortTrace:
         )
 
     def record(self, packet: Mapping[str, Any]) -> None:
+        self.check()
         self._records.put(dict(packet))
+
+    def check(self) -> None:
+        if self.error is not None:
+            raise RuntimeError(f"MIT telemetry log failed: {self.path}") from self.error
 
     def close(self) -> None:
         self._records.put(self._stop_token)
         self._thread.join()
         self._stream.close()
+        self.check()
 
     def _write_loop(self) -> None:
+        try:
+            self._write_records()
+        except Exception as exc:
+            self.error = exc
+
+    def _write_records(self) -> None:
         while True:
             record = self._records.get()
             if record is self._stop_token:
@@ -90,18 +103,46 @@ class MITTelemetryReceiver:
         self._latched: dict[str, Any] | None = None
         self._received_at: float | None = None
         self._trace: _EffortTrace | None = None
+        self._state_lock = threading.Lock()
+        self._reader_stop = threading.Event()
+        self._reader_thread: threading.Thread | None = None
+        self._reader_error: Exception | None = None
 
-    def record_to(self, path: Path) -> None:
+    def record_to(self, path: Path, *, background: bool = False) -> None:
         """Keep every packet drained from here, not just the latest one.
 
         The effort a rollout produced is already in every telemetry packet, at
         the worker's full rate; this receiver simply throws all but the newest
         away. Recording is therefore a tee on the drain, and costs the control
         path one queue put per packet.
+
+        With background=True, call after open(): a dedicated reader keeps
+        receiving while the observation loop encodes video or waits in reset.
+        Only latch_engaged() advances the per-frame observation/action latch.
         """
         if self._trace is not None:
             raise RuntimeError("MIT telemetry is already being recorded")
+        if background and not self.is_open:
+            raise RuntimeError("open telemetry before starting background recording")
         self._trace = _EffortTrace(Path(path), self.address)
+        # The observer may already have a cached startup packet. Keep it too,
+        # so the first dataset frame always has a corresponding raw record.
+        if self._latest is not None:
+            self._trace.record(self._latest)
+        if background:
+            self._reader_stop.clear()
+            self._reader_error = None
+            self._reader_thread = threading.Thread(
+                target=self._read_loop, name="ruri-telemetry-reader", daemon=True
+            )
+            self._reader_thread.start()
+
+    def _read_loop(self) -> None:
+        try:
+            while not self._reader_stop.is_set():
+                self._receive(0.02)
+        except Exception as exc:
+            self._reader_error = exc
 
     @property
     def is_open(self) -> bool:
@@ -115,7 +156,19 @@ class MITTelemetryReceiver:
         receiver.setblocking(False)
         self._socket = receiver
 
+    def check_recording(self) -> None:
+        """Surface background receive/write errors on the recording thread."""
+        if self._reader_error is not None:
+            raise RuntimeError("MIT background telemetry failed") from self._reader_error
+        if self._trace is not None:
+            self._trace.check()
+
     def _drain(self, wait_s: float = 0.0) -> None:
+        self.check_recording()
+        if self._reader_thread is None:
+            self._receive(wait_s)
+
+    def _receive(self, wait_s: float = 0.0) -> None:
         if self._socket is None:
             raise RuntimeError("MIT telemetry receiver is not open")
         if wait_s > 0 and not select.select([self._socket], [], [], wait_s)[0]:
@@ -130,23 +183,26 @@ class MITTelemetryReceiver:
                 continue
             if packet.get("protocol") != TELEMETRY_PROTOCOL or packet.get("version") != PROTOCOL_VERSION:
                 continue
-            self._latest = packet
-            self._received_at = time.monotonic()
             if self._trace is not None:
                 self._trace.record(packet)
+            with self._state_lock:
+                self._latest = packet
+                self._received_at = time.monotonic()
 
     def latest_engaged(self, timeout_s: float) -> Mapping[str, Any]:
         self._drain(timeout_s)
-        if self._latest is None or self._received_at is None:
+        with self._state_lock:
+            packet, received_at = self._latest, self._received_at
+        if packet is None or received_at is None:
             raise TimeoutError(f"No MIT telemetry received from {self.address}")
-        age = time.monotonic() - self._received_at
+        age = time.monotonic() - received_at
         if age > timeout_s:
             raise TimeoutError(f"MIT telemetry is stale by {age:.3f}s")
-        phase = str(self._latest.get("phase", "")).lower()
+        phase = str(packet.get("phase", "")).lower()
         if phase != "engaged":
-            reason = self._latest.get("reason")
+            reason = packet.get("reason")
             raise RuntimeError(f"MIT worker phase={phase!r} reason={reason!r}")
-        return self._latest
+        return packet
 
     def latch_engaged(self, timeout_s: float) -> Mapping[str, Any]:
         """Latch one control packet for a complete 30 Hz collection frame."""
@@ -178,6 +234,11 @@ class MITTelemetryReceiver:
         raise TimeoutError(f"Timed out waiting for MIT worker phase=engaged; last phase={last_phase!r}")
 
     def close(self) -> None:
+        self._reader_stop.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join()
+            self._reader_thread = None
+        reader_error, self._reader_error = self._reader_error, None
         if self._socket is not None:
             self._socket.close()
         self._socket = None
@@ -185,8 +246,11 @@ class MITTelemetryReceiver:
         self._latched = None
         self._received_at = None
         if self._trace is not None:
-            self._trace.close()
+            trace = self._trace
             self._trace = None
+            trace.close()
+        if reader_error is not None:
+            raise RuntimeError("MIT background telemetry failed") from reader_error
 
 
 _SHARED_TELEMETRY: dict[str, MITTelemetryReceiver] = {}

@@ -92,6 +92,7 @@ class MITTelemetryPublisher:
         follower_gripper_force: float | None = None,
         overruns: int = 0,
         reason: str | None = None,
+        control: dict | None = None,
     ) -> bool:
         """Send one latest-state packet, dropping it on any telemetry error."""
         self.sequence += 1
@@ -123,6 +124,8 @@ class MITTelemetryPublisher:
                 "overruns": int(overruns),
                 "reason": None if reason is None else str(reason),
             }
+            if control is not None:
+                packet["control"] = control
             payload = json.dumps(
                 packet,
                 allow_nan=False,

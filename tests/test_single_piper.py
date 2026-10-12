@@ -225,6 +225,63 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertEqual(observation["observation.state"].shape, (7,))
 
+    def home_controller(self, q):
+        controller = SinglePiperController()
+        controller._arm_started = True
+        controller._worker = SimpleNamespace(running=True)
+        controller._telemetry = FakeTelemetry("unused")
+        controller._telemetry.packet["follower"]["q"] = list(q)
+        controller._telemetry.packet["action"] = {"gripper_width": 0.06}
+        return controller
+
+    def test_home_reference_speed_synchronous_arrival_and_measured_settling(self):
+        start = np.array([0.2, 1.0, -0.8, 0.1, 0.5, -0.3])
+        controller = self.home_controller(start)
+        actions = controller.iter_home_actions(control_hz=30, speed_rad_s=1.0)
+        targets = [denormalize_action(next(actions)) for _ in range(31)]
+        joints = np.stack([q for q, _ in targets])
+        np.testing.assert_allclose(joints[0], start, atol=1e-6)
+        np.testing.assert_allclose(joints[-1], 0, atol=1e-6)
+        velocities = np.diff(joints, axis=0) * 30
+        self.assertLessEqual(np.max(np.abs(velocities)), 1.00001)
+        np.testing.assert_allclose(velocities[:, 1], -1, atol=1e-5)
+        np.testing.assert_allclose(joints[:, 2], -0.8 * joints[:, 1], atol=1e-6)
+        for _, width in targets:
+            self.assertAlmostEqual(width, 0.06, places=6)
+        # Reaching the final reference is insufficient: keep sending home
+        # while measured joints are still away, then require settled feedback.
+        now = [0.0]
+        with patch("ruri.client.controllers.single_piper.home.time.monotonic", side_effect=lambda: now[0]):
+            np.testing.assert_allclose(denormalize_action(next(actions))[0], 0, atol=1e-6)
+            # Near-zero measured feedback may slightly overshoot J2/J3 stops.
+            controller._telemetry.packet["follower"].update(
+                q=[0.0, -0.001, 0.001, 0.0, 0.0, 0.0], qd=[0.0] * 6
+            )
+            now[0] = 0.1
+            next(actions)
+            now[0] = 0.31
+            with self.assertRaises(StopIteration):
+                next(actions)
+
+    def test_home_fails_on_stale_telemetry_or_failed_arrival(self):
+        controller = self.home_controller([0.0] * 6)
+        actions = controller.iter_home_actions(control_hz=30)
+        next(actions)
+        next(actions)
+        with patch("ruri.client.controllers.single_piper.home.time.monotonic", side_effect=[0.0, 0.0, 3.1]):
+            next(actions)  # qd is still 0.1: not settled despite zero joints.
+            with self.assertRaisesRegex(TimeoutError, "did not settle"):
+                next(actions)
+        actions = controller.iter_home_actions(control_hz=30)
+        with (
+            patch.object(
+                controller._telemetry, "latest_engaged",
+                side_effect=TimeoutError("stale"),
+            ),
+            self.assertRaisesRegex(TimeoutError, "stale"),
+        ):
+            next(actions)
+
     def test_teleop_observer_reads_state_and_target_without_touching_can(self):
         class TeleopTelemetry(FakeTelemetry):
             def __init__(self, address):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,7 @@ from ruri.client.controllers.single_piper.hardware_registry import (
     find_arm_by_hardware_id,
     find_arm_registration,
 )
+from ruri.client.controllers.single_piper.home import home_actions
 from ruri.client.controllers.single_piper.mit_io import (
     MITCommandSender,
     MITTelemetryReceiver,
@@ -458,6 +459,24 @@ class SinglePiperController(RobotSetupController):
         q_rad, gripper_width_m = denormalize_action(target)
         self._commands.send(q_rad, gripper_width_m)
         self._sent_action = True
+
+    def iter_home_actions(
+        self, *, control_hz: float, speed_rad_s: float = 1.0
+    ) -> Iterator[np.ndarray]:
+        """Yield synchronous zero-joint targets, paced by the caller's loop.
+
+        Start at fresh measured joints and preserve the commanded gripper width.
+        The fastest joint travels at at most ``speed_rad_s``. Targets still go
+        through ``send_action`` and all existing MIT guards. Completion requires
+        measured arrival; yielding alone never sends a command or sleeps.
+        """
+        if not self.arm_started or self._telemetry is None:
+            raise RuntimeError("start_arm() must complete before homing")
+        yield from home_actions(
+            lambda: self._telemetry.latest_engaged(self.config.telemetry_timeout_s),
+            control_hz=control_hz,
+            speed_rad_s=speed_rad_s,
+        )
 
     def status(self) -> dict[str, Any]:
         return {
